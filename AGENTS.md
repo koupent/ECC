@@ -2,7 +2,7 @@
 
 This is a **production-ready AI coding plugin** providing 67 specialized agents, 281 skills, 98 commands, and automated hook workflows for software development.
 
-**Version:** 2.1.0-koute.2
+**Version:** 2.1.0-koute.3
 
 ## Core Principles
 
