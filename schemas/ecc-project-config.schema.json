@@ -18,6 +18,29 @@
     "legacyHarness": { "const": "replace" },
     "deliveryWorkflow": { "enum": ["advisory", "required"] },
     "deliveryBaseBranch": { "type": "string", "minLength": 1 },
+    "legacyPreserve": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^\\.claude/[A-Za-z0-9._/-]+$" }
+    },
+    "legacyArchive": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^\\.claude/[A-Za-z0-9._/-]+$" }
+    },
+    "legacySettingsEnv": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" }
+    },
+    "devcontainer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["service"],
+      "properties": {
+        "service": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" }
+      }
+    },
     "codex": {
       "type": "object",
       "additionalProperties": false,
