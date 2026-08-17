@@ -8,7 +8,6 @@ const { spawnSync } = require('child_process');
 const { loadConfig } = require('./config');
 const {
   appendEvent,
-  atomicWrite,
   hash,
   projectFingerprint,
   readEvents,
