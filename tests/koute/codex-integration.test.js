@@ -190,6 +190,22 @@ test('migrated statusline keeps dynamic windows and fork-local cache', () => {
   assert.ok(helper.includes('account/rateLimits/read'));
 });
 
+test('upstream stable sync remains a manual fork-only draft PR', () => {
+  const workflow = fs.readFileSync(path.join(__dirname, '..', '..', '.github', 'workflows', 'sync-upstream-stable.yml'), 'utf8');
+  const runner = fs.readFileSync(path.join(__dirname, '..', '..', 'scripts', 'ci', 'sync-upstream-stable.sh'), 'utf8');
+  const tracking = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', '.github', 'upstream-stable.json'), 'utf8'));
+
+  assert.strictEqual(tracking.repository, 'affaan-m/ECC');
+  assert.strictEqual(tracking.tag, 'v2.1.0');
+  assert.match(workflow, /github\.repository == 'koupent\/ECC'/);
+  assert.match(workflow, /persist-credentials: false/);
+  assert.match(runner, /FORK_REPOSITORY:-.*koupent\/ECC/);
+  assert.match(runner, /gh pr create[\s\S]*--draft/);
+  assert.match(runner, /npm ci --ignore-scripts/);
+  assert.doesNotMatch(runner, /gh pr merge|--auto|enable-auto-merge/);
+  assert.doesNotMatch(runner, /--repo\s+["']?affaan-m\/ECC/);
+});
+
 test('redaction is bounded and privacy preserving', () => {
   const output = redactText(`password=hunter2 ${'x'.repeat(3000)}`);
   assert.ok(!output.includes('hunter2'));
