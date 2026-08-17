@@ -9,12 +9,13 @@ const { spawnSync } = require('child_process');
 const { loadConfig } = require('../../scripts/codex/config');
 const {
   readState,
+  readEvents,
   recordIncident,
   redactText,
   resetState,
   writeState
 } = require('../../scripts/codex/runtime-state');
-const { isTestPath, requireUsableResult, validateResult, workingTreeSignature } = require('../../scripts/codex/run-role');
+const { isTestPath, requireUsableResult, runRole, validateResult, workingTreeSignature } = require('../../scripts/codex/run-role');
 const { eligible, ensureForkTarget, publicIncident } = require('../../scripts/codex/incident-worker');
 const { record } = require('../../scripts/codex/record-event');
 const contextGate = require('../../scripts/hooks/codex-context-gate');
@@ -45,6 +46,55 @@ fs.writeFileSync(
   'utf8'
 );
 const env = { ...process.env, ECC_KOUTE_STATE_DIR: stateDir, CLAUDE_SESSION_ID: 'test-session' };
+
+function createGitFixture(name) {
+  const fixture = path.join(temp, name);
+  fs.mkdirSync(path.join(fixture, '.ecc'), { recursive: true });
+  fs.mkdirSync(path.join(fixture, 'src'), { recursive: true });
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', codex: { enabled: true, timeoutSeconds: 1 } }),
+    'utf8'
+  );
+  fs.writeFileSync(path.join(fixture, 'src', 'product.ts'), 'export const product = true;\n', 'utf8');
+  assert.strictEqual(spawnSync('git', ['init', '--quiet'], { cwd: fixture }).status, 0);
+  assert.strictEqual(spawnSync('git', ['config', 'user.email', 'ecc-test@example.invalid'], { cwd: fixture }).status, 0);
+  assert.strictEqual(spawnSync('git', ['config', 'user.name', 'ECC Test'], { cwd: fixture }).status, 0);
+  assert.strictEqual(spawnSync('git', ['add', '.'], { cwd: fixture }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'fixture'], { cwd: fixture }).status, 0);
+  return fixture;
+}
+
+function createCodexShim(mode, fixture) {
+  // run-role invokes `codex exec ...`. Pointing the binary at Node makes `exec`
+  // a portable script name on both Windows and Unix without enabling a shell.
+  const script = path.join(fixture, 'exec');
+  fs.writeFileSync(
+    script,
+    [
+      "'use strict';",
+      "const fs = require('fs');",
+      "const path = require('path');",
+      "const args = process.argv.slice(2);",
+      "const output = args[args.indexOf('--output-last-message') + 1];",
+      `const mode = ${JSON.stringify(mode)};`,
+      "if (mode === 'timeout') { setTimeout(() => {}, 5000); return; }",
+      "if (mode === 'schema') { fs.writeFileSync(output, '{}'); return; }",
+      "if (mode === 'write-violation') {",
+      "  fs.mkdirSync(path.join(process.cwd(), 'tests'), { recursive: true });",
+      "  fs.writeFileSync(path.join(process.cwd(), 'tests', 'contract.test.ts'), 'test placeholder\\n');",
+      "  fs.writeFileSync(path.join(process.cwd(), 'src', 'forbidden.ts'), 'forbidden\\n');",
+      "}",
+      "const context = {status:'ok',summary:'fixture context',files:['src/product.ts'],constraints:[],risks:[],verification:[]};",
+      "const assessment = {status:'ok',summary:'fixture assessment',findings:[]};",
+      "fs.writeFileSync(output, JSON.stringify(mode === 'context' ? context : assessment));"
+    ].join('\n'),
+    'utf8'
+  );
+  assert.strictEqual(spawnSync('git', ['add', 'exec'], { cwd: fixture }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', `add ${mode} shim`], { cwd: fixture }).status, 0);
+  return process.execPath;
+}
 
 console.log('\n=== Koupent ECC Codex integration ===\n');
 
@@ -141,6 +191,72 @@ test('insufficient Context Builder output triggers Claude fallback', () => {
   );
   assert.doesNotThrow(() => requireUsableResult('context-builder', { status: 'ok', summary: 'ready' }));
   assert.doesNotThrow(() => requireUsableResult('review', { status: 'blocked', summary: 'release blocker' }));
+});
+
+test('Context Builder shim opens the gate without external Codex access', () => {
+  const fixture = createGitFixture('context-shim-repo');
+  const fixtureEnv = {
+    ...env,
+    ECC_KOUTE_STATE_DIR: path.join(temp, 'context-shim-state'),
+    ECC_CODEX_BINARY: createCodexShim('context', fixture)
+  };
+  const output = runRole({
+    role: 'context-builder',
+    request: 'find household rename surfaces',
+    cwd: fixture,
+    sessionId: 'context-shim',
+    env: fixtureEnv
+  });
+  assert.strictEqual(output.ok, true, JSON.stringify(output));
+  assert.strictEqual(readState({ session_id: 'context-shim' }, fixtureEnv).context_status, 'ready');
+  const raw = JSON.stringify({ session_id: 'context-shim', tool_name: 'Grep', tool_input: { pattern: 'household' } });
+  assert.strictEqual(contextGate.run(raw, { cwd: fixture, env: fixtureEnv }), raw);
+});
+
+for (const failure of ['missing-binary', 'timeout', 'schema']) {
+  test(`Context Builder records fallback for ${failure}`, () => {
+    const fixture = createGitFixture(`failure-${failure}`);
+    const fixtureEnv = {
+      ...env,
+      ECC_KOUTE_STATE_DIR: path.join(temp, `failure-state-${failure}`),
+      ECC_CODEX_BINARY:
+        failure === 'missing-binary'
+          ? path.join(temp, 'does-not-exist', 'codex')
+          : createCodexShim(failure, fixture),
+      ECC_CODEX_TIMEOUT_SECONDS: failure === 'timeout' ? '1' : '30'
+    };
+    const output = runRole({
+      role: 'context-builder',
+      request: 'bounded fixture investigation',
+      cwd: fixture,
+      sessionId: `failure-${failure}`,
+      env: fixtureEnv
+    });
+    assert.strictEqual(output.ok, false);
+    assert.strictEqual(output.fallback, true);
+    assert.strictEqual(readState({ session_id: `failure-${failure}` }, fixtureEnv).context_status, 'fallback');
+  });
+}
+
+test('tests-only shim removes product changes and records a critical violation', () => {
+  const fixture = createGitFixture('tests-only-shim-repo');
+  const fixtureEnv = {
+    ...env,
+    ECC_KOUTE_STATE_DIR: path.join(temp, 'tests-only-shim-state'),
+    ECC_CODEX_BINARY: createCodexShim('write-violation', fixture)
+  };
+  const output = runRole({
+    role: 'contract-test',
+    request: 'write an independent public contract test',
+    cwd: fixture,
+    sessionId: 'tests-only-shim',
+    env: fixtureEnv
+  });
+  assert.strictEqual(output.ok, false, JSON.stringify(output));
+  assert.ok(fs.existsSync(path.join(fixture, 'tests', 'contract.test.ts')));
+  assert.ok(!fs.existsSync(path.join(fixture, 'src', 'forbidden.ts')));
+  const incidents = readEvents(fixtureEnv, 100).filter(event => event.kind === 'incident');
+  assert.ok(incidents.some(event => event.type === 'codex_write_scope_violation' && event.severity === 'critical'));
 });
 
 test('incident threshold promotes critical once and minor twice', () => {
