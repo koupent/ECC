@@ -126,6 +126,13 @@ function roleInstructions(role, request) {
       'Add a failing regression test first, implement the smallest generic fix, and run relevant tests.',
       'Do not add private paths, repository names, prompts, or customer data.'
     );
+  } else if (role === 'review' || role === 'security-review') {
+    common.push(
+      '',
+      'Do not edit any file. Review the complete delivery diff, not only uncommitted changes.',
+      'When the worktree is clean, compare the current issue branch against its base branch and inspect the committed changes.',
+      'Report only evidence-backed findings that are actionable for this request.'
+    );
   } else {
     common.push('', 'Do not edit any file. Report only evidence-backed findings that are actionable for this request.');
   }
@@ -242,11 +249,12 @@ function runRole(options) {
     cwd
   ];
   if (config.externalSandbox) {
-    args.push('--dangerously-bypass-approvals-and-sandbox');
-  } else {
-    args.push('--sandbox', def.sandbox);
-    if (def.sandbox === 'workspace-write') args.push('--approve-for-me');
+    const error = new Error('dangerous Codex sandbox bypass is unsupported; restore the Kit-managed standard sandbox');
+    failureState(role, input, error, cwd, env);
+    return { ok: false, role, model, error: error.message, fallback: true };
   }
+  args.push('--sandbox', def.sandbox);
+  if (def.sandbox === 'workspace-write') args.push('--approve-for-me');
   args.push('-');
 
   if (role === 'context-builder') {
@@ -307,6 +315,12 @@ function runRole(options) {
       nextPatch.context = parsed;
       nextPatch.context_head = gitOutput(cwd, ['rev-parse', 'HEAD']);
       nextPatch.context_request_hash = hash(options.request || '', 32);
+    }
+    if (role === 'review' || role === 'security-review') {
+      nextPatch.review_role = role;
+      nextPatch.review_status = parsed.status;
+      nextPatch.review_head = gitOutput(cwd, ['rev-parse', 'HEAD']);
+      nextPatch.review_worktree_clean = after.length === 0;
     }
     writeState(input, nextPatch, env);
     appendEvent(

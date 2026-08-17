@@ -28,17 +28,20 @@ Comprehensive security and quality review of uncommitted changes.
 ### Phase 1 — GATHER
 
 ```bash
-git diff --name-only HEAD
+git status --porcelain
 ```
 
-If no changed files, stop: "Nothing to review."
+If there are uncommitted changes, review `git diff HEAD`. If the worktree is
+clean and the current branch is an Issue-linked delivery branch, review the
+complete committed branch diff against its base branch instead. Only stop with
+"Nothing to review" when both diffs are empty.
 
 ### Phase 2 — REVIEW
 
 Run the fork's fresh-context Codex reviewer first:
 
 ```bash
-node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --request "Review the current diff for correctness, security, regressions, and release blockers" --session "$CLAUDE_SESSION_ID"
+node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --request "Review the complete current delivery diff (uncommitted diff when present, otherwise the committed issue-branch diff against its base) for correctness, security, regressions, and release blockers" --session "$CLAUDE_SESSION_ID"
 ```
 
 Use its findings as independent evidence in the ECC review. If Codex reports a

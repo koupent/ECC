@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/koupent/ECC/blob/main/schemas/ecc-project-config.schema.json",
+  "title": "Koute ECC project configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "profile", "rulePacks", "codexSandbox", "legacyHarness"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "version": { "const": 1 },
+    "profile": { "enum": ["minimal", "standard", "strict"] },
+    "rulePacks": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "codexSandbox": { "const": "required" },
+    "legacyHarness": { "const": "replace" },
+    "deliveryWorkflow": { "enum": ["advisory", "required"] },
+    "deliveryBaseBranch": { "type": "string", "minLength": 1 },
+    "codex": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "contextModel": { "type": "string", "minLength": 1 },
+        "reviewModel": { "type": "string", "minLength": 1 },
+        "reasoningEffort": { "enum": ["low", "medium", "high", "xhigh"] },
+        "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 7200 },
+        "incidentRepository": { "type": "string", "pattern": "^[^/]+/[^/]+$" },
+        "forkRepository": { "const": "koupent/ECC" },
+        "autoRemediation": { "type": "boolean" }
+      }
+    }
+  }
+}

@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "totalCommands": 97,
+  "totalCommands": 98,
   "commands": [
     {
       "command": "aside",
@@ -125,6 +125,15 @@
         "tdd-workflow"
       ],
       "path": "commands/cpp-test.md"
+    },
+    {
+      "command": "delivery-prepare",
+      "description": "Prepare the required GitHub Issue and issue-linked branch before editing.",
+      "type": "general",
+      "primaryAgents": [],
+      "allAgents": [],
+      "skills": [],
+      "path": "commands/delivery-prepare.md"
     },
     {
       "command": "ecc-guide",
@@ -1056,7 +1065,7 @@
   "statistics": {
     "byType": {
       "build": 4,
-      "general": 11,
+      "general": 12,
       "orchestration": 11,
       "planning": 2,
       "refactoring": 1,

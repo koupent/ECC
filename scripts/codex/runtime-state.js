@@ -53,7 +53,13 @@ function readState(input = {}, env = process.env) {
     context_status: 'idle',
     codex_calls: 0,
     codex_failures: 0,
-    waste_loops: 0
+    waste_loops: 0,
+    delivery: null,
+    protected_config_approvals: [],
+    review_role: null,
+    review_status: null,
+    review_head: null,
+    review_worktree_clean: false
   });
 }
 

@@ -2,8 +2,9 @@
 'use strict';
 
 const { loadConfig } = require('../codex/config');
+const { initializeDelivery } = require('../codex/delivery-lifecycle');
 const { runRole } = require('../codex/run-role');
-const { readState } = require('../codex/runtime-state');
+const { hash, readState } = require('../codex/runtime-state');
 
 const MAX_STDIN = 1024 * 1024;
 
@@ -24,15 +25,23 @@ function run(rawInput, options = {}) {
   const prompt = input.prompt || input.user_prompt || '';
   if (!config.enabled || shouldSkip(prompt)) return rawInput;
 
+  const delivery = initializeDelivery(input, prompt, { cwd, env: options.env || process.env });
+
   const existing = readState(input, options.env || process.env);
-  if (existing.context_status === 'ready' && existing.context) {
+  if (
+    existing.context_status === 'ready' && existing.context &&
+    existing.context_request_hash === hash(prompt, 32)
+  ) {
     return JSON.stringify({
       hookSpecificOutput: {
         hookEventName: 'UserPromptSubmit',
         additionalContext: [
           '[ECC Codex Context Builder cached packet]',
           'Reuse the existing task context below. Do not rerun broad exploration.',
-          'Run /ecc:codex-task-reset before starting a different task in this Claude session.',
+          delivery && delivery.status === 'pending'
+            ? 'Before the first edit, run /ecc:delivery-prepare. The Delivery Gate will fail closed until Issue deduplication and the issue-linked branch are recorded.'
+            : '',
+          'This packet is bound to the current request fingerprint; a different request automatically rebuilds it.',
           JSON.stringify(existing.context)
         ].join('\n')
       }
@@ -50,6 +59,9 @@ function run(rawInput, options = {}) {
     ? [
         '[ECC Codex Context Builder]',
         'Codex completed the initial repository investigation. Do not repeat broad exploration already covered below.',
+        delivery && delivery.status === 'pending'
+          ? 'Before the first edit, run /ecc:delivery-prepare. The Delivery Gate will fail closed until Issue deduplication and the issue-linked branch are recorded.'
+          : '',
         'If GateGuard requests first-touch facts, present the relevant facts from this packet and retry; do not re-read the same files merely to satisfy the gate.',
         JSON.stringify(output.result)
       ].join('\n')

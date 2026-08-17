@@ -8,6 +8,7 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 const { loadConfig } = require('../../scripts/codex/config');
 const {
+  hash,
   readState,
   readEvents,
   recordIncident,
@@ -20,6 +21,10 @@ const { eligible, ensureForkTarget, publicIncident } = require('../../scripts/co
 const { record } = require('../../scripts/codex/record-event');
 const contextGate = require('../../scripts/hooks/codex-context-gate');
 const contextBuilder = require('../../scripts/hooks/codex-context-builder');
+const deliveryGate = require('../../scripts/hooks/delivery-lifecycle-gate');
+const deliveryCompletion = require('../../scripts/hooks/delivery-completion-gate');
+const configProtection = require('../../scripts/hooks/config-protection');
+const { initializeDelivery, isDeliveryRequest, parseIssueNumber, slug } = require('../../scripts/codex/delivery-lifecycle');
 
 let passed = 0;
 let failed = 0;
@@ -105,6 +110,128 @@ test('project config opts into standard Codex integration', () => {
   assert.strictEqual(config.contextModel, 'gpt-5.6-terra');
   assert.strictEqual(config.reviewModel, 'gpt-5.6-sol');
   assert.strictEqual(config.timeoutSeconds, 1800);
+  assert.strictEqual(config.deliveryWorkflow, 'advisory');
+});
+
+test('delivery request classifier ignores chat and recognizes implementation work', () => {
+  assert.strictEqual(isDeliveryRequest('この不具合を修正してください'), true);
+  assert.strictEqual(isDeliveryRequest('設計について相談したいです'), false);
+  assert.strictEqual(parseIssueNumber('https://github.com/acme/repo/issues/42'), 42);
+  assert.strictEqual(slug('Fix generated worktrees'), 'fix-generated-worktrees');
+});
+
+test('required delivery gate blocks edits until issue and branch evidence are ready', () => {
+  const fixture = createGitFixture('delivery-gate-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-gate-state') };
+  const input = { session_id: 'delivery-gate', cwd: fixture };
+  const delivery = initializeDelivery(input, 'worktree lintの誤検出を修正してください', { cwd: fixture, env: fixtureEnv });
+  assert.strictEqual(delivery.status, 'pending');
+  const raw = JSON.stringify({ ...input, tool_name: 'Edit', tool_input: { file_path: path.join(fixture, 'src', 'product.ts') } });
+  const denied = JSON.parse(deliveryGate.run(raw, { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(denied.hookSpecificOutput.permissionDecisionReason, /delivery-prepare/);
+
+  const bash = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: 'npm test' } });
+  assert.strictEqual(JSON.parse(deliveryGate.run(bash, { cwd: fixture, env: fixtureEnv })).hookSpecificOutput.permissionDecision, 'deny');
+  const prepare = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: 'node "$CLAUDE_PLUGIN_ROOT/scripts/codex/delivery-lifecycle.js" prepare --session test' } });
+  assert.strictEqual(deliveryGate.run(prepare, { cwd: fixture, env: fixtureEnv }), prepare);
+
+  const branch = 'codex/issue-42-worktree-lint';
+  assert.strictEqual(spawnSync('git', ['switch', '-c', branch], { cwd: fixture }).status, 0);
+  writeState(input, { delivery: { ...delivery, status: 'ready', issue_number: 42, branch } }, fixtureEnv);
+  assert.strictEqual(deliveryGate.run(raw, { cwd: fixture, env: fixtureEnv }), raw);
+});
+
+test('delivery completion gate rejects a review that is not bound to the current clean commit', () => {
+  const fixture = createGitFixture('delivery-completion-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  assert.strictEqual(spawnSync('git', ['add', '.ecc/config.json'], { cwd: fixture }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'require delivery workflow'], { cwd: fixture }).status, 0);
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-completion-state') };
+  const input = { session_id: 'delivery-completion', cwd: fixture };
+  const branch = 'codex/issue-7-task';
+  assert.strictEqual(spawnSync('git', ['switch', '-c', branch], { cwd: fixture }).status, 0);
+  writeState(input, {
+    delivery: { status: 'ready', issue_number: 7, branch },
+    last_role: 'review',
+    review_role: 'review',
+    review_status: 'ok',
+    review_head: 'stale-commit',
+    review_worktree_clean: true
+  }, fixtureEnv);
+  const output = JSON.parse(deliveryCompletion.run(JSON.stringify(input), { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(output.decision, 'block');
+  assert.match(output.reason, /current clean commit/);
+
+  const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  writeState(input, {
+    review_role: 'review',
+    review_status: 'ok',
+    review_head: head,
+    review_worktree_clean: true
+  }, fixtureEnv);
+  const invalidPrData = JSON.parse(deliveryCompletion.run(JSON.stringify(input), {
+    cwd: fixture,
+    env: fixtureEnv,
+    command(binary, args, commandCwd, commandEnv) {
+      if (binary === 'gh') return { ok: true, stdout: '{invalid', stderr: '' };
+      return deliveryCompletion.command(binary, args, commandCwd, commandEnv);
+    }
+  }));
+  assert.strictEqual(invalidPrData.decision, 'block');
+  assert.match(invalidPrData.reason, /invalid data/);
+});
+
+test('delivery completion gate does not allow a required pending delivery to stop silently', () => {
+  const fixture = createGitFixture('delivery-pending-stop-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-pending-stop-state') };
+  const input = { session_id: 'delivery-pending-stop', cwd: fixture };
+  writeState(input, { delivery: { status: 'pending', request_hash: 'fixture' } }, fixtureEnv);
+  const output = JSON.parse(deliveryCompletion.run(JSON.stringify(input), { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(output.decision, 'block');
+  assert.match(output.reason, /delivery-prepare/);
+});
+
+test('config protection allows only additive generated-path exclusion with independent context and delivery evidence', () => {
+  const fixture = createGitFixture('protected-config-repo');
+  const configFile = path.join(fixture, 'eslint.config.mjs');
+  fs.writeFileSync(configFile, "export default [{ ignores: ['.next/**'] }];\n", 'utf8');
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'protected-config-state') };
+  const input = { session_id: 'protected-config', cwd: fixture };
+  writeState(input, {
+    context_status: 'ready',
+    context: { files: ['eslint.config.mjs'] },
+    delivery: { status: 'ready', issue_number: 9, branch: 'codex/issue-9-task' }
+  }, fixtureEnv);
+  const result = configProtection.run({
+    ...input,
+    tool_input: {
+      file_path: configFile,
+      old_string: "export default [{ ignores: ['.next/**'] }];",
+      new_string: "export default [{ ignores: ['.next/**'] }];\n// Exclude generated worktrees\nexport const generatedIgnores = ['.worktrees/**'];"
+    }
+  }, { env: fixtureEnv });
+  assert.strictEqual(result.exitCode, 0);
+
+  const weakening = configProtection.run({
+    ...input,
+    tool_input: { file_path: configFile, old_string: "rules: { strict: 'error' }", new_string: "rules: { strict: 'off' }" }
+  }, { env: fixtureEnv });
+  assert.strictEqual(weakening.exitCode, 2);
 });
 
 test('project without .ecc config remains opt-out', () => {
@@ -143,14 +270,19 @@ test('context gate opens for ready and recorded fallback states', () => {
 });
 
 test('context builder reuses the task packet instead of starting a duplicate Codex run', () => {
+  const request = 'follow-up detail';
   writeState(
     { session_id: 'cached-context' },
-    { context_status: 'ready', context: { status: 'ok', summary: 'cached', files: [] } },
+    {
+      context_status: 'ready',
+      context_request_hash: hash(request, 32),
+      context: { status: 'ok', summary: 'cached', files: [] }
+    },
     env
   );
   const output = JSON.parse(
     contextBuilder.run(
-      JSON.stringify({ session_id: 'cached-context', cwd: repo, prompt: 'follow-up detail' }),
+      JSON.stringify({ session_id: 'cached-context', cwd: repo, prompt: request }),
       { cwd: repo, env }
     )
   );
@@ -191,6 +323,26 @@ test('insufficient Context Builder output triggers Claude fallback', () => {
   );
   assert.doesNotThrow(() => requireUsableResult('context-builder', { status: 'ok', summary: 'ready' }));
   assert.doesNotThrow(() => requireUsableResult('review', { status: 'blocked', summary: 'release blocker' }));
+});
+
+test('dangerous Codex sandbox bypass is rejected instead of being executed', () => {
+  const fixture = createGitFixture('sandbox-bypass-rejected');
+  const fixtureEnv = {
+    ...env,
+    ECC_KOUTE_STATE_DIR: path.join(temp, 'sandbox-bypass-state'),
+    ECC_CODEX_EXTERNAL_SANDBOX: '1',
+    ECC_CODEX_BINARY: path.join(temp, 'must-not-run', 'codex')
+  };
+  const output = runRole({
+    role: 'context-builder',
+    request: 'inspect fixture',
+    cwd: fixture,
+    sessionId: 'sandbox-bypass',
+    env: fixtureEnv
+  });
+  assert.strictEqual(output.ok, false);
+  assert.match(output.error, /sandbox bypass is unsupported/);
+  assert.strictEqual(readState({ session_id: 'sandbox-bypass' }, fixtureEnv).context_status, 'fallback');
 });
 
 test('Context Builder shim opens the gate without external Codex access', () => {
@@ -308,13 +460,15 @@ test('plugin manifest does not explicitly register hooks twice', () => {
   assert.ok(!Object.prototype.hasOwnProperty.call(plugin, 'hooks'));
   assert.ok(hooks.UserPromptSubmit.some(group => group.id === 'user:prompt:codex-context-builder'));
   assert.ok(hooks.PreToolUse.some(group => group.id === 'pre:read-search:codex-context-gate'));
+  assert.ok(hooks.PreToolUse.some(group => group.id === 'pre:edit-write:delivery-lifecycle'));
+  assert.ok(hooks.Stop.some(group => group.id === 'stop:delivery-completion'));
   assert.ok(hooks.SessionEnd.some(group => group.id === 'session:end:codex-incident-worker'));
 });
 
-test('GateGuard standard implementation is not bypassed by Codex state', () => {
+test('GateGuard reuses scoped Context Builder evidence without disabling destructive Bash checks', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', '..', 'scripts', 'hooks', 'gateguard-fact-force.js'), 'utf8');
-  assert.ok(!source.includes('contextReady'));
-  assert.ok(!source.includes('contextCoversFile'));
+  assert.ok(source.includes('gateguard_context_reuse'));
+  assert.ok(source.includes("codexState.context_status === 'ready'"));
   assert.ok(source.includes('isDestructiveBash'));
 });
 
