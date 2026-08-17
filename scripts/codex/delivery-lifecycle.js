@@ -70,18 +70,24 @@ function pendingSessionForProject(cwd, env = process.env) {
 }
 
 function runCommand(binary, args, options = {}) {
-  const result = spawnSync(binary, args, {
-    cwd: options.cwd,
-    env: options.env || process.env,
-    encoding: 'utf8',
-    timeout: options.timeout || 30000,
-    windowsHide: true
-  });
-  if (result.error || result.status !== 0) {
+  const attempts = binary === 'gh' ? 3 : 1;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const result = spawnSync(binary, args, {
+      cwd: options.cwd,
+      env: options.env || process.env,
+      encoding: 'utf8',
+      timeout: options.timeout || 30000,
+      windowsHide: true
+    });
+    if (!result.error && result.status === 0) return String(result.stdout || '').trim();
     const detail = result.error ? result.error.message : String(result.stderr || result.stdout || '').trim();
-    throw new Error(`${binary} ${args[0] || ''} failed: ${detail || `exit ${result.status}`}`);
+    const transient = /(?:HTTP 5\d\d|timed?\s*out|timeout|ECONNRESET|ENOTFOUND|temporar(?:y|ily)|server is currently unavailable)/i.test(detail);
+    if (binary !== 'gh' || !transient || attempt === attempts) {
+      throw new Error(`${binary} ${args[0] || ''} failed: ${detail || `exit ${result.status}`}`);
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, attempt * 500);
   }
-  return String(result.stdout || '').trim();
+  throw new Error(`${binary} ${args[0] || ''} failed after bounded retries`);
 }
 
 function parseIssueNumber(url) {

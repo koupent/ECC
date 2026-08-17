@@ -132,6 +132,13 @@ test('Codex output schemas satisfy strict Structured Outputs object requirements
   }
 });
 
+test('delivery GitHub retry classifier is limited to transient transport and server failures', () => {
+  assert.strictEqual(deliveryCompletion.isTransientGitHubFailure('HTTP 503: server unavailable'), true);
+  assert.strictEqual(deliveryCompletion.isTransientGitHubFailure('ECONNRESET'), true);
+  assert.strictEqual(deliveryCompletion.isTransientGitHubFailure('HTTP 401: Bad credentials'), false);
+  assert.strictEqual(deliveryCompletion.isTransientGitHubFailure('validation failed'), false);
+});
+
 test('project config opts into standard Codex integration', () => {
   const config = loadConfig(repo, env);
   assert.strictEqual(config.enabled, true);

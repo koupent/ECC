@@ -5,13 +5,24 @@ const { spawnSync } = require('child_process');
 const { loadConfig } = require('../codex/config');
 const { readState, recordIncident, writeState } = require('../codex/runtime-state');
 
+function isTransientGitHubFailure(message) {
+  return /(?:HTTP 5\d\d|timed?\s*out|timeout|ECONNRESET|ENOTFOUND|temporar(?:y|ily)|server is currently unavailable)/i.test(String(message || ''));
+}
+
 function command(binary, args, cwd, env) {
-  const result = spawnSync(binary, args, { cwd, env, encoding: 'utf8', timeout: 10000, windowsHide: true });
-  return {
-    ok: !result.error && result.status === 0,
-    stdout: String(result.stdout || '').trim(),
-    stderr: String(result.stderr || '').trim()
-  };
+  const attempts = binary === 'gh' ? 3 : 1;
+  let response = { ok: false, stdout: '', stderr: '' };
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const result = spawnSync(binary, args, { cwd, env, encoding: 'utf8', timeout: 10000, windowsHide: true });
+    response = {
+      ok: !result.error && result.status === 0,
+      stdout: String(result.stdout || '').trim(),
+      stderr: String(result.stderr || result.error && result.error.message || '').trim()
+    };
+    if (response.ok || !isTransientGitHubFailure(response.stderr) || attempt === attempts) return response;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, attempt * 500);
+  }
+  return response;
 }
 
 function block(reason) {
@@ -97,4 +108,4 @@ if (require.main === module) {
   process.stdin.on('end', () => process.stdout.write(run(raw)));
 }
 
-module.exports = { block, command, run };
+module.exports = { block, command, isTransientGitHubFailure, run };
