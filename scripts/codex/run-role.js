@@ -141,6 +141,13 @@ function validateResult(result, schemaName) {
   return result;
 }
 
+function requireUsableResult(role, result) {
+  if (role === 'context-builder' && result.status !== 'ok') {
+    throw new Error(`Codex context is insufficient: ${String(result.summary || '').slice(0, 500)}`);
+  }
+  return result;
+}
+
 function diffFingerprint(cwd) {
   const head = gitOutput(cwd, ['rev-parse', 'HEAD']);
   const diff = gitOutput(cwd, ['diff', '--binary', 'HEAD']);
@@ -259,7 +266,10 @@ function runRole(options) {
   try {
     if (result.error) throw result.error;
     if (result.status !== 0) throw new Error(`codex exited ${result.status}: ${String(result.stderr || '').slice(-1000)}`);
-    const parsed = validateResult(JSON.parse(fs.readFileSync(outputPath, 'utf8')), def.schema);
+    const parsed = requireUsableResult(
+      role,
+      validateResult(JSON.parse(fs.readFileSync(outputPath, 'utf8')), def.schema)
+    );
     const after = workingTreePaths(cwd);
 
     if (!def.writePolicy && workingTreeSignature(cwd) !== beforeSignature) {
@@ -343,6 +353,7 @@ module.exports = {
   isTestPath,
   parseArgs,
   recordDuplicateFindings,
+  requireUsableResult,
   roleInstructions,
   runRole,
   validateResult,

@@ -14,7 +14,7 @@ const {
   resetState,
   writeState
 } = require('../../scripts/codex/runtime-state');
-const { isTestPath, validateResult, workingTreeSignature } = require('../../scripts/codex/run-role');
+const { isTestPath, requireUsableResult, validateResult, workingTreeSignature } = require('../../scripts/codex/run-role');
 const { eligible, ensureForkTarget, publicIncident } = require('../../scripts/codex/incident-worker');
 const contextGate = require('../../scripts/hooks/codex-context-gate');
 const contextBuilder = require('../../scripts/hooks/codex-context-builder');
@@ -131,6 +131,15 @@ test('role result validator rejects malformed output', () => {
   assert.doesNotThrow(() =>
     validateResult({ status: 'ok', summary: 'x', files: [], constraints: [], risks: [], verification: [] }, 'context-result.schema.json')
   );
+});
+
+test('insufficient Context Builder output triggers Claude fallback', () => {
+  assert.throws(
+    () => requireUsableResult('context-builder', { status: 'insufficient', summary: 'sandbox unavailable' }),
+    /context is insufficient/
+  );
+  assert.doesNotThrow(() => requireUsableResult('context-builder', { status: 'ok', summary: 'ready' }));
+  assert.doesNotThrow(() => requireUsableResult('review', { status: 'blocked', summary: 'release blocker' }));
 });
 
 test('incident threshold promotes critical once and minor twice', () => {
