@@ -16,6 +16,7 @@ const {
 } = require('../../scripts/codex/runtime-state');
 const { isTestPath, requireUsableResult, validateResult, workingTreeSignature } = require('../../scripts/codex/run-role');
 const { eligible, ensureForkTarget, publicIncident } = require('../../scripts/codex/incident-worker');
+const { record } = require('../../scripts/codex/record-event');
 const contextGate = require('../../scripts/hooks/codex-context-gate');
 const contextBuilder = require('../../scripts/hooks/codex-context-builder');
 
@@ -153,6 +154,17 @@ test('incident recorder increments identical fingerprints', () => {
   const second = recordIncident({ type: 'x', severity: 'minor', message: 'same' }, { cwd: repo, env });
   assert.strictEqual(first.count, 1);
   assert.strictEqual(second.count, 2);
+});
+
+test('project quality runners record evidence and incidents in external state', () => {
+  const evidence = record(['evidence', 'deterministic_e2e', 'PASS', 'artifact verified'], { cwd: repo, env });
+  assert.strictEqual(evidence.kind, 'evidence');
+  assert.strictEqual(evidence.status, 'PASS');
+  const incident = record(['incident', 'ai_qa_abort', 'minor', 'browser unavailable'], { cwd: repo, env });
+  assert.strictEqual(incident.kind, 'incident');
+  assert.strictEqual(incident.severity, 'minor');
+  assert.throws(() => record(['evidence', 'bad type', 'PASS', 'x'], { cwd: repo, env }), /usage/);
+  assert.throws(() => record(['incident', 'ai_qa_abort', 'unsafe', 'x'], { cwd: repo, env }), /usage/);
 });
 
 test('public remediation is hard-locked to koupent/ECC', () => {
