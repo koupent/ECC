@@ -3,7 +3,9 @@
 
 const { spawnSync } = require('child_process');
 const { loadConfig } = require('./config');
-const { hash, readState, recordIncident, writeState } = require('./runtime-state');
+const fs = require('fs');
+const path = require('path');
+const { hash, projectFingerprint, readJson, readState, recordIncident, resolveSessionId, stateRoot, writeState } = require('./runtime-state');
 
 const DELIVERY_REQUEST = /(?:\b(?:implement|fix|change|add|remove|refactor|build|create|update)\b|実装|修正|変更|追加|削除|作成|更新|直して)/i;
 
@@ -47,8 +49,24 @@ function initializeDelivery(input, request, options = {}) {
     branch: null,
     draft_pr_url: null
   };
-  writeState(input, { delivery }, env);
+  writeState(input, { delivery, project: projectFingerprint(cwd) }, env);
   return delivery;
+}
+
+function pendingSessionForProject(cwd, env = process.env) {
+  const sessionsDir = path.join(stateRoot(env), 'sessions');
+  const project = projectFingerprint(cwd);
+  let candidates = [];
+  try {
+    candidates = fs.readdirSync(sessionsDir)
+      .filter(file => file.endsWith('.json'))
+      .map(file => readJson(path.join(sessionsDir, file)))
+      .filter(state => state && state.project === project && state.delivery && state.delivery.status === 'pending')
+      .sort((left, right) => String(right.updated_at || '').localeCompare(String(left.updated_at || '')));
+  } catch {
+    return '';
+  }
+  return candidates.length === 1 ? resolveSessionId(candidates[0], env) : '';
 }
 
 function runCommand(binary, args, options = {}) {
@@ -145,8 +163,10 @@ function prepareDelivery(input = {}, options = {}) {
 function main() {
   const command = process.argv[2];
   const sessionIndex = process.argv.indexOf('--session');
-  const sessionId = sessionIndex >= 0 ? process.argv[sessionIndex + 1] : process.env.CLAUDE_SESSION_ID;
+  const explicitSession = sessionIndex >= 0 ? process.argv[sessionIndex + 1] : process.env.CLAUDE_SESSION_ID;
+  const sessionId = explicitSession || pendingSessionForProject(process.cwd(), process.env);
   if (command !== 'prepare') throw new Error('usage: delivery-lifecycle.js prepare --session <id>');
+  if (!sessionId) throw new Error('No unique pending delivery session for this project; retry the exact session-bound command from the Delivery Gate.');
   process.stdout.write(`${JSON.stringify(prepareDelivery({ session_id: sessionId, cwd: process.cwd() }), null, 2)}\n`);
 }
 
@@ -164,6 +184,7 @@ module.exports = {
   initializeDelivery,
   isDeliveryRequest,
   parseIssueNumber,
+  pendingSessionForProject,
   prepareDelivery,
   runCommand,
   slug,

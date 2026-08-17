@@ -79,7 +79,8 @@ function contextCoversFile(state, filePath) {
   const files = state && state.context && Array.isArray(state.context.files) ? state.context.files : [];
   const target = String(filePath || '').replace(/\\/g, '/').toLowerCase();
   return files.some(candidate => {
-    const normalized = String(candidate || '').replace(/\\/g, '/').toLowerCase();
+    const value = candidate && typeof candidate === 'object' ? candidate.path : candidate;
+    const normalized = String(value || '').replace(/\\/g, '/').toLowerCase();
     return normalized && (target === normalized || target.endsWith(`/${normalized}`) || path.basename(target) === path.basename(normalized));
   });
 }

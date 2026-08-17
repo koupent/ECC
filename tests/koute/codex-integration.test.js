@@ -24,7 +24,7 @@ const contextBuilder = require('../../scripts/hooks/codex-context-builder');
 const deliveryGate = require('../../scripts/hooks/delivery-lifecycle-gate');
 const deliveryCompletion = require('../../scripts/hooks/delivery-completion-gate');
 const configProtection = require('../../scripts/hooks/config-protection');
-const { initializeDelivery, isDeliveryRequest, parseIssueNumber, slug } = require('../../scripts/codex/delivery-lifecycle');
+const { initializeDelivery, isDeliveryRequest, parseIssueNumber, pendingSessionForProject, slug } = require('../../scripts/codex/delivery-lifecycle');
 
 let passed = 0;
 let failed = 0;
@@ -103,6 +103,35 @@ function createCodexShim(mode, fixture) {
 
 console.log('\n=== Koupent ECC Codex integration ===\n');
 
+test('Codex output schemas satisfy strict Structured Outputs object requirements', () => {
+  for (const schemaName of ['context-result.schema.json', 'assessment-result.schema.json']) {
+    const schema = JSON.parse(
+      fs.readFileSync(path.join(__dirname, '..', '..', 'schemas', 'codex', schemaName), 'utf8')
+    );
+    const visit = (node, location = '$') => {
+      if (!node || typeof node !== 'object') return;
+      if (node.type === 'object') {
+        assert.strictEqual(node.additionalProperties, false, `${schemaName} ${location} must reject extra properties`);
+        const properties = Object.keys(node.properties || {}).sort();
+        const required = [...(node.required || [])].sort();
+        assert.deepStrictEqual(required, properties, `${schemaName} ${location} must require every declared property`);
+      }
+      for (const [key, value] of Object.entries(node)) {
+        if (key === 'properties') {
+          for (const [property, propertySchema] of Object.entries(value || {})) {
+            visit(propertySchema, `${location}.properties.${property}`);
+          }
+        } else if (key === 'items') {
+          visit(value, `${location}.items`);
+        } else if (key === 'anyOf') {
+          for (const [index, variant] of (value || []).entries()) visit(variant, `${location}.anyOf[${index}]`);
+        }
+      }
+    };
+    visit(schema);
+  }
+});
+
 test('project config opts into standard Codex integration', () => {
   const config = loadConfig(repo, env);
   assert.strictEqual(config.enabled, true);
@@ -134,7 +163,7 @@ test('required delivery gate blocks edits until issue and branch evidence are re
   const raw = JSON.stringify({ ...input, tool_name: 'Edit', tool_input: { file_path: path.join(fixture, 'src', 'product.ts') } });
   const denied = JSON.parse(deliveryGate.run(raw, { cwd: fixture, env: fixtureEnv }));
   assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny');
-  assert.match(denied.hookSpecificOutput.permissionDecisionReason, /delivery-prepare/);
+  assert.match(denied.hookSpecificOutput.permissionDecisionReason, /--session \"delivery-gate\"/);
 
   const bash = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: 'npm test' } });
   assert.strictEqual(JSON.parse(deliveryGate.run(bash, { cwd: fixture, env: fixtureEnv })).hookSpecificOutput.permissionDecision, 'deny');
@@ -145,6 +174,22 @@ test('required delivery gate blocks edits until issue and branch evidence are re
   assert.strictEqual(spawnSync('git', ['switch', '-c', branch], { cwd: fixture }).status, 0);
   writeState(input, { delivery: { ...delivery, status: 'ready', issue_number: 42, branch } }, fixtureEnv);
   assert.strictEqual(deliveryGate.run(raw, { cwd: fixture, env: fixtureEnv }), raw);
+});
+
+test('delivery preparation resolves the unique pending project session without relying on Bash environment propagation', () => {
+  const fixture = createGitFixture('delivery-project-session-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-project-session-state') };
+  initializeDelivery(
+    { session_id: 'session-from-hook', cwd: fixture },
+    '生成ディレクトリ除外を修正してください',
+    { cwd: fixture, env: fixtureEnv }
+  );
+  assert.strictEqual(pendingSessionForProject(fixture, fixtureEnv), 'session-from-hook');
 });
 
 test('delivery completion gate rejects a review that is not bound to the current clean commit', () => {
@@ -249,6 +294,28 @@ test('config protection allows only additive generated-path exclusion with indep
     tool_input: { file_path: configFile, old_string: "rules: { strict: 'error' }", new_string: "rules: { strict: 'off' }" }
   }, { env: fixtureEnv });
   assert.strictEqual(weakening.exitCode, 2);
+});
+
+test('config protection accepts structured Context Builder file evidence', () => {
+  const fixture = createGitFixture('protected-config-structured-context-repo');
+  const configFile = path.join(fixture, 'eslint.config.mjs');
+  fs.writeFileSync(configFile, "export default [{ ignores: ['.next/**'] }];\n", 'utf8');
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'protected-config-structured-state') };
+  const input = { session_id: 'protected-config-structured', cwd: fixture };
+  writeState(input, {
+    context_status: 'ready',
+    context: { files: [{ path: 'eslint.config.mjs', reason: 'generated worktree lint scope' }] },
+    delivery: { status: 'ready', issue_number: 10, branch: 'codex/issue-10-task' }
+  }, fixtureEnv);
+  const result = configProtection.run({
+    ...input,
+    tool_input: {
+      file_path: configFile,
+      old_string: "export default [{ ignores: ['.next/**'] }];",
+      new_string: "export default [{ ignores: ['.next/**', '.worktrees/**'] }];"
+    }
+  }, { env: fixtureEnv });
+  assert.strictEqual(result.exitCode, 0);
 });
 
 test('project without .ecc config remains opt-out', () => {

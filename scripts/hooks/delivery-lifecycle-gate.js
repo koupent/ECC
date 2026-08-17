@@ -3,7 +3,7 @@
 
 const { spawnSync } = require('child_process');
 const { loadConfig } = require('../codex/config');
-const { readState, recordIncident } = require('../codex/runtime-state');
+const { readState, recordIncident, resolveSessionId } = require('../codex/runtime-state');
 
 function deny(reason) {
   return JSON.stringify({
@@ -40,9 +40,10 @@ function run(rawInput, options = {}) {
     const isPrepareCommand = toolName === 'Bash' &&
       /scripts[\\/]codex[\\/]delivery-lifecycle\.js["']?\s+prepare(?:\s|$)/i.test(command);
     if (isPrepareCommand) return rawInput;
+    const sessionId = resolveSessionId(input, env);
     return deny(
       '[ECC Delivery Gate] Repository tools are blocked until duplicate Issue search, Issue selection/creation, and issue-linked branch creation complete. ' +
-        'Run `/ecc:delivery-prepare` first, then retry the tool call.'
+        `Run node \"$CLAUDE_PLUGIN_ROOT/scripts/codex/delivery-lifecycle.js\" prepare --session \"${sessionId}\" first, then retry the tool call.`
     );
   }
 

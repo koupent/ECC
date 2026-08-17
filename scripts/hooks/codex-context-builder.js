@@ -4,7 +4,7 @@
 const { loadConfig } = require('../codex/config');
 const { initializeDelivery } = require('../codex/delivery-lifecycle');
 const { runRole } = require('../codex/run-role');
-const { hash, readState } = require('../codex/runtime-state');
+const { hash, readState, resolveSessionId } = require('../codex/runtime-state');
 
 const MAX_STDIN = 1024 * 1024;
 
@@ -22,6 +22,8 @@ function run(rawInput, options = {}) {
   }
   const cwd = options.cwd || input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const config = loadConfig(cwd, options.env || process.env);
+  const sessionId = resolveSessionId(input, options.env || process.env);
+  const prepareInstruction = `Before the first edit, run node \"$CLAUDE_PLUGIN_ROOT/scripts/codex/delivery-lifecycle.js\" prepare --session \"${sessionId}\". The Delivery Gate will fail closed until Issue deduplication and the issue-linked branch are recorded.`;
   const prompt = input.prompt || input.user_prompt || '';
   if (!config.enabled || shouldSkip(prompt)) return rawInput;
 
@@ -39,7 +41,7 @@ function run(rawInput, options = {}) {
           '[ECC Codex Context Builder cached packet]',
           'Reuse the existing task context below. Do not rerun broad exploration.',
           delivery && delivery.status === 'pending'
-            ? 'Before the first edit, run /ecc:delivery-prepare. The Delivery Gate will fail closed until Issue deduplication and the issue-linked branch are recorded.'
+            ? prepareInstruction
             : '',
           'This packet is bound to the current request fingerprint; a different request automatically rebuilds it.',
           JSON.stringify(existing.context)
@@ -60,7 +62,7 @@ function run(rawInput, options = {}) {
         '[ECC Codex Context Builder]',
         'Codex completed the initial repository investigation. Do not repeat broad exploration already covered below.',
         delivery && delivery.status === 'pending'
-          ? 'Before the first edit, run /ecc:delivery-prepare. The Delivery Gate will fail closed until Issue deduplication and the issue-linked branch are recorded.'
+          ? prepareInstruction
           : '',
         'If GateGuard requests first-touch facts, present the relevant facts from this packet and retry; do not re-read the same files merely to satisfy the gate.',
         JSON.stringify(output.result)

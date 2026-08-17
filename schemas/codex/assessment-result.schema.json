@@ -11,12 +11,12 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["severity", "title", "evidence", "recommendation", "fingerprint"],
+        "required": ["severity", "title", "path", "line", "evidence", "recommendation", "fingerprint"],
         "properties": {
           "severity": { "type": "string", "enum": ["critical", "high", "medium", "low", "info"] },
           "title": { "type": "string" },
-          "path": { "type": "string" },
-          "line": { "type": "integer", "minimum": 1 },
+          "path": { "type": ["string", "null"] },
+          "line": { "type": ["integer", "null"], "minimum": 1 },
           "evidence": { "type": "string" },
           "recommendation": { "type": "string" },
           "fingerprint": { "type": "string" }
