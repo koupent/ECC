@@ -161,7 +161,7 @@ test('delivery completion gate rejects a review that is not bound to the current
   const branch = 'codex/issue-7-task';
   assert.strictEqual(spawnSync('git', ['switch', '-c', branch], { cwd: fixture }).status, 0);
   writeState(input, {
-    delivery: { status: 'ready', issue_number: 7, branch },
+    delivery: { status: 'ready', issue_number: 7, branch, base_branch: 'main' },
     last_role: 'review',
     review_role: 'review',
     review_status: 'ok',
@@ -189,6 +189,23 @@ test('delivery completion gate rejects a review that is not bound to the current
   }));
   assert.strictEqual(invalidPrData.decision, 'block');
   assert.match(invalidPrData.reason, /invalid data/);
+
+  const wrongBase = JSON.parse(deliveryCompletion.run(JSON.stringify(input), {
+    cwd: fixture,
+    env: fixtureEnv,
+    command(binary, args, commandCwd, commandEnv) {
+      if (binary === 'gh') {
+        return {
+          ok: true,
+          stdout: JSON.stringify([{ url: 'https://example.invalid/pr/1', isDraft: true, number: 1, body: 'Closes #7', baseRefName: 'develop' }]),
+          stderr: ''
+        };
+      }
+      return deliveryCompletion.command(binary, args, commandCwd, commandEnv);
+    }
+  }));
+  assert.strictEqual(wrongBase.decision, 'block');
+  assert.match(wrongBase.reason, /based on main/);
 });
 
 test('delivery completion gate does not allow a required pending delivery to stop silently', () => {

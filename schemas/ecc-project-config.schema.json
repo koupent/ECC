@@ -21,18 +21,19 @@
     "legacyPreserve": {
       "type": "array",
       "uniqueItems": true,
-      "items": { "type": "string", "pattern": "^\\.claude/[A-Za-z0-9._/-]+$" }
+      "items": { "type": "string", "pattern": "^\\.(?:claude|githooks)/[A-Za-z0-9._/-]+$" }
     },
     "legacyArchive": {
       "type": "array",
       "uniqueItems": true,
-      "items": { "type": "string", "pattern": "^\\.claude/[A-Za-z0-9._/-]+$" }
+      "items": { "type": "string", "pattern": "^\\.(?:claude|githooks)/[A-Za-z0-9._/-]+$" }
     },
     "legacySettingsEnv": {
       "type": "array",
       "uniqueItems": true,
       "items": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" }
     },
+    "legacyGitHooksPath": { "const": "remove" },
     "devcontainer": {
       "type": "object",
       "additionalProperties": false,

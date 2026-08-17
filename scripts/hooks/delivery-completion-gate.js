@@ -62,7 +62,7 @@ function run(rawInput, options = {}) {
     return block('A fresh independent Codex review is not bound to the current clean commit. Commit the validated implementation, run `/ecc:code-review` on that commit, address release-blocking findings, and then continue.');
   }
 
-  const prs = execute('gh', ['pr', 'list', '--head', branch, '--state', 'open', '--json', 'url,isDraft,number,body'], cwd, env);
+  const prs = execute('gh', ['pr', 'list', '--head', branch, '--state', 'open', '--json', 'url,isDraft,number,body,baseRefName'], cwd, env);
   if (!prs.ok) {
     recordIncident({ type: 'delivery_pr_lookup_failure', severity: 'minor', message: prs.stderr || 'gh pr list failed' }, { cwd, env });
     return block('Draft PR status could not be verified. Confirm GitHub authentication, push the branch, and create a Draft PR; do not bypass this gate.');
@@ -76,7 +76,10 @@ function run(rawInput, options = {}) {
   }
   const draft = entries.find(pr => pr.isDraft === true);
   if (!draft) {
-    return block(`No open Draft PR exists for ${branch}. Push the branch and create one with \`gh pr create --draft\`, linking Issue #${delivery.issue_number}. Do not Ready or merge it.`);
+    return block(`No open Draft PR exists for ${branch}. Push the branch and create one with \`gh pr create --draft --base ${delivery.base_branch}\`, linking Issue #${delivery.issue_number}. Do not Ready or merge it.`);
+  }
+  if (draft.baseRefName !== delivery.base_branch) {
+    return block(`Draft PR #${draft.number} targets ${draft.baseRefName || '<unknown>'}, but this delivery is based on ${delivery.base_branch}. Recreate or retarget the Draft PR without bypassing the gate.`);
   }
   const issueLink = new RegExp(`(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\s+#${delivery.issue_number}\\b`, 'i');
   if (!issueLink.test(String(draft.body || ''))) {
