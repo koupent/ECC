@@ -11,7 +11,11 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const SCRIPT = path.join(__dirname, '..', '..', 'scripts', 'hooks', 'plugin-hook-bootstrap.js');
-const { normalizePluginRootForPlatform } = require(SCRIPT);
+const {
+  isCriticalNodeHook,
+  nodeTimeoutMs,
+  normalizePluginRootForPlatform,
+} = require(SCRIPT);
 
 function createTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'plugin-hook-bootstrap-'));
@@ -100,6 +104,23 @@ function runTests() {
       normalizePluginRootForPlatform('/c/Users/x/.claude/plugins/ecc', 'linux'),
       '/c/Users/x/.claude/plugins/ecc'
     );
+  })) passed++; else failed++;
+
+  if (test('gives the Codex Context Builder a role-length bootstrap timeout', () => {
+    assert.strictEqual(nodeTimeoutMs(['ordinary-hook'], {}), 30000);
+    assert.strictEqual(
+      nodeTimeoutMs(['user:prompt:codex-context-builder'], {}),
+      (30 * 60 * 1000) + 30000
+    );
+    assert.strictEqual(
+      nodeTimeoutMs(['user:prompt:codex-context-builder'], { ECC_HOOK_BOOTSTRAP_TIMEOUT_MS: '1234' }),
+      1234
+    );
+  })) passed++; else failed++;
+
+  if (test('marks the Context Builder bootstrap as critical', () => {
+    assert.strictEqual(isCriticalNodeHook(['user:prompt:codex-context-builder']), true);
+    assert.strictEqual(isCriticalNodeHook(['pre:observe']), false);
   })) passed++; else failed++;
 
   if (test('does not mangle UNC or non-drive absolute paths on Windows', () => {
@@ -287,6 +308,29 @@ process.exit(7);
       assert.strictEqual(result.status, 1);
       assert.strictEqual(result.stdout, '');
       assert.ok(result.stderr.includes('Cannot find module'));
+    } finally {
+      cleanup(root);
+    }
+  })) passed++; else failed++;
+
+  if (test('critical Context Builder bootstrap fails closed on timeout', () => {
+    const root = createTempDir();
+    try {
+      writeFile(root, path.join('scripts', 'slow.js'), 'setTimeout(() => {}, 1000);\n');
+
+      const result = run([
+        'node',
+        path.join('scripts', 'slow.js'),
+        'user:prompt:codex-context-builder',
+      ], {
+        root,
+        input: 'raw-input',
+        env: { ECC_HOOK_BOOTSTRAP_TIMEOUT_MS: '20' },
+      });
+
+      assert.strictEqual(result.status, 1);
+      assert.strictEqual(result.stdout, '');
+      assert.ok(result.stderr.includes('ETIMEDOUT'), result.stderr);
     } finally {
       cleanup(root);
     }
