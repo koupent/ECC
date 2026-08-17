@@ -27,6 +27,16 @@ Identify the project's build tool and run the build:
 3. Sort by dependency order (fix imports/types before logic errors)
 4. Count total errors for progress tracking
 
+Before editing, delegate diagnosis to Codex and use its structured evidence as
+the starting hypothesis:
+
+```bash
+node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" failure-diagnosis --request "Diagnose these build errors without editing files: <errors>" --session "$CLAUDE_SESSION_ID"
+```
+
+If Codex reports fallback, diagnose with the native ECC flow. Claude remains
+responsible for every product-code fix.
+
 ## Step 3: Fix Loop (One Error at a Time)
 
 For each error:

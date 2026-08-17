@@ -80,7 +80,7 @@
 
 ## 最新动态
 
-### v2.1.0 — 智能体 Harness 操作系统（2026年6月）
+### v2.1.0-koute.1 — 智能体 Harness 操作系统（2026年6月）
 
 2.0 主线稳定版：261 个技能、control-pane 基底（会话适配器 + MCP 清单）、worktree 生命周期服务，以及 [ECC Discord 社区](https://discord.gg/36yGMHGFbR)。
 
@@ -192,7 +192,7 @@ Copy-Item -Recurse rules/typescript "$HOME/.claude/rules/"
 /plugin list ecc@ecc
 ```
 
-**完成！** 你现在可以使用 67 个代理、281 个技能和 94 个命令。
+**完成！** 你现在可以使用 67 个代理、281 个技能和 97 个命令。
 
 ### multi-* 命令需要额外配置
 

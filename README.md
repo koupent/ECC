@@ -545,7 +545,7 @@ If you stacked methods, clean up in this order:
 /plugin list ecc@ecc
 ```
 
-**That's it!** You now have access to 67 agents, 281 skills, and 94 legacy command shims.
+**That's it!** You now have access to 67 agents, 281 skills, and 97 legacy command shims.
 
 ### Dashboard GUI
 
@@ -1665,7 +1665,7 @@ The configuration is automatically detected from `.opencode/opencode.json`.
 | Feature | Claude Code         | OpenCode | Status |
 |---------|---------------------|----------|--------|
 | Agents | PASS: 67 agents     | PASS: 12 agents | **Claude Code leads** |
-| Commands | PASS: 94 commands   | PASS: 35 commands | **Claude Code leads** |
+| Commands | PASS: 97 commands   | PASS: 35 commands | **Claude Code leads** |
 | Skills | PASS: 281 skills    | PASS: 37 skills | **Claude Code leads** |
 | Hooks | PASS: 8 event types | PASS: 11 events | **OpenCode has more!** |
 | Rules | PASS: 29 rules      | PASS: 13 instructions | **Claude Code leads** |
@@ -1826,7 +1826,7 @@ ECC is the **first plugin to maximize every major AI coding tool**. Here's how e
 | Feature | Claude Code           | Cursor IDE | Codex CLI | OpenCode | GitHub Copilot |
 |---------|-----------------------|------------|-----------|----------|----------------|
 | **Agents** | 67                    | Shared (AGENTS.md) | Shared (AGENTS.md) | 12 | N/A |
-| **Commands** | 94                    | Shared | Instruction-based | 35 | 5 prompts |
+| **Commands** | 97                    | Shared | Instruction-based | 35 | 5 prompts |
 | **Skills** | 281                   | Shared | 10 (native format) | 37 | Via instructions |
 | **Hook Events** | 8 types               | 15 types | None yet | 11 types | None |
 | **Hook Scripts** | 20+ scripts           | 16 scripts (DRY adapter) | N/A | Plugin hooks | N/A |
@@ -1837,7 +1837,7 @@ ECC is the **first plugin to maximize every major AI coding tool**. Here's how e
 | **Context File** | CLAUDE.md + AGENTS.md | AGENTS.md | AGENTS.md | AGENTS.md | copilot-instructions.md |
 | **Secret Detection** | Hook-based            | beforeSubmitPrompt hook | Sandbox-based | Hook-based | Instruction-based |
 | **Auto-Format** | PostToolUse hook      | afterFileEdit hook | N/A | file.edited hook | N/A |
-| **Version** | Plugin | Plugin | Reference config | 2.1.0 | Instruction layer |
+| **Version** | Plugin | Plugin | Reference config | 2.1.0-koute.1 | Instruction layer |
 
 **Key architectural decisions:**
 - **AGENTS.md** at root is the universal cross-tool file (read by Claude Code, Cursor, Codex, and OpenCode — GitHub Copilot uses `.github/copilot-instructions.md` instead)

@@ -81,7 +81,7 @@
 
 ## 最新动态
 
-### v2.1.0 — 智能体 Harness 操作系统（2026年6月）
+### v2.1.0-koute.1 — 智能体 Harness 操作系统（2026年6月）
 
 2.0 主线稳定版：261 个技能、control-pane 基底（会话适配器 + MCP 清单）、worktree 生命周期服务，以及 [ECC Discord 社区](https://discord.gg/36yGMHGFbR)。
 
@@ -256,7 +256,7 @@ Copy-Item -Recurse rules/typescript "$HOME/.claude/rules/"
 /plugin list ecc@ecc
 ```
 
-**搞定！** 你现在可以使用 67 个智能体、281 项技能和 94 个命令了。
+**搞定！** 你现在可以使用 67 个智能体、281 项技能和 97 个命令了。
 
 ***
 
@@ -1169,7 +1169,7 @@ opencode
 | 功能特性 | Claude Code   | OpenCode | 状态 |
 |---------|---------------|----------|--------|
 | 智能体 | PASS: 67 个    | PASS: 12 个 | **Claude Code 领先** |
-| 命令 | PASS: 94 个    | PASS: 35 个 | **Claude Code 领先** |
+| 命令 | PASS: 97 个    | PASS: 35 个 | **Claude Code 领先** |
 | 技能 | PASS: 281 项   | PASS: 37 项 | **Claude Code 领先** |
 | 钩子 | PASS: 8 种事件类型 | PASS: 11 种事件 | **OpenCode 更多！** |
 | 规则 | PASS: 29 条    | PASS: 13 条指令 | **Claude Code 领先** |
@@ -1277,7 +1277,7 @@ ECC 是**第一个最大化利用每个主要 AI 编码工具的插件**。以�
 | 功能特性 | Claude Code           | Cursor IDE | Codex CLI | OpenCode |
 |---------|-----------------------|------------|-----------|----------|
 | **智能体** | 67                    | 共享 (AGENTS.md) | 共享 (AGENTS.md) | 12 |
-| **命令** | 94                    | 共享 | 基于指令 | 35 |
+| **命令** | 97                    | 共享 | 基于指令 | 35 |
 | **技能** | 281                   | 共享 | 10 (原生格式) | 37 |
 | **钩子事件** | 8 种类型                 | 15 种类型 | 暂无 | 11 种类型 |
 | **钩子脚本** | 20+ 个脚本               | 16 个脚本 (DRY 适配器) | N/A | 插件钩子 |
@@ -1288,7 +1288,7 @@ ECC 是**第一个最大化利用每个主要 AI 编码工具的插件**。以�
 | **上下文文件** | CLAUDE.md + AGENTS.md | AGENTS.md | AGENTS.md | AGENTS.md |
 | **秘密检测** | 基于钩子                  | beforeSubmitPrompt 钩子 | 基于沙箱 | 基于钩子 |
 | **自动格式化** | PostToolUse 钩子        | afterFileEdit 钩子 | N/A | file.edited 钩子 |
-| **版本** | 插件 | 插件 | 参考配置 | 2.1.0 |
+| **版本** | 插件 | 插件 | 参考配置 | 2.1.0-koute.1 |
 
 **关键架构决策：**
 

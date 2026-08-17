@@ -33,6 +33,16 @@ npm run scan -- --path "${TARGET_PATH:-.}" --format text
 
 Do not invent findings. Use AgentShield output as the source of truth and separate scanner facts from follow-up judgment.
 
+After the deterministic scan, run an independent Codex security review over
+the same scope. Codex is a validator, not the source of scanner facts:
+
+```bash
+node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" security-review --request "Validate the security scan for ${TARGET_PATH:-.}; focus on release-blocking defects and cite repository evidence" --session "$CLAUDE_SESSION_ID"
+```
+
+On Codex failure, record the fallback and continue with the native
+`ecc:security-reviewer` path.
+
 ## Review Checklist
 
 1. Identify active runtime findings first:

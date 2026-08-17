@@ -35,6 +35,16 @@ If no changed files, stop: "Nothing to review."
 
 ### Phase 2 — REVIEW
 
+Run the fork's fresh-context Codex reviewer first:
+
+```bash
+node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --request "Review the current diff for correctness, security, regressions, and release blockers" --session "$CLAUDE_SESSION_ID"
+```
+
+Use its findings as independent evidence in the ECC review. If Codex reports a
+fallback, continue with the native review. ECC retains control of review count,
+severity policy, and final judgment.
+
 Read each changed file in full. Check for:
 
 **Security Issues (CRITICAL):**

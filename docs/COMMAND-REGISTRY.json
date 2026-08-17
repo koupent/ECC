@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "totalCommands": 94,
+  "totalCommands": 97,
   "commands": [
     {
       "command": "aside",
@@ -46,6 +46,33 @@
       "allAgents": [],
       "skills": [],
       "path": "commands/code-review.md"
+    },
+    {
+      "command": "codex-context",
+      "description": "Run the Codex Context Builder and return a compact repository evidence packet.",
+      "type": "build",
+      "primaryAgents": [],
+      "allAgents": [],
+      "skills": [],
+      "path": "commands/codex-context.md"
+    },
+    {
+      "command": "codex-doctor",
+      "description": "Diagnose the ECC fork's Codex CLI, authentication, models, sandbox, and project configuration.",
+      "type": "general",
+      "primaryAgents": [],
+      "allAgents": [],
+      "skills": [],
+      "path": "commands/codex-doctor.md"
+    },
+    {
+      "command": "codex-task-reset",
+      "description": "Reset the current ECC Codex task state so the next request builds fresh context.",
+      "type": "build",
+      "primaryAgents": [],
+      "allAgents": [],
+      "skills": [],
+      "path": "commands/codex-task-reset.md"
     },
     {
       "command": "cost-report",
@@ -1028,8 +1055,8 @@
   ],
   "statistics": {
     "byType": {
-      "build": 2,
-      "general": 10,
+      "build": 4,
+      "general": 11,
       "orchestration": 11,
       "planning": 2,
       "refactoring": 1,
