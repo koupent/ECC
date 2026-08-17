@@ -110,6 +110,9 @@ function roleInstructions(role, request) {
       '',
       'Explore the repository broadly enough to replace the parent Claude session\'s initial code reading.',
       'Summarize the implementation surface, relevant files, constraints, risks, and exact verification commands.',
+      'Treat permission, sandbox, network, and command failures as unverified observations, never as proof that a path, tool, or account is absent.',
+      'Do not diagnose orchestration session IDs, delivery state, GitHub authentication, or Codex authentication; the parent harness owns those checks.',
+      'Do not claim a path or tool is missing unless a direct filesystem or executable lookup succeeded and proved absence.',
       'Do not edit any file.'
     );
   } else if (role === 'bug-reproduction-test' || role === 'contract-test') {

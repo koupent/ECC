@@ -122,7 +122,6 @@
     ],
     "UserPromptSubmit": [
       {
-        "matcher": "*",
         "hooks": [
           {
             "type": "command",
@@ -213,7 +212,6 @@
     ],
     "Stop": [
       {
-        "matcher": "*",
         "hooks": [
           {
             "type": "command",
@@ -225,7 +223,6 @@
         "id": "stop:delivery-completion"
       },
       {
-        "matcher": "*",
         "hooks": [
           {
             "type": "command",
@@ -237,7 +234,6 @@
         "id": "stop:format-typecheck"
       },
       {
-        "matcher": "*",
         "hooks": [
           {
             "type": "command",
@@ -248,7 +244,6 @@
         "id": "stop:check-console-log"
       },
       {
-        "matcher": "*",
         "hooks": [
           {
             "type": "command",
@@ -261,7 +256,6 @@
         "id": "stop:session-end"
       },
       {
-        "matcher": "*",
         "hooks": [
           {
             "type": "command",
@@ -274,7 +268,6 @@
         "id": "stop:evaluate-session"
       },
       {
-        "matcher": "*",
         "hooks": [
           {
             "type": "command",
@@ -287,7 +280,6 @@
         "id": "stop:cost-tracker"
       },
       {
-        "matcher": "*",
         "hooks": [
           {
             "type": "command",

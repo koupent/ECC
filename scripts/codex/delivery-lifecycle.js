@@ -29,6 +29,18 @@ function slug(value) {
   return ascii || 'task';
 }
 
+function explicitIssueNumber(request) {
+  const match = String(request || '').match(/\bissue\s*#?\s*(\d+)\b/i);
+  return match ? Number(match[1]) : null;
+}
+
+function normalizeIssueTitle(value) {
+  return String(value || '')
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\s\u3000()[\]{}「」『』【】]/g, '');
+}
+
 function initializeDelivery(input, request, options = {}) {
   const env = options.env || process.env;
   const cwd = options.cwd || input.cwd || process.cwd();
@@ -43,6 +55,7 @@ function initializeDelivery(input, request, options = {}) {
     status: 'pending',
     request_hash: requestHash,
     title: titleFromRequest(request),
+    requested_issue_number: explicitIssueNumber(request),
     base_branch: config.deliveryBaseBranch,
     issue_number: null,
     issue_url: null,
@@ -97,11 +110,25 @@ function parseIssueNumber(url) {
 }
 
 function findDuplicateIssue(delivery, options = {}) {
-  const raw = runCommand('gh', ['issue', 'list', '--state', 'open', '--limit', '100', '--json', 'number,title,url,body'], options);
+  const execute = options.runCommand || runCommand;
+  if (delivery.requested_issue_number) {
+    const raw = execute(
+      'gh',
+      ['issue', 'view', String(delivery.requested_issue_number), '--json', 'number,title,url,state'],
+      options
+    );
+    const referenced = JSON.parse(raw || '{}');
+    if (String(referenced.state || '').toUpperCase() !== 'OPEN') {
+      throw new Error(`Explicitly referenced Issue #${delivery.requested_issue_number} is not open; refusing to create a duplicate.`);
+    }
+    return referenced;
+  }
+
+  const raw = execute('gh', ['issue', 'list', '--state', 'open', '--limit', '100', '--json', 'number,title,url,body'], options);
   const issues = JSON.parse(raw || '[]');
-  const needle = delivery.title.toLowerCase();
+  const needle = normalizeIssueTitle(delivery.title);
   return issues.find(issue => {
-    const title = String(issue.title || '').toLowerCase();
+    const title = normalizeIssueTitle(issue.title);
     const body = String(issue.body || '');
     const sameFingerprint = body.includes(`Request fingerprint: \`${delivery.request_hash}\``);
     const strongTitleOverlap = title.length >= 24 && needle.length >= 24 && (title.includes(needle) || needle.includes(title));
@@ -186,9 +213,11 @@ if (require.main === module) {
 }
 
 module.exports = {
+  explicitIssueNumber,
   findDuplicateIssue,
   initializeDelivery,
   isDeliveryRequest,
+  normalizeIssueTitle,
   parseIssueNumber,
   pendingSessionForProject,
   prepareDelivery,

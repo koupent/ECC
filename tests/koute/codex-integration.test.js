@@ -16,7 +16,7 @@ const {
   resetState,
   writeState
 } = require('../../scripts/codex/runtime-state');
-const { isTestPath, requireUsableResult, runRole, validateResult, workingTreeSignature } = require('../../scripts/codex/run-role');
+const { isTestPath, requireUsableResult, roleInstructions, runRole, validateResult, workingTreeSignature } = require('../../scripts/codex/run-role');
 const { eligible, ensureForkTarget, publicIncident } = require('../../scripts/codex/incident-worker');
 const { record } = require('../../scripts/codex/record-event');
 const contextGate = require('../../scripts/hooks/codex-context-gate');
@@ -24,7 +24,16 @@ const contextBuilder = require('../../scripts/hooks/codex-context-builder');
 const deliveryGate = require('../../scripts/hooks/delivery-lifecycle-gate');
 const deliveryCompletion = require('../../scripts/hooks/delivery-completion-gate');
 const configProtection = require('../../scripts/hooks/config-protection');
-const { initializeDelivery, isDeliveryRequest, parseIssueNumber, pendingSessionForProject, slug } = require('../../scripts/codex/delivery-lifecycle');
+const {
+  explicitIssueNumber,
+  findDuplicateIssue,
+  initializeDelivery,
+  isDeliveryRequest,
+  normalizeIssueTitle,
+  parseIssueNumber,
+  pendingSessionForProject,
+  slug
+} = require('../../scripts/codex/delivery-lifecycle');
 
 let passed = 0;
 let failed = 0;
@@ -156,6 +165,34 @@ test('delivery request classifier ignores chat and recognizes implementation wor
   assert.strictEqual(slug('Fix generated worktrees'), 'fix-generated-worktrees');
 });
 
+test('delivery preparation prioritizes an explicit open Issue reference and normalizes Unicode titles', () => {
+  assert.strictEqual(explicitIssueNumber('GitHub Issue #9「proxyへ移行」'), 9);
+  assert.strictEqual(explicitIssueNumber('issue 42 を修正してください'), 42);
+  assert.strictEqual(explicitIssueNumber('Issue番号を調査してください'), null);
+  assert.strictEqual(normalizeIssueTitle('Proxy（移行）'), normalizeIssueTitle('proxy ( 移行 )'));
+
+  const delivery = {
+    request_hash: 'request-hash',
+    title: 'GitHub Issue #9「Next.js middleware（proxyへの移行）」',
+    requested_issue_number: 9
+  };
+  const issue = findDuplicateIssue(delivery, {
+    runCommand(binary, args) {
+      assert.strictEqual(binary, 'gh');
+      assert.deepStrictEqual(args.slice(0, 3), ['issue', 'view', '9']);
+      return JSON.stringify({ number: 9, title: 'Next.js middleware (proxyへの移行)', url: 'https://example.invalid/issues/9', state: 'OPEN' });
+    }
+  });
+  assert.strictEqual(issue.number, 9);
+});
+
+test('Context Builder distinguishes unavailable evidence from verified absence and avoids delivery diagnostics', () => {
+  const instructions = roleInstructions('context-builder', 'Issue #9を修正してください');
+  assert.match(instructions, /unverified/i);
+  assert.match(instructions, /Do not diagnose.*authentication/i);
+  assert.match(instructions, /Do not claim.*missing/i);
+});
+
 test('required delivery gate blocks edits until issue and branch evidence are ready', () => {
   const fixture = createGitFixture('delivery-gate-repo');
   fs.writeFileSync(
@@ -258,6 +295,25 @@ test('delivery completion gate rejects a review that is not bound to the current
   }));
   assert.strictEqual(wrongBase.decision, 'block');
   assert.match(wrongBase.reason, /based on main/);
+
+  const rawInput = JSON.stringify(input);
+  assert.strictEqual(deliveryCompletion.run(rawInput, {
+    cwd: fixture,
+    env: fixtureEnv,
+    command(binary, args, commandCwd, commandEnv) {
+      if (binary === 'gh') {
+        return {
+          ok: true,
+          stdout: JSON.stringify([{ url: 'https://example.invalid/pr/2', isDraft: true, number: 2, body: 'Closes #7', baseRefName: 'main' }]),
+          stderr: ''
+        };
+      }
+      return deliveryCompletion.command(binary, args, commandCwd, commandEnv);
+    }
+  }), rawInput);
+  const completed = readState(input, fixtureEnv);
+  assert.strictEqual(completed.delivery.status, 'draft-pr');
+  assert.strictEqual(completed.delivery.draft_pr_url, 'https://example.invalid/pr/2');
 });
 
 test('delivery completion gate does not allow a required pending delivery to stop silently', () => {
@@ -554,6 +610,9 @@ test('plugin manifest does not explicitly register hooks twice', () => {
   assert.ok(hooks.PreToolUse.some(group => group.id === 'pre:edit-write:delivery-lifecycle'));
   assert.ok(hooks.Stop.some(group => group.id === 'stop:delivery-completion'));
   assert.ok(hooks.SessionEnd.some(group => group.id === 'session:end:codex-incident-worker'));
+  for (const event of ['UserPromptSubmit', 'Stop']) {
+    assert.ok(hooks[event].every(group => !Object.prototype.hasOwnProperty.call(group, 'matcher')), `${event} does not support matchers`);
+  }
 });
 
 test('GateGuard reuses scoped Context Builder evidence without disabling destructive Bash checks', () => {
