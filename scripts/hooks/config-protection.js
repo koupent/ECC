@@ -15,6 +15,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { readState, appendEvent } = require('../codex/runtime-state');
 
 const MAX_STDIN = 1024 * 1024;
 let raw = '';
@@ -74,6 +75,37 @@ function parseInput(inputOrRaw) {
   return inputOrRaw && typeof inputOrRaw === 'object' ? inputOrRaw : {};
 }
 
+function contextCoversFile(state, filePath) {
+  const files = state && state.context && Array.isArray(state.context.files) ? state.context.files : [];
+  const target = String(filePath || '').replace(/\\/g, '/').toLowerCase();
+  return files.some(candidate => {
+    const value = candidate && typeof candidate === 'object' ? candidate.path : candidate;
+    const normalized = String(value || '').replace(/\\/g, '/').toLowerCase();
+    return normalized && (target === normalized || target.endsWith(`/${normalized}`) || path.basename(target) === path.basename(normalized));
+  });
+}
+
+function isAdditiveNonWeakeningEdit(toolInput) {
+  const before = String(toolInput.old_string || '');
+  const after = String(toolInput.new_string || '');
+  if (!before || after.length < before.length) return false;
+
+  // Every meaningful pre-change line must survive. The additions are limited
+  // to ignore/exclude declarations, comments, and punctuation. This permits a
+  // scoped generated-directory exclusion while rejecting rule removal,
+  // severity downgrades, parser changes, and wholesale rewrites.
+  const quoted = value => [...value.matchAll(/['"]([^'"]+)['"]/g)].map(match => match[1]);
+  const oldValues = quoted(before);
+  const newValues = quoted(after);
+  if (!oldValues.every(value => newValues.includes(value))) return false;
+  const addedValues = newValues.filter(value => !oldValues.includes(value));
+  if (addedValues.length === 0) return false;
+  const generatedPath = /^(?:\.worktrees(?:\/\*\*)?|\.next(?:\/\*\*)?|dist(?:\/\*\*)?|build(?:\/\*\*)?|coverage(?:\/\*\*)?)$/i;
+  return addedValues.every(value => generatedPath.test(value)) &&
+    /(?:ignore|exclude)/i.test(after) &&
+    !/(?:rules?|severity|parser|plugin|extends?)\s*[:=]/i.test(after.replace(before, ''));
+}
+
 /**
  * Exportable run() for in-process execution via run-with-flags.js.
  * Avoids the ~50-100ms spawnSync overhead when available.
@@ -85,7 +117,7 @@ function run(inputOrRaw, options = {}) {
       stderr:
         `BLOCKED: Hook input exceeded ${options.maxStdin || MAX_STDIN} bytes. ` +
         'Refusing to bypass config-protection on a truncated payload. ' +
-        'Retry with a smaller edit or disable the config-protection hook temporarily.'
+        'Retry with a smaller edit; otherwise request explicit owner review.'
     };
   }
 
@@ -130,20 +162,37 @@ function run(inputOrRaw, options = {}) {
       return { exitCode: 0 };
     }
 
+    const env = options.env || process.env;
+    const state = readState(input, env);
+    if (
+      state.delivery && state.delivery.status === 'ready' &&
+      state.context_status === 'ready' && contextCoversFile(state, filePath) &&
+      isAdditiveNonWeakeningEdit(input.tool_input || {})
+    ) {
+      appendEvent({
+        kind: 'evidence',
+        type: 'protected_config_additive_change',
+        status: 'PASS',
+        project: state.project,
+        message: `Allowed additive generated-path exclusion in ${basename}`
+      }, env);
+      return { exitCode: 0 };
+    }
+
     return {
       exitCode: 2,
       stderr:
         `BLOCKED: Modifying ${basename} is not allowed. ` +
         'Fix the source code to satisfy linter/formatter rules instead of ' +
         'weakening the config. If this is a legitimate config change, ' +
-        'disable the config-protection hook temporarily.'
+        'keep the hook enabled and request explicit owner review. Additive generated-path exclusions are allowed only on a prepared delivery branch when the independent Context Builder covered this file.'
     };
   }
 
   return { exitCode: 0 };
 }
 
-module.exports = { run };
+module.exports = { contextCoversFile, isAdditiveNonWeakeningEdit, run };
 
 // Stdin fallback for spawnSync execution
 let truncated = /^(1|true|yes)$/i.test(String(process.env.ECC_HOOK_INPUT_TRUNCATED || ''));

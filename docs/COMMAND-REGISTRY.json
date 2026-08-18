@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "totalCommands": 94,
+  "totalCommands": 99,
   "commands": [
     {
       "command": "aside",
@@ -46,6 +46,42 @@
       "allAgents": [],
       "skills": [],
       "path": "commands/code-review.md"
+    },
+    {
+      "command": "codex-acceptance-audit",
+      "description": "Audit a completed ECC delivery from external state, Git, and GitHub evidence.",
+      "type": "review",
+      "primaryAgents": [],
+      "allAgents": [],
+      "skills": [],
+      "path": "commands/codex-acceptance-audit.md"
+    },
+    {
+      "command": "codex-context",
+      "description": "Run the Codex Context Builder and return a compact repository evidence packet.",
+      "type": "build",
+      "primaryAgents": [],
+      "allAgents": [],
+      "skills": [],
+      "path": "commands/codex-context.md"
+    },
+    {
+      "command": "codex-doctor",
+      "description": "Diagnose the ECC fork's Codex CLI, authentication, models, sandbox, and project configuration.",
+      "type": "general",
+      "primaryAgents": [],
+      "allAgents": [],
+      "skills": [],
+      "path": "commands/codex-doctor.md"
+    },
+    {
+      "command": "codex-task-reset",
+      "description": "Reset the current ECC Codex task state so the next request builds fresh context.",
+      "type": "build",
+      "primaryAgents": [],
+      "allAgents": [],
+      "skills": [],
+      "path": "commands/codex-task-reset.md"
     },
     {
       "command": "cost-report",
@@ -98,6 +134,15 @@
         "tdd-workflow"
       ],
       "path": "commands/cpp-test.md"
+    },
+    {
+      "command": "delivery-prepare",
+      "description": "Prepare the required GitHub Issue and issue-linked branch before editing.",
+      "type": "general",
+      "primaryAgents": [],
+      "allAgents": [],
+      "skills": [],
+      "path": "commands/delivery-prepare.md"
     },
     {
       "command": "ecc-guide",
@@ -1028,12 +1073,12 @@
   ],
   "statistics": {
     "byType": {
-      "build": 2,
-      "general": 10,
+      "build": 4,
+      "general": 12,
       "orchestration": 11,
       "planning": 2,
       "refactoring": 1,
-      "review": 15,
+      "review": 16,
       "testing": 53
     },
     "topAgents": [

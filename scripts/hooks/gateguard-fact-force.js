@@ -25,6 +25,7 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { readState, appendEvent } = require('../codex/runtime-state');
 const { extractCommandSubstitutions, extractSubshellGroups, extractBraceGroups } = require('../lib/shell-substitution');
 
 // Session state — scoped per session to avoid cross-session races.
@@ -1197,6 +1198,36 @@ function run(rawInput) {
 
     if (inSubagent) {
       return rawInput; // parent session already passed the first-touch file gate
+    }
+
+    // The fork's Context Builder is an independent repository investigation.
+    // If its signed session packet names this existing file, asking Claude to
+    // repeat Glob/Grep/Read solely to appease GateGuard is wasted work. Reuse
+    // that evidence and mark the first touch as satisfied. New files are not
+    // covered because the packet could not have investigated them.
+    const codexState = readState(data, process.env);
+    const contextFiles = codexState && codexState.context && Array.isArray(codexState.context.files)
+      ? codexState.context.files
+      : [];
+    const normalizedTarget = normalizeForMatch(filePath);
+    const contextCoversTarget = toolName === 'Edit' && contextFiles.some(candidate => {
+      const normalizedCandidate = normalizeForMatch(candidate);
+      return normalizedCandidate && (
+        normalizedTarget === normalizedCandidate ||
+        normalizedTarget.endsWith(`/${normalizedCandidate}`) ||
+        normalizedCandidate.endsWith(`/${path.basename(normalizedTarget)}`)
+      );
+    });
+    if (contextCoversTarget && codexState.context_status === 'ready') {
+      markChecked(filePath);
+      appendEvent({
+        kind: 'evidence',
+        type: 'gateguard_context_reuse',
+        status: 'PASS',
+        project: codexState.project,
+        message: `Context Builder evidence reused for ${path.basename(filePath)}`
+      });
+      return rawInput;
     }
 
     if (!isChecked(filePath)) {

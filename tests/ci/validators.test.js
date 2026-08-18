@@ -1876,13 +1876,28 @@ function runTests() {
       hooks: {
         PreToolUse: [{ matcher: 'test', hooks: [{ type: 'command', command: 'echo pre' }] }],
         PostToolUse: [{ matcher: 'test', hooks: [{ type: 'command', command: 'echo post' }] }],
-        Stop: [{ matcher: 'test', hooks: [{ type: 'command', command: 'echo stop' }] }]
+        Stop: [{ hooks: [{ type: 'command', command: 'echo stop' }] }]
       }
     }));
 
     const result = runValidatorWithDir('validate-hooks', 'HOOKS_FILE', hooksFile);
     assert.strictEqual(result.code, 0, 'Should accept multiple valid event types');
     assert.ok(result.stdout.includes('3'), 'Should report 3 matchers validated');
+    cleanupTestDir(testDir);
+  })) passed++; else failed++;
+
+  if (test('rejects matchers on events whose current Claude Code contract has no matcher support', () => {
+    const testDir = createTestDir();
+    const hooksFile = path.join(testDir, 'hooks.json');
+    fs.writeFileSync(hooksFile, JSON.stringify({
+      hooks: {
+        Stop: [{ matcher: '*', hooks: [{ type: 'command', command: 'echo stop' }] }]
+      }
+    }));
+
+    const result = runValidatorWithDir('validate-hooks', 'HOOKS_FILE', hooksFile);
+    assert.notStrictEqual(result.code, 0, 'Should reject a Stop matcher that prevents the hook from firing');
+    assert.ok(result.stderr.includes("does not support a 'matcher' field"));
     cleanupTestDir(testDir);
   })) passed++; else failed++;
 

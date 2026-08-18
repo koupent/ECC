@@ -7,6 +7,27 @@ const { spawnSync } = require('child_process');
 const { ensureAgentDataHomeEnv } = require('../lib/agent-data-home');
 
 const SHELL_PROBE_TIMEOUT_MS = 2000;
+const DEFAULT_NODE_TIMEOUT_MS = 30000;
+// The Context Builder is allowed to run a full Codex role (30 minutes by
+// default). Keep the bootstrap alive slightly longer than the role so the
+// role can record a deterministic fallback instead of being killed by the
+// generic 30-second wrapper.
+const CONTEXT_BUILDER_NODE_TIMEOUT_MS = (30 * 60 * 1000) + 30000;
+
+function nodeTimeoutMs(args = [], env = process.env) {
+  const override = Number(env.ECC_HOOK_BOOTSTRAP_TIMEOUT_MS);
+  if (Number.isFinite(override) && override > 0) {
+    return Math.floor(override);
+  }
+
+  return args[0] === 'user:prompt:codex-context-builder'
+    ? CONTEXT_BUILDER_NODE_TIMEOUT_MS
+    : DEFAULT_NODE_TIMEOUT_MS;
+}
+
+function isCriticalNodeHook(args = []) {
+  return args[0] === 'user:prompt:codex-context-builder';
+}
 
 function readStdinRaw() {
   try {
@@ -151,7 +172,7 @@ function spawnNode(rootDir, relPath, raw, args) {
     encoding: 'utf8',
     env: hookEnv,
     cwd: process.cwd(),
-    timeout: 30000,
+    timeout: nodeTimeoutMs(args),
     windowsHide: true,
   });
 }
@@ -241,21 +262,28 @@ function main() {
     }
   } catch (error) {
     writeStderr(`[Hook] bootstrap resolution failed: ${error.message}\n`);
+    if (mode === 'node' && isCriticalNodeHook(args)) {
+      process.exit(1);
+    }
     process.stdout.write(raw);
     process.exit(0);
   }
 
-  passthrough(raw, result);
+  const executionFailed = Boolean(result.error || result.signal || result.status === null);
+  const criticalFailure = mode === 'node' && isCriticalNodeHook(args) && executionFailed;
+  if (!criticalFailure) {
+    passthrough(raw, result);
+  }
   writeStderr(result.stderr);
 
-  if (result.error || result.signal || result.status === null) {
+  if (executionFailed) {
     const reason = result.error
       ? result.error.message
       : result.signal
         ? `terminated by signal ${result.signal}`
         : 'missing exit status';
     writeStderr(`[Hook] bootstrap execution failed: ${reason}\n`);
-    process.exit(0);
+    process.exit(criticalFailure ? 1 : 0);
   }
 
   process.exit(Number.isInteger(result.status) ? result.status : 0);
@@ -274,5 +302,7 @@ if (require.main === module || require.main === undefined) {
 
 module.exports = {
   main,
+  nodeTimeoutMs,
+  isCriticalNodeHook,
   normalizePluginRootForPlatform,
 };

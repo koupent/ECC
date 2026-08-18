@@ -14,6 +14,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { sanitizeSessionId, readBridge, renameWithRetry } = require('../lib/session-bridge');
+const { recordIncident } = require('../codex/runtime-state');
 
 const CONTEXT_WARNING_PCT = 35;
 const CONTEXT_CRITICAL_PCT = 25;
@@ -255,6 +256,17 @@ function run(rawInput) {
     warnState.lastSeverity = topSeverity;
     warnState.lastMessage = message;
     writeWarnState(sessionId, warnState);
+
+    const loopWarning = warnings.find(warning => warning.type === 'loop');
+    if (loopWarning) {
+      recordIncident({
+        type: 'repeated_tool_call',
+        severity: 'minor',
+        hook_id: 'post:ecc-context-monitor',
+        message: loopWarning.message,
+        metadata: { session_id: sessionId }
+      });
+    }
 
     const output = {
       hookSpecificOutput: {

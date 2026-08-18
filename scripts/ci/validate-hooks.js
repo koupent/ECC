@@ -13,6 +13,7 @@ const HOOKS_SCHEMA_PATH = path.join(__dirname, '../../schemas/hooks.schema.json'
 const VALID_EVENTS = [
   'SessionStart',
   'UserPromptSubmit',
+  'PostToolBatch',
   'PreToolUse',
   'PermissionRequest',
   'PostToolUse',
@@ -24,14 +25,26 @@ const VALID_EVENTS = [
   'PreCompact',
   'InstructionsLoaded',
   'TeammateIdle',
+  'TaskCreated',
   'TaskCompleted',
   'ConfigChange',
   'WorktreeCreate',
   'WorktreeRemove',
+  'CwdChanged',
   'SessionEnd',
 ];
 const VALID_HOOK_TYPES = ['command', 'http', 'prompt', 'agent'];
-const EVENTS_WITHOUT_MATCHER = new Set(['UserPromptSubmit', 'Notification', 'Stop', 'SubagentStop']);
+const EVENTS_WITHOUT_MATCHER = new Set([
+  'UserPromptSubmit',
+  'PostToolBatch',
+  'Stop',
+  'TeammateIdle',
+  'TaskCreated',
+  'TaskCompleted',
+  'WorktreeCreate',
+  'WorktreeRemove',
+  'CwdChanged',
+]);
 
 function isNonEmptyString(value) {
   return typeof value === 'string' && value.trim().length > 0;
@@ -179,7 +192,10 @@ function validateHooks() {
           hasErrors = true;
           continue;
         }
-        if (!('matcher' in matcher) && !EVENTS_WITHOUT_MATCHER.has(eventType)) {
+        if ('matcher' in matcher && EVENTS_WITHOUT_MATCHER.has(eventType)) {
+          console.error(`ERROR: ${eventType}[${i}] does not support a 'matcher' field`);
+          hasErrors = true;
+        } else if (!('matcher' in matcher) && !EVENTS_WITHOUT_MATCHER.has(eventType)) {
           console.error(`ERROR: ${eventType}[${i}] missing 'matcher' field`);
           hasErrors = true;
         } else if ('matcher' in matcher && typeof matcher.matcher !== 'string' && (typeof matcher.matcher !== 'object' || matcher.matcher === null)) {

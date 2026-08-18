@@ -1,0 +1,57 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+
+const FALSE_VALUES = new Set(['0', 'false', 'off', 'no', 'disabled']);
+
+function envEnabled(value, fallback) {
+  if (value === undefined || value === null || String(value).trim() === '') return fallback;
+  return !FALSE_VALUES.has(String(value).trim().toLowerCase());
+}
+
+function findProjectRoot(start = process.cwd()) {
+  let current = path.resolve(start);
+  for (let i = 0; i < 30; i += 1) {
+    if (fs.existsSync(path.join(current, '.git')) || fs.existsSync(path.join(current, '.ecc', 'config.json'))) return current;
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return path.resolve(start);
+}
+
+function readProjectConfig(cwd = process.cwd()) {
+  const root = findProjectRoot(cwd);
+  const file = path.join(root, '.ecc', 'config.json');
+  try {
+    return { root, file, exists: true, value: JSON.parse(fs.readFileSync(file, 'utf8')) };
+  } catch {
+    return { root, file, exists: false, value: {} };
+  }
+}
+
+function loadConfig(cwd = process.cwd(), env = process.env) {
+  const project = readProjectConfig(cwd);
+  const codex = project.value.codex || {};
+  return {
+    projectRoot: project.root,
+    projectConfigPath: project.file,
+    projectEnabled: project.exists,
+    enabled: project.exists && envEnabled(env.ECC_CODEX_ENABLED, codex.enabled !== false),
+    hookProfile: env.ECC_HOOK_PROFILE || project.value.profile || 'standard',
+    contextModel: env.ECC_CODEX_CONTEXT_MODEL || codex.contextModel || 'gpt-5.6-terra',
+    reviewModel: env.ECC_CODEX_REVIEW_MODEL || codex.reviewModel || 'gpt-5.6-sol',
+    effort: env.ECC_CODEX_REASONING_EFFORT || codex.reasoningEffort || 'high',
+    timeoutSeconds: Number(env.ECC_CODEX_TIMEOUT_SECONDS || codex.timeoutSeconds || 1800),
+    externalSandbox: envEnabled(env.ECC_CODEX_EXTERNAL_SANDBOX, false),
+    centralIncidentRepo: env.ECC_INCIDENT_REPOSITORY || codex.incidentRepository || 'koupent/engineering-environment-kit',
+    forkRepo: env.ECC_FORK_REPOSITORY || codex.forkRepository || 'koupent/ECC',
+    autoRemediation: envEnabled(env.ECC_INCIDENT_AUTO_REMEDIATE, codex.autoRemediation !== false),
+    deliveryWorkflow: env.ECC_DELIVERY_WORKFLOW || project.value.deliveryWorkflow || 'advisory',
+    deliveryBaseBranch: env.ECC_DELIVERY_BASE_BRANCH || project.value.deliveryBaseBranch || 'main'
+  };
+}
+
+module.exports = { envEnabled, findProjectRoot, loadConfig, readProjectConfig };

@@ -37,6 +37,15 @@ The assistant will:
 6. **Estimate complexity** (High/Medium/Low)
 7. **Present the plan** and WAIT for your explicit confirmation
 
+Before presenting a substantial plan, ask Codex for one independent critique:
+
+```bash
+node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" plan-critique --request "Critique this implementation plan for missing constraints, failure modes, and unnecessary loops: <draft plan>" --session "$CLAUDE_SESSION_ID"
+```
+
+Incorporate evidence-backed issues only. Do not start a critique/rewrite loop;
+ECC's existing planning and confirmation semantics remain authoritative.
+
 ## Input Modes
 
 | Input | Mode | Behavior |

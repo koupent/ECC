@@ -242,7 +242,7 @@ test('claude marketplace.json keeps only Claude-supported top-level keys', () =>
 
 test('claude marketplace.json has plugins array with the published plugin entry', () => {
   assert.ok(Array.isArray(claudeMarketplace.plugins) && claudeMarketplace.plugins.length > 0, 'Expected plugins array');
-  assert.strictEqual(claudeMarketplace.name, 'ecc');
+  assert.strictEqual(claudeMarketplace.name, 'koute-ecc');
   assert.strictEqual(claudeMarketplace.plugins[0].name, 'ecc');
 });
 

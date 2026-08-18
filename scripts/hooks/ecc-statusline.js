@@ -14,6 +14,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { sanitizeSessionId, readBridge, writeBridgeAtomic } = require('../lib/session-bridge');
+const { readState: readCodexState } = require('../codex/runtime-state');
 
 const AUTO_COMPACT_BUFFER_PCT = 16.5;
 const MAX_STDIN = 1024 * 1024;
@@ -105,6 +106,7 @@ function runStatusline() {
 
       const sessionId = sanitizeSessionId(session);
       const bridge = sessionId ? readBridge(sessionId) : null;
+      const codexState = sessionId ? readCodexState({ session_id: sessionId }) : null;
 
       // Write context % back to bridge for context-monitor
       if (sessionId && bridge && remaining !== null && remaining !== undefined) {
@@ -153,6 +155,12 @@ function runStatusline() {
       }
       if (metricsStr) {
         segments.push(metricsStr);
+      }
+      if (codexState && (codexState.context_status !== 'idle' || codexState.codex_calls > 0 || codexState.codex_failures > 0)) {
+        const codexParts = [`Codex:${codexState.context_status || 'idle'}`, `${codexState.codex_calls || 0}c`];
+        if (codexState.codex_failures > 0) codexParts.push(`${codexState.codex_failures}f`);
+        if (codexState.waste_loops > 0) codexParts.push(`${codexState.waste_loops}w`);
+        segments.push(`\x1b[38;5;141m${codexParts.join(' ')}\x1b[0m`);
       }
       segments.push(`\x1b[2m${dirname}\x1b[0m`);
 

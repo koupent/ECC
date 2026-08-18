@@ -25,6 +25,27 @@
 > [!WARNING]
 > **Official sources only.** Install ECC only from verified channels: the GitHub repository [github.com/affaan-m/ECC](https://github.com/affaan-m/ECC), the npm packages [`ecc-universal`](https://www.npmjs.com/package/ecc-universal) and [`ecc-agentshield`](https://www.npmjs.com/package/ecc-agentshield), the [GitHub App](https://github.com/apps/ecc-tools), the plugin slug `ecc@ecc`, and the project website [ecc.tools](https://ecc.tools). Third-party re-uploads and unofficial mirrors are not maintained or reviewed by the project and may contain malware.
 
+<!-- Separate the upstream security warning from the fork-specific note. -->
+
+> [!NOTE]
+> **Koupent fork.** This repository is the public `koupent/ECC` fork, installed as
+> `ecc@koute-ecc`. It preserves ECC's `standard` workflow and adds a fail-closed
+> Codex Context Builder, independent Codex review, external state/incident
+> telemetry, statusline integration, and an opt-in deterministic delivery gate.
+> It never enables `--dangerously-bypass-approvals-and-sandbox`. Project
+> configuration is validated against
+> [`schemas/ecc-project-config.schema.json`](schemas/ecc-project-config.schema.json).
+
+For projects with `"deliveryWorkflow": "required"`, implementation requests are
+bound to the following Hook-enforced lifecycle:
+
+1. Codex builds the initial repository evidence packet before broad Claude exploration.
+2. `/ecc:delivery-prepare` searches open Issues, selects or creates one, and creates its `codex/issue-*` branch.
+3. Repository edits fail closed until that external-state evidence and branch agree.
+4. A fresh Codex review, clean commit, push, and open Draft PR are required before the task can stop.
+
+The Draft PR gate never marks a PR ready and never merges it.
+
 **211.9K+ stars** | **32.5K+ forks** | **230+ contributors** | **12+ language ecosystems** | **Cross-harness agent workflows**
 
 ---
@@ -545,7 +566,7 @@ If you stacked methods, clean up in this order:
 /plugin list ecc@ecc
 ```
 
-**That's it!** You now have access to 67 agents, 281 skills, and 94 legacy command shims.
+**That's it!** You now have access to 67 agents, 281 skills, and 99 legacy command shims.
 
 ### Dashboard GUI
 
@@ -1665,7 +1686,7 @@ The configuration is automatically detected from `.opencode/opencode.json`.
 | Feature | Claude Code         | OpenCode | Status |
 |---------|---------------------|----------|--------|
 | Agents | PASS: 67 agents     | PASS: 12 agents | **Claude Code leads** |
-| Commands | PASS: 94 commands   | PASS: 35 commands | **Claude Code leads** |
+| Commands | PASS: 99 commands   | PASS: 35 commands | **Claude Code leads** |
 | Skills | PASS: 281 skills    | PASS: 37 skills | **Claude Code leads** |
 | Hooks | PASS: 8 event types | PASS: 11 events | **OpenCode has more!** |
 | Rules | PASS: 29 rules      | PASS: 13 instructions | **Claude Code leads** |
@@ -1826,7 +1847,7 @@ ECC is the **first plugin to maximize every major AI coding tool**. Here's how e
 | Feature | Claude Code           | Cursor IDE | Codex CLI | OpenCode | GitHub Copilot |
 |---------|-----------------------|------------|-----------|----------|----------------|
 | **Agents** | 67                    | Shared (AGENTS.md) | Shared (AGENTS.md) | 12 | N/A |
-| **Commands** | 94                    | Shared | Instruction-based | 35 | 5 prompts |
+| **Commands** | 99                    | Shared | Instruction-based | 35 | 5 prompts |
 | **Skills** | 281                   | Shared | 10 (native format) | 37 | Via instructions |
 | **Hook Events** | 8 types               | 15 types | None yet | 11 types | None |
 | **Hook Scripts** | 20+ scripts           | 16 scripts (DRY adapter) | N/A | Plugin hooks | N/A |
@@ -1837,7 +1858,7 @@ ECC is the **first plugin to maximize every major AI coding tool**. Here's how e
 | **Context File** | CLAUDE.md + AGENTS.md | AGENTS.md | AGENTS.md | AGENTS.md | copilot-instructions.md |
 | **Secret Detection** | Hook-based            | beforeSubmitPrompt hook | Sandbox-based | Hook-based | Instruction-based |
 | **Auto-Format** | PostToolUse hook      | afterFileEdit hook | N/A | file.edited hook | N/A |
-| **Version** | Plugin | Plugin | Reference config | 2.1.0 | Instruction layer |
+| **Version** | Plugin | Plugin | Reference config | 2.1.0-koute.12 | Instruction layer |
 
 **Key architectural decisions:**
 - **AGENTS.md** at root is the universal cross-tool file (read by Claude Code, Cursor, Codex, and OpenCode — GitHub Copilot uses `.github/copilot-instructions.md` instead)
