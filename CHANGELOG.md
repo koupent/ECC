@@ -4,7 +4,15 @@
 
 ### Changed
 
+- Harness incidents now route deterministically to ECC, Engineering Environment Kit, or product follow-up labels, and background remediation is opt-in so the normal Claude Code CLI workflow remains the default repair path.
 - Default MCP connector set reduced to a single connector (`chrome-devtools`) per the new connector policy (`docs/MCP-CONNECTOR-POLICY.md`). The six previous defaults (`github`, `context7`, `exa`, `memory`, `playwright`, `sequential-thinking`) were retired after the June 2026 audit: their jobs are covered by skills wrapping CLIs/REST APIs (`github-ops`, `documentation-lookup`, `exa-search`, e2e skills) or by harness-native features (memory, extended thinking, web search). All six remain opt-in via `mcp-configs/mcp-servers.json`.
+
+### Fixed
+
+- Session-end incident reporting now uses an external-state lock, reconciles duplicate GitHub Issues, preserves failed reports for retry, and mirrors `needs-human` or Draft PR status to the central Issue.
+- Workspace-write Codex roles no longer pass the mutually exclusive `--sandbox` and `--approve-for-me` flags together.
+- Context Builder now treats explicit operational or acceptance commands that need no repository exploration as valid context-free handoffs instead of recording a false Codex failure.
+- Delivery classification now ignores negated mutation constraints such as "do not change" or `変更せず`, preventing diagnostic and acceptance commands from entering the Issue/branch workflow.
 
 ## 2.0.0 - 2026-06-09
 

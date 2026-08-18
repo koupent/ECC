@@ -30,7 +30,7 @@ function record(argv, options = {}) {
   }
   if (kind === 'incident') {
     if (!ALLOWED_SEVERITY.has(value)) throw new Error(usage());
-    return recordIncident({ type, severity: value, message }, { cwd, env });
+    return recordIncident({ type, severity: value, message, target: env.ECC_INCIDENT_TARGET }, { cwd, env });
   }
   throw new Error(usage());
 }

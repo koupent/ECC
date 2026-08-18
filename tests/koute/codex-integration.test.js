@@ -17,7 +17,13 @@ const {
   writeState
 } = require('../../scripts/codex/runtime-state');
 const { isTestPath, requireUsableResult, roleInstructions, runRole, validateResult, workingTreeSignature } = require('../../scripts/codex/run-role');
-const { eligible, ensureForkTarget, publicIncident } = require('../../scripts/codex/incident-worker');
+const {
+  acquireLock,
+  classifyTarget,
+  eligible,
+  ensureForkTarget,
+  publicIncident
+} = require('../../scripts/codex/incident-worker');
 const { record } = require('../../scripts/codex/record-event');
 const contextGate = require('../../scripts/hooks/codex-context-gate');
 const contextBuilder = require('../../scripts/hooks/codex-context-builder');
@@ -99,6 +105,11 @@ function createCodexShim(mode, fixture) {
       "  fs.writeFileSync(path.join(process.cwd(), 'tests', 'contract.test.ts'), 'test placeholder\\n');",
       "  fs.writeFileSync(path.join(process.cwd(), 'src', 'forbidden.ts'), 'forbidden\\n');",
       "}",
+      "if (mode === 'assert-workspace-args') {",
+      "  if (!args.includes('--approve-for-me') || args.includes('--sandbox')) process.exit(23);",
+      "  fs.mkdirSync(path.join(process.cwd(), 'tests'), { recursive: true });",
+      "  fs.writeFileSync(path.join(process.cwd(), 'tests', 'contract.test.ts'), 'test placeholder\\n');",
+      "}",
       "const context = {status:'ok',summary:'fixture context',files:['src/product.ts'],constraints:[],risks:[],verification:[]};",
       "const assessment = {status:'ok',summary:'fixture assessment',findings:[]};",
       "fs.writeFileSync(output, JSON.stringify(mode === 'context' ? context : assessment));"
@@ -160,6 +171,10 @@ test('project config opts into standard Codex integration', () => {
 
 test('delivery request classifier ignores chat and recognizes implementation work', () => {
   assert.strictEqual(isDeliveryRequest('この不具合を修正してください'), true);
+  assert.strictEqual(isDeliveryRequest('製品コードやGit管理ファイルは変更せず、受入コマンドを実行してください'), false);
+  assert.strictEqual(isDeliveryRequest('設定は変更せず、この不具合を修正してください'), true);
+  assert.strictEqual(isDeliveryRequest('Do not change product files; run the acceptance command once.'), false);
+  assert.strictEqual(isDeliveryRequest('Do not change config; fix the parser bug.'), true);
   assert.strictEqual(isDeliveryRequest('設計について相談したいです'), false);
   assert.strictEqual(parseIssueNumber('https://github.com/acme/repo/issues/42'), 42);
   assert.strictEqual(slug('Fix generated worktrees'), 'fix-generated-worktrees');
@@ -191,6 +206,9 @@ test('Context Builder distinguishes unavailable evidence from verified absence a
   assert.match(instructions, /unverified/i);
   assert.match(instructions, /Do not diagnose.*authentication/i);
   assert.match(instructions, /Do not claim.*missing/i);
+  assert.match(instructions, /Do not execute the requested implementation, acceptance, migration, or state-changing command/i);
+  assert.match(instructions, /only an explicit operational or acceptance command.*status=ok.*empty files array/i);
+  assert.match(instructions, /Do not call GitHub write operations/i);
 });
 
 test('Context Builder injects an explicit Issue snapshot before entering the Codex sandbox', () => {
@@ -600,10 +618,51 @@ test('tests-only shim removes product changes and records a critical violation',
   assert.ok(incidents.some(event => event.type === 'codex_write_scope_violation' && event.severity === 'critical'));
 });
 
+test('workspace-write Codex roles use approve-for-me without conflicting sandbox flags', () => {
+  const fixture = createGitFixture('workspace-args-shim-repo');
+  const fixtureEnv = {
+    ...env,
+    ECC_KOUTE_STATE_DIR: path.join(temp, 'workspace-args-shim-state'),
+    ECC_CODEX_BINARY: createCodexShim('assert-workspace-args', fixture)
+  };
+  const output = runRole({
+    role: 'contract-test',
+    request: 'write an independent public contract test',
+    cwd: fixture,
+    sessionId: 'workspace-args-shim',
+    env: fixtureEnv
+  });
+  assert.strictEqual(output.ok, true, JSON.stringify(output));
+  assert.deepStrictEqual(output.changedPaths, ['tests/contract.test.ts']);
+});
+
 test('incident threshold promotes critical once and minor twice', () => {
   assert.ok(eligible({ kind: 'incident', severity: 'critical', count: 1 }));
   assert.ok(eligible({ kind: 'incident', severity: 'minor', count: 2 }));
   assert.ok(!eligible({ kind: 'incident', severity: 'minor', count: 1 }));
+});
+
+test('incident target classification routes Kit, ECC, product, and explicit targets deterministically', () => {
+  assert.strictEqual(classifyTarget({ type: 'devcontainer_voice_failure' }), 'kit');
+  assert.strictEqual(classifyTarget({ type: 'codex_role_failure', message: 'Codex is not logged in' }), 'kit');
+  assert.strictEqual(classifyTarget({ type: 'duplicate_finding', role: 'review' }), 'ecc');
+  assert.strictEqual(classifyTarget({ type: 'product_e2e_failure' }), 'product');
+  assert.strictEqual(classifyTarget({ type: 'unknown', metadata: { target: 'kit' } }), 'kit');
+});
+
+test('incident worker lock prevents concurrent reporting and releases cleanly', () => {
+  const lockEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'incident-lock-state') };
+  const release = acquireLock(lockEnv);
+  assert.strictEqual(typeof release, 'function');
+  assert.strictEqual(acquireLock(lockEnv), null);
+  release();
+  const reacquired = acquireLock(lockEnv);
+  assert.strictEqual(typeof reacquired, 'function');
+  reacquired();
+});
+
+test('background incident remediation is opt-in', () => {
+  assert.strictEqual(loadConfig(repo, env).autoRemediation, false);
 });
 
 test('incident recorder increments identical fingerprints', () => {

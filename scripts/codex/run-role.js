@@ -113,6 +113,9 @@ function roleInstructions(role, request) {
       'Treat permission, sandbox, network, and command failures as unverified observations, never as proof that a path, tool, or account is absent.',
       'Do not diagnose orchestration session IDs, delivery state, GitHub authentication, or Codex authentication; the parent harness owns those checks.',
       'Do not claim a path or tool is missing unless a direct filesystem or executable lookup succeeded and proved absence.',
+      'Do not execute the requested implementation, acceptance, migration, or state-changing command; only inspect and report the context the parent Claude session needs.',
+      'If the request is only an explicit operational or acceptance command and needs no repository investigation, return status=ok with an empty files array and tell the parent Claude session to execute it; this is not insufficient context.',
+      'Do not call GitHub write operations or repository commands whose purpose is to fulfill the user task.',
       'Do not edit any file.'
     );
   } else if (role === 'bug-reproduction-test' || role === 'contract-test') {
@@ -256,8 +259,8 @@ function runRole(options) {
     failureState(role, input, error, cwd, env);
     return { ok: false, role, model, error: error.message, fallback: true };
   }
-  args.push('--sandbox', def.sandbox);
   if (def.sandbox === 'workspace-write') args.push('--approve-for-me');
+  else args.push('--sandbox', def.sandbox);
   args.push('-');
 
   if (role === 'context-builder') {
