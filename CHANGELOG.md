@@ -11,6 +11,7 @@
 
 - Session-end incident reporting now uses an external-state lock, reconciles duplicate GitHub Issues, preserves failed reports for retry, and mirrors `needs-human` or Draft PR status to the central Issue.
 - Workspace-write Codex roles no longer pass the mutually exclusive `--sandbox` and `--approve-for-me` flags together.
+- Context Builder now treats explicit operational or acceptance commands that need no repository exploration as valid context-free handoffs instead of recording a false Codex failure.
 
 ## 2.0.0 - 2026-06-09
 

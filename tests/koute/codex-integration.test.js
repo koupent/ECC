@@ -203,6 +203,7 @@ test('Context Builder distinguishes unavailable evidence from verified absence a
   assert.match(instructions, /Do not diagnose.*authentication/i);
   assert.match(instructions, /Do not claim.*missing/i);
   assert.match(instructions, /Do not execute the requested implementation, acceptance, migration, or state-changing command/i);
+  assert.match(instructions, /only an explicit operational or acceptance command.*status=ok.*empty files array/i);
   assert.match(instructions, /Do not call GitHub write operations/i);
 });
 

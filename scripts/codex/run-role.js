@@ -114,6 +114,7 @@ function roleInstructions(role, request) {
       'Do not diagnose orchestration session IDs, delivery state, GitHub authentication, or Codex authentication; the parent harness owns those checks.',
       'Do not claim a path or tool is missing unless a direct filesystem or executable lookup succeeded and proved absence.',
       'Do not execute the requested implementation, acceptance, migration, or state-changing command; only inspect and report the context the parent Claude session needs.',
+      'If the request is only an explicit operational or acceptance command and needs no repository investigation, return status=ok with an empty files array and tell the parent Claude session to execute it; this is not insufficient context.',
       'Do not call GitHub write operations or repository commands whose purpose is to fulfill the user task.',
       'Do not edit any file.'
     );
