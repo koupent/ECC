@@ -2,15 +2,47 @@
 'use strict';
 
 const { loadConfig } = require('../codex/config');
-const { initializeDelivery } = require('../codex/delivery-lifecycle');
+const { explicitIssueNumber, initializeDelivery, runCommand } = require('../codex/delivery-lifecycle');
 const { runRole } = require('../codex/run-role');
 const { hash, readState, resolveSessionId } = require('../codex/runtime-state');
 
 const MAX_STDIN = 1024 * 1024;
+const MAX_ISSUE_BODY = 64 * 1024;
 
 function shouldSkip(prompt) {
   const value = String(prompt || '').trim();
   return !value || /^\/(?:ecc:)?(?:codex-|help|clear|compact|status)/i.test(value);
+}
+
+function requestWithExplicitIssueSnapshot(prompt, options = {}) {
+  const issueNumber = explicitIssueNumber(prompt);
+  if (!issueNumber) return prompt;
+  const execute = options.runCommand || runCommand;
+  try {
+    const raw = execute(
+      'gh',
+      ['issue', 'view', String(issueNumber), '--json', 'number,title,url,state,body'],
+      { cwd: options.cwd, env: options.env }
+    );
+    const issue = JSON.parse(raw || '{}');
+    if (Number(issue.number) !== issueNumber) return prompt;
+    const snapshot = {
+      number: issueNumber,
+      title: String(issue.title || '').slice(0, 500),
+      url: String(issue.url || '').slice(0, 2000),
+      state: String(issue.state || '').slice(0, 32),
+      body: String(issue.body || '').slice(0, MAX_ISSUE_BODY)
+    };
+    return [
+      prompt,
+      '',
+      '[ECC authoritative referenced Issue snapshot]',
+      'The parent Hook fetched this snapshot before entering the Codex sandbox. Use it instead of querying GitHub again.',
+      JSON.stringify(snapshot)
+    ].join('\n');
+  } catch {
+    return prompt;
+  }
 }
 
 function run(rawInput, options = {}) {
@@ -50,9 +82,16 @@ function run(rawInput, options = {}) {
     });
   }
 
-  const output = runRole({
+  const roleRequest = requestWithExplicitIssueSnapshot(prompt, {
+    cwd,
+    env: options.env || process.env,
+    runCommand: options.runCommand
+  });
+  const roleRunner = options.runRole || runRole;
+  const output = roleRunner({
     role: 'context-builder',
-    request: prompt,
+    request: roleRequest,
+    requestHash: hash(prompt, 32),
     cwd,
     sessionId: input.session_id,
     env: options.env || process.env
@@ -90,4 +129,4 @@ if (require.main === module) {
   process.stdin.on('end', () => process.stdout.write(run(raw)));
 }
 
-module.exports = { run, shouldSkip };
+module.exports = { requestWithExplicitIssueSnapshot, run, shouldSkip };

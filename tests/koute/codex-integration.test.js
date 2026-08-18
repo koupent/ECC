@@ -193,6 +193,48 @@ test('Context Builder distinguishes unavailable evidence from verified absence a
   assert.match(instructions, /Do not claim.*missing/i);
 });
 
+test('Context Builder injects an explicit Issue snapshot before entering the Codex sandbox', () => {
+  const prompt = 'Issue #17 を実装してください';
+  let roleOptions;
+  const output = JSON.parse(
+    contextBuilder.run(
+      JSON.stringify({ session_id: 'issue-snapshot', cwd: repo, prompt }),
+      {
+        cwd: repo,
+        env,
+        runCommand(binary, args) {
+          assert.strictEqual(binary, 'gh');
+          assert.deepStrictEqual(args, [
+            'issue',
+            'view',
+            '17',
+            '--json',
+            'number,title,url,state,body'
+          ]);
+          return JSON.stringify({
+            number: 17,
+            title: 'Synthetic acceptance task',
+            url: 'https://example.invalid/issues/17',
+            state: 'OPEN',
+            body: 'requestedAt: 2026-08-18T08:00:00Z'
+          });
+        },
+        runRole(options) {
+          roleOptions = options;
+          return {
+            ok: true,
+            result: { status: 'ok', summary: 'issue context ready', files: [], constraints: [], risks: [], verification: [] }
+          };
+        }
+      }
+    )
+  );
+  assert.match(roleOptions.request, /authoritative referenced Issue snapshot/);
+  assert.match(roleOptions.request, /2026-08-18T08:00:00Z/);
+  assert.strictEqual(roleOptions.requestHash, hash(prompt, 32));
+  assert.match(output.hookSpecificOutput.additionalContext, /issue context ready/);
+});
+
 test('required delivery gate blocks edits until issue and branch evidence are ready', () => {
   const fixture = createGitFixture('delivery-gate-repo');
   fs.writeFileSync(

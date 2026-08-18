@@ -317,7 +317,7 @@ function runRole(options) {
       nextPatch.context_status = 'ready';
       nextPatch.context = parsed;
       nextPatch.context_head = gitOutput(cwd, ['rev-parse', 'HEAD']);
-      nextPatch.context_request_hash = hash(options.request || '', 32);
+      nextPatch.context_request_hash = options.requestHash || hash(options.request || '', 32);
     }
     if (role === 'review' || role === 'security-review') {
       nextPatch.review_role = role;
