@@ -94,7 +94,7 @@ function isAdditiveNonWeakeningEdit(toolInput) {
   // to ignore/exclude declarations, comments, and punctuation. This permits a
   // scoped generated-directory exclusion while rejecting rule removal,
   // severity downgrades, parser changes, and wholesale rewrites.
-  const quoted = value => [...value.matchAll(/['\"]([^'\"]+)['\"]/g)].map(match => match[1]);
+  const quoted = value => [...value.matchAll(/['"]([^'"]+)['"]/g)].map(match => match[1]);
   const oldValues = quoted(before);
   const newValues = quoted(after);
   if (!oldValues.every(value => newValues.includes(value))) return false;

@@ -25,6 +25,8 @@
 > [!WARNING]
 > **Official sources only.** Install ECC only from verified channels: the GitHub repository [github.com/affaan-m/ECC](https://github.com/affaan-m/ECC), the npm packages [`ecc-universal`](https://www.npmjs.com/package/ecc-universal) and [`ecc-agentshield`](https://www.npmjs.com/package/ecc-agentshield), the [GitHub App](https://github.com/apps/ecc-tools), the plugin slug `ecc@ecc`, and the project website [ecc.tools](https://ecc.tools). Third-party re-uploads and unofficial mirrors are not maintained or reviewed by the project and may contain malware.
 
+<!-- Separate the upstream security warning from the fork-specific note. -->
+
 > [!NOTE]
 > **Koupent fork.** This repository is the public `koupent/ECC` fork, installed as
 > `ecc@koute-ecc`. It preserves ECC's `standard` workflow and adds a fail-closed
@@ -1856,7 +1858,7 @@ ECC is the **first plugin to maximize every major AI coding tool**. Here's how e
 | **Context File** | CLAUDE.md + AGENTS.md | AGENTS.md | AGENTS.md | AGENTS.md | copilot-instructions.md |
 | **Secret Detection** | Hook-based            | beforeSubmitPrompt hook | Sandbox-based | Hook-based | Instruction-based |
 | **Auto-Format** | PostToolUse hook      | afterFileEdit hook | N/A | file.edited hook | N/A |
-| **Version** | Plugin | Plugin | Reference config | 2.1.0-koute.10 | Instruction layer |
+| **Version** | Plugin | Plugin | Reference config | 2.1.0-koute.11 | Instruction layer |
 
 **Key architectural decisions:**
 - **AGENTS.md** at root is the universal cross-tool file (read by Claude Code, Cursor, Codex, and OpenCode — GitHub Copilot uses `.github/copilot-instructions.md` instead)

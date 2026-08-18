@@ -207,7 +207,7 @@ test('required delivery gate blocks edits until issue and branch evidence are re
   const raw = JSON.stringify({ ...input, tool_name: 'Edit', tool_input: { file_path: path.join(fixture, 'src', 'product.ts') } });
   const denied = JSON.parse(deliveryGate.run(raw, { cwd: fixture, env: fixtureEnv }));
   assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny');
-  assert.match(denied.hookSpecificOutput.permissionDecisionReason, /--session \"delivery-gate\"/);
+  assert.match(denied.hookSpecificOutput.permissionDecisionReason, /--session "delivery-gate"/);
 
   const bash = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: 'npm test' } });
   assert.strictEqual(JSON.parse(deliveryGate.run(bash, { cwd: fixture, env: fixtureEnv })).hookSpecificOutput.permissionDecision, 'deny');

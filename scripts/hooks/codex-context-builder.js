@@ -23,7 +23,7 @@ function run(rawInput, options = {}) {
   const cwd = options.cwd || input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const config = loadConfig(cwd, options.env || process.env);
   const sessionId = resolveSessionId(input, options.env || process.env);
-  const prepareInstruction = `Before the first edit, run node \"$CLAUDE_PLUGIN_ROOT/scripts/codex/delivery-lifecycle.js\" prepare --session \"${sessionId}\". The Delivery Gate will fail closed until Issue deduplication and the issue-linked branch are recorded.`;
+  const prepareInstruction = `Before the first edit, run node "$CLAUDE_PLUGIN_ROOT/scripts/codex/delivery-lifecycle.js" prepare --session "${sessionId}". The Delivery Gate will fail closed until Issue deduplication and the issue-linked branch are recorded.`;
   const prompt = input.prompt || input.user_prompt || '';
   if (!config.enabled || shouldSkip(prompt)) return rawInput;
 
