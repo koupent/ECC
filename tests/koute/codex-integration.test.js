@@ -202,6 +202,8 @@ test('Context Builder distinguishes unavailable evidence from verified absence a
   assert.match(instructions, /unverified/i);
   assert.match(instructions, /Do not diagnose.*authentication/i);
   assert.match(instructions, /Do not claim.*missing/i);
+  assert.match(instructions, /Do not execute the requested implementation, acceptance, migration, or state-changing command/i);
+  assert.match(instructions, /Do not call GitHub write operations/i);
 });
 
 test('Context Builder injects an explicit Issue snapshot before entering the Codex sandbox', () => {

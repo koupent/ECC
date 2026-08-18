@@ -113,6 +113,8 @@ function roleInstructions(role, request) {
       'Treat permission, sandbox, network, and command failures as unverified observations, never as proof that a path, tool, or account is absent.',
       'Do not diagnose orchestration session IDs, delivery state, GitHub authentication, or Codex authentication; the parent harness owns those checks.',
       'Do not claim a path or tool is missing unless a direct filesystem or executable lookup succeeded and proved absence.',
+      'Do not execute the requested implementation, acceptance, migration, or state-changing command; only inspect and report the context the parent Claude session needs.',
+      'Do not call GitHub write operations or repository commands whose purpose is to fulfill the user task.',
       'Do not edit any file.'
     );
   } else if (role === 'bug-reproduction-test' || role === 'contract-test') {
