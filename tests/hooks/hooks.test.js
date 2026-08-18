@@ -3634,10 +3634,7 @@ async function runTests() {
       const result = await runScript(path.join(scriptsDir, 'session-end.js'), '', {
         HOME: testDir,
         USERPROFILE: testDir,
-        CLAUDE_SESSION_ID: `session-${shortId}`,
-        GIT_CONFIG_COUNT: '1',
-        GIT_CONFIG_KEY_0: 'safe.directory',
-        GIT_CONFIG_VALUE_0: process.cwd()
+        CLAUDE_SESSION_ID: `session-${shortId}`
       });
       assert.strictEqual(result.code, 0);
 
@@ -3668,7 +3665,10 @@ async function runTests() {
       const result = await runScript(path.join(scriptsDir, 'session-end.js'), '', {
         HOME: testDir,
         USERPROFILE: testDir,
-        CLAUDE_SESSION_ID: `session-${shortId}`
+        CLAUDE_SESSION_ID: `session-${shortId}`,
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'safe.directory',
+        GIT_CONFIG_VALUE_0: process.cwd()
       });
       assert.strictEqual(result.code, 0);
 
