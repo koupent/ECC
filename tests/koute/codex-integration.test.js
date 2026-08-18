@@ -171,6 +171,10 @@ test('project config opts into standard Codex integration', () => {
 
 test('delivery request classifier ignores chat and recognizes implementation work', () => {
   assert.strictEqual(isDeliveryRequest('この不具合を修正してください'), true);
+  assert.strictEqual(isDeliveryRequest('製品コードやGit管理ファイルは変更せず、受入コマンドを実行してください'), false);
+  assert.strictEqual(isDeliveryRequest('設定は変更せず、この不具合を修正してください'), true);
+  assert.strictEqual(isDeliveryRequest('Do not change product files; run the acceptance command once.'), false);
+  assert.strictEqual(isDeliveryRequest('Do not change config; fix the parser bug.'), true);
   assert.strictEqual(isDeliveryRequest('設計について相談したいです'), false);
   assert.strictEqual(parseIssueNumber('https://github.com/acme/repo/issues/42'), 42);
   assert.strictEqual(slug('Fix generated worktrees'), 'fix-generated-worktrees');

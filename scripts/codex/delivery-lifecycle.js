@@ -8,10 +8,12 @@ const path = require('path');
 const { hash, projectFingerprint, readJson, readState, recordIncident, resolveSessionId, stateRoot, writeState } = require('./runtime-state');
 
 const DELIVERY_REQUEST = /(?:\b(?:implement|fix|change|add|remove|refactor|build|create|update)\b|実装|修正|変更|追加|削除|作成|更新|直して)/i;
+const NEGATED_DELIVERY_REQUEST = /(?:\b(?:do\s+not|don't|without)\s+(?:implement(?:ing)?|fix(?:ing)?|chang(?:e|ing)|add(?:ing)?|remov(?:e|ing)|refactor(?:ing)?|build(?:ing)?|creat(?:e|ing)|updat(?:e|ing))\b|(?:実装|修正|変更|追加|削除|作成|更新)(?:は)?(?:しないで|しない|しなくてよい|せず|不要)|直さない)/gi;
 
 function isDeliveryRequest(prompt) {
   const value = String(prompt || '').trim();
-  return value.length >= 8 && DELIVERY_REQUEST.test(value) && !/^\s*\/(?:help|clear|compact|status)\b/i.test(value);
+  const actionable = value.replace(NEGATED_DELIVERY_REQUEST, '');
+  return value.length >= 8 && DELIVERY_REQUEST.test(actionable) && !/^\s*\/(?:help|clear|compact|status)\b/i.test(value);
 }
 
 function titleFromRequest(request) {
