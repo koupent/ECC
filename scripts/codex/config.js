@@ -48,7 +48,7 @@ function loadConfig(cwd = process.cwd(), env = process.env) {
     externalSandbox: envEnabled(env.ECC_CODEX_EXTERNAL_SANDBOX, false),
     centralIncidentRepo: env.ECC_INCIDENT_REPOSITORY || codex.incidentRepository || 'koupent/engineering-environment-kit',
     forkRepo: env.ECC_FORK_REPOSITORY || codex.forkRepository || 'koupent/ECC',
-    autoRemediation: envEnabled(env.ECC_INCIDENT_AUTO_REMEDIATE, codex.autoRemediation !== false),
+    autoRemediation: envEnabled(env.ECC_INCIDENT_AUTO_REMEDIATE, codex.autoRemediation === true),
     deliveryWorkflow: env.ECC_DELIVERY_WORKFLOW || project.value.deliveryWorkflow || 'advisory',
     deliveryBaseBranch: env.ECC_DELIVERY_BASE_BRANCH || project.value.deliveryBaseBranch || 'main'
   };

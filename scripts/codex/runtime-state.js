@@ -155,6 +155,7 @@ function recordIncident(incident, options = {}) {
       count,
       severity: incident.severity || 'minor',
       type: incident.type || 'unknown',
+      target: incident.target || (incident.metadata && incident.metadata.target),
       role: incident.role,
       hook_id: incident.hook_id,
       project: incident.project || projectFingerprint(options.cwd),

@@ -256,8 +256,8 @@ function runRole(options) {
     failureState(role, input, error, cwd, env);
     return { ok: false, role, model, error: error.message, fallback: true };
   }
-  args.push('--sandbox', def.sandbox);
   if (def.sandbox === 'workspace-write') args.push('--approve-for-me');
+  else args.push('--sandbox', def.sandbox);
   args.push('-');
 
   if (role === 'context-builder') {
