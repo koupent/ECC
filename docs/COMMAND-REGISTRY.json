@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "totalCommands": 98,
+  "totalCommands": 99,
   "commands": [
     {
       "command": "aside",
@@ -46,6 +46,15 @@
       "allAgents": [],
       "skills": [],
       "path": "commands/code-review.md"
+    },
+    {
+      "command": "codex-acceptance-audit",
+      "description": "Audit a completed ECC delivery from external state, Git, and GitHub evidence.",
+      "type": "review",
+      "primaryAgents": [],
+      "allAgents": [],
+      "skills": [],
+      "path": "commands/codex-acceptance-audit.md"
     },
     {
       "command": "codex-context",
@@ -1069,7 +1078,7 @@
       "orchestration": 11,
       "planning": 2,
       "refactoring": 1,
-      "review": 15,
+      "review": 16,
       "testing": 53
     },
     "topAgents": [
