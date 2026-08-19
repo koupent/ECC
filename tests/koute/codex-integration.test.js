@@ -42,7 +42,8 @@ const {
   parseIssueNumber,
   pendingSessionForProject,
   selectDeliveryBranch,
-  slug
+  slug,
+  titleFromRequest
 } = require('../../scripts/codex/delivery-lifecycle');
 
 let passed = 0;
@@ -179,7 +180,11 @@ test('delivery request classifier ignores chat and recognizes implementation wor
   assert.strictEqual(isDeliveryRequest('設定は変更せず、この不具合を修正してください'), true);
   assert.strictEqual(isDeliveryRequest('Do not change product files; run the acceptance command once.'), false);
   assert.strictEqual(isDeliveryRequest('Do not change config; fix the parser bug.'), true);
+  assert.strictEqual(isDeliveryRequest('設定変更の影響を調査してください'), false);
+  assert.strictEqual(isDeliveryRequest('設定変更の影響を調査し、必要なら設定を修正してください'), true);
   assert.strictEqual(isDeliveryRequest('設計について相談したいです'), false);
+  assert.match(titleFromRequest('秘密を含むかもしれない音声入力です'), /^ECC delivery [0-9a-f]{10}$/);
+  assert.doesNotMatch(titleFromRequest('秘密を含むかもしれない音声入力です'), /秘密|音声/);
   assert.strictEqual(parseIssueNumber('https://github.com/acme/repo/issues/42'), 42);
   assert.strictEqual(slug('Fix generated worktrees'), 'fix-generated-worktrees');
 });
@@ -320,15 +325,22 @@ test('required delivery gate blocks edits until issue and branch evidence are re
   const denied = JSON.parse(deliveryGate.run(raw, { cwd: fixture, env: fixtureEnv }));
   assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny');
   assert.match(denied.hookSpecificOutput.permissionDecisionReason, /--session "delivery-gate"/);
+  assert.doesNotMatch(denied.hookSpecificOutput.permissionDecisionReason, /CLAUDE_PLUGIN_ROOT/);
+  assert.match(denied.hookSpecificOutput.permissionDecisionReason, /delivery-lifecycle\.js/);
 
   const bash = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: 'npm test' } });
   assert.strictEqual(JSON.parse(deliveryGate.run(bash, { cwd: fixture, env: fixtureEnv })).hookSpecificOutput.permissionDecision, 'deny');
   const prepare = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: 'node "$CLAUDE_PLUGIN_ROOT/scripts/codex/delivery-lifecycle.js" prepare --session test' } });
   assert.strictEqual(deliveryGate.run(prepare, { cwd: fixture, env: fixtureEnv }), prepare);
+  const reset = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: 'node "/plugin/scripts/codex/reset.js" delivery-gate' } });
+  assert.strictEqual(deliveryGate.run(reset, { cwd: fixture, env: fixtureEnv }), reset);
 
   const branch = 'codex/issue-42-worktree-lint';
   assert.strictEqual(spawnSync('git', ['switch', '-c', branch], { cwd: fixture }).status, 0);
   writeState(input, { delivery: { ...delivery, status: 'ready', issue_number: 42, branch } }, fixtureEnv);
+  assert.strictEqual(deliveryGate.run(raw, { cwd: fixture, env: fixtureEnv }), raw);
+  writeState(input, { delivery: { ...delivery, status: 'draft-pr', issue_number: 42, branch } }, fixtureEnv);
+  assert.strictEqual(deliveryGate.run(bash, { cwd: fixture, env: fixtureEnv }), bash);
   assert.strictEqual(deliveryGate.run(raw, { cwd: fixture, env: fixtureEnv }), raw);
 });
 
