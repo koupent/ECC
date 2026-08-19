@@ -327,6 +327,9 @@ function runRole(options) {
       nextPatch.review_status = parsed.status;
       nextPatch.review_head = gitOutput(cwd, ['rev-parse', 'HEAD']);
       nextPatch.review_worktree_clean = after.length === 0;
+      nextPatch.review_blocking_findings = parsed.findings.filter(finding =>
+        ['critical', 'high'].includes(String(finding.severity || '').toLowerCase())
+      ).length;
     }
     writeState(input, nextPatch, env);
     appendEvent(

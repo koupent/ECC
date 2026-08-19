@@ -29,15 +29,19 @@ const contextGate = require('../../scripts/hooks/codex-context-gate');
 const contextBuilder = require('../../scripts/hooks/codex-context-builder');
 const deliveryGate = require('../../scripts/hooks/delivery-lifecycle-gate');
 const deliveryCompletion = require('../../scripts/hooks/delivery-completion-gate');
+const deliveryProgress = require('../../scripts/hooks/delivery-progress');
+const deliveryFinalizer = require('../../scripts/hooks/delivery-session-finalizer');
 const configProtection = require('../../scripts/hooks/config-protection');
 const {
   explicitIssueNumber,
+  deliveryBranch,
   findDuplicateIssue,
   initializeDelivery,
   isDeliveryRequest,
   normalizeIssueTitle,
   parseIssueNumber,
   pendingSessionForProject,
+  selectDeliveryBranch,
   slug
 } = require('../../scripts/codex/delivery-lifecycle');
 
@@ -199,6 +203,54 @@ test('delivery preparation prioritizes an explicit open Issue reference and norm
     }
   });
   assert.strictEqual(issue.number, 9);
+  assert.strictEqual(
+    deliveryBranch(9, 'changed title', 'codex/issue-9-original-title'),
+    'codex/issue-9-original-title'
+  );
+  assert.strictEqual(deliveryBranch(10, 'Changed title', 'main'), 'codex/issue-10-changed-title');
+  assert.strictEqual(
+    selectDeliveryBranch(9, 'changed title', 'main', ['codex/issue-9-original-title']),
+    'codex/issue-9-original-title'
+  );
+  assert.throws(
+    () => selectDeliveryBranch(9, 'changed title', 'main', ['codex/issue-9-a', 'codex/issue-9-b']),
+    /multiple local branches/
+  );
+});
+
+test('follow-up prompts preserve the active delivery and reuse its Context Builder packet', () => {
+  const fixture = createGitFixture('delivery-follow-up-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-follow-up-state') };
+  const input = { session_id: 'delivery-follow-up', cwd: fixture };
+  const original = 'Issue #12 の診断表示を修正してください';
+  const first = initializeDelivery(input, original, { cwd: fixture, env: fixtureEnv });
+  writeState(input, {
+    delivery: { ...first, status: 'ready', issue_number: 12, branch: 'codex/issue-12-diagnostics' },
+    context_status: 'ready',
+    context_request_hash: first.request_hash,
+    context: { status: 'ok', summary: 'cached packet', files: [], constraints: [], risks: [], verification: [] }
+  }, fixtureEnv);
+
+  const followUp = 'そのまま修正を続けて、完了まで進めてください';
+  const preserved = initializeDelivery(input, followUp, { cwd: fixture, env: fixtureEnv });
+  assert.strictEqual(preserved.request_hash, first.request_hash);
+  let reran = false;
+  const output = JSON.parse(contextBuilder.run(JSON.stringify({ ...input, prompt: followUp }), {
+    cwd: fixture,
+    env: fixtureEnv,
+    runRole() {
+      reran = true;
+      throw new Error('Context Builder must not rerun for a follow-up prompt');
+    }
+  }));
+  assert.strictEqual(reran, false);
+  assert.match(output.hookSpecificOutput.additionalContext, /cached packet/);
+  assert.match(output.hookSpecificOutput.additionalContext, /active Delivery/);
 });
 
 test('Context Builder distinguishes unavailable evidence from verified absence and avoids delivery diagnostics', () => {
@@ -389,6 +441,102 @@ test('delivery completion gate does not allow a required pending delivery to sto
   const output = JSON.parse(deliveryCompletion.run(JSON.stringify(input), { cwd: fixture, env: fixtureEnv }));
   assert.strictEqual(output.decision, 'block');
   assert.match(output.reason, /delivery-prepare/);
+});
+
+test('a clean commit is recorded and further edits wait for an independent review', () => {
+  const fixture = createGitFixture('delivery-progress-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  assert.strictEqual(spawnSync('git', ['add', '.ecc/config.json'], { cwd: fixture }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'require delivery'], { cwd: fixture }).status, 0);
+  const branch = 'codex/issue-31-progress';
+  assert.strictEqual(spawnSync('git', ['switch', '-c', branch], { cwd: fixture }).status, 0);
+  fs.writeFileSync(path.join(fixture, 'src', 'product.ts'), 'export const product = false;\n', 'utf8');
+  assert.strictEqual(spawnSync('git', ['add', 'src/product.ts'], { cwd: fixture }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'fix product'], { cwd: fixture }).status, 0);
+
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-progress-state') };
+  const input = { session_id: 'delivery-progress', cwd: fixture };
+  writeState(input, { delivery: { status: 'ready', issue_number: 31, branch, base_branch: 'main' } }, fixtureEnv);
+  const progress = deliveryProgress.run(JSON.stringify({
+    ...input,
+    tool_name: 'Bash',
+    tool_input: { command: 'git commit -m "fix product"' },
+    tool_response: { exit_code: 0 }
+  }), { cwd: fixture, env: fixtureEnv });
+  assert.match(progress.additionalContext, /independent Codex review/);
+  const recorded = readState(input, fixtureEnv);
+  assert.strictEqual(recorded.delivery.committed_head, spawnSync('git', ['rev-parse', 'HEAD'], { cwd: fixture, encoding: 'utf8' }).stdout.trim());
+
+  const edit = JSON.stringify({ ...input, tool_name: 'Edit', tool_input: { file_path: path.join(fixture, 'src', 'product.ts') } });
+  const denied = JSON.parse(deliveryGate.run(edit, { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(denied.hookSpecificOutput.permissionDecisionReason, /waiting for an independent Codex review/);
+
+  writeState(input, {
+    review_role: 'review',
+    review_status: 'ok',
+    review_head: recorded.delivery.committed_head,
+    review_worktree_clean: true,
+    review_blocking_findings: 1
+  }, fixtureEnv);
+  assert.strictEqual(deliveryGate.run(edit, { cwd: fixture, env: fixtureEnv }), edit);
+});
+
+test('failed commits do not advance Delivery and branch mismatch incidents are deduplicated', () => {
+  const fixture = createGitFixture('delivery-incident-dedup-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-incident-dedup-state') };
+  const input = { session_id: 'delivery-incident-dedup', cwd: fixture };
+  writeState(input, { delivery: { status: 'ready', issue_number: 32, branch: 'codex/issue-32-dedup' } }, fixtureEnv);
+
+  const failedCommit = JSON.stringify({
+    ...input,
+    tool_name: 'Bash',
+    tool_input: { command: 'git commit -m failed' },
+    tool_response: { exit_code: 1, stderr: 'nothing to commit' }
+  });
+  assert.strictEqual(deliveryProgress.run(failedCommit, { cwd: fixture, env: fixtureEnv }), failedCommit);
+  assert.strictEqual(readState(input, fixtureEnv).delivery.committed_head, undefined);
+
+  const edit = JSON.stringify({ ...input, tool_name: 'Edit', tool_input: { file_path: path.join(fixture, 'src', 'product.ts') } });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const denied = JSON.parse(deliveryGate.run(edit, { cwd: fixture, env: fixtureEnv }));
+    assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny');
+  }
+  const incidents = readEvents(fixtureEnv).filter(event => event.type === 'delivery_branch_mismatch');
+  assert.strictEqual(incidents.length, 1);
+  assert.strictEqual(incidents[0].severity, 'minor');
+});
+
+test('an incomplete delivery session records exactly one promotable incident', () => {
+  const fixture = createGitFixture('delivery-finalizer-repo');
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-finalizer-state') };
+  const input = { session_id: 'delivery-finalizer', cwd: fixture };
+  writeState(input, {
+    project: hash(path.resolve(fixture)),
+    delivery: {
+      status: 'ready',
+      issue_number: 44,
+      branch: 'codex/issue-44-finalizer',
+      committed_head: 'deadbeef',
+      completion_stage: 'review-required'
+    }
+  }, fixtureEnv);
+  const state = readState(input, fixtureEnv);
+  assert.strictEqual(deliveryFinalizer.reportIncomplete(input, state, { cwd: fixture, env: fixtureEnv }), true);
+  assert.strictEqual(deliveryFinalizer.reportIncomplete(input, readState(input, fixtureEnv), { cwd: fixture, env: fixtureEnv }), false);
+  const incidents = readEvents(fixtureEnv).filter(event => event.type === 'delivery_stranded_after_commit');
+  assert.strictEqual(incidents.length, 1);
+  assert.strictEqual(incidents[0].severity, 'critical');
+  assert.strictEqual(incidents[0].target, 'ecc');
 });
 
 test('config protection allows only additive generated-path exclusion with independent context and delivery evidence', () => {

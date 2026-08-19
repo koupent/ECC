@@ -30,9 +30,18 @@ const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const { resolveEccRoot } = require('../lib/resolve-ecc-root');
+const { run: auditDeliverySessions } = require('./delivery-session-finalizer');
 
 // Read the raw JSON event from stdin
 const raw = fs.readFileSync(0, 'utf8');
+
+// 強制終了ではSessionEndが届かない場合がある。次回SessionStart時に、同じ
+// projectの古い未完了Deliveryを監査してインシデントへ昇格できる状態にする。
+try {
+  auditDeliverySessions(raw, { mode: 'start' });
+} catch (error) {
+  process.stderr.write(`[SessionStart] WARNING: incomplete delivery audit failed: ${error.message}\n`);
+}
 
 // Path (relative to plugin root) to the hook runner
 const rel = path.join('scripts', 'hooks', 'run-with-flags.js');

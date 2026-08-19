@@ -9,6 +9,9 @@
 
 ### Fixed
 
+- Claude Codeの継続turnで進行中DeliveryとContext Builder証拠を再利用し、同一Issueの既存branchを優先することで、重複調査と重複branch作成を防止しました。
+- clean commit後は独立Codex reviewへ決定論的に遷移し、重大指摘がない状態での追加編集ループを停止するようにしました。
+- 未完了DeliveryをSessionEndまたは次回SessionStartでインシデント化し、branch不一致はfail-closeを維持しつつ同一Delivery内の重複記録と過剰なcritical昇格を抑制しました。
 - Engineering Environment Kitが生成する`devcontainer.voice`をproject config schemaで受理し、Docker Desktop／Rancher Desktop／無効の各設定を同じ契約で検証するようにしました。
 - Session-end incident reporting now uses an external-state lock, reconciles duplicate GitHub Issues, preserves failed reports for retry, and mirrors `needs-human` or Draft PR status to the central Issue.
 - Workspace-write Codex roles no longer pass the mutually exclusive `--sandbox` and `--approve-for-me` flags together.

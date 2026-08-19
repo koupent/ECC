@@ -13,6 +13,7 @@ const {
   stopObserverForContext,
   resolveSessionId
 } = require('../lib/observer-sessions');
+const { run: finalizeDelivery } = require('./delivery-session-finalizer');
 
 function log(message) {
   process.stderr.write(`[SessionEnd] ${message}\n`);
@@ -21,6 +22,14 @@ function log(message) {
 function run(rawInput) {
   const output = rawInput || '';
   const sessionId = resolveSessionId();
+
+  // incident-workerは既存イベントを送信するだけなので、その前段で未完了Deliveryを
+  // 明示的にイベント化する。二重SessionEndはfinalizer側で冪等に処理する。
+  try {
+    finalizeDelivery(output, { mode: 'end' });
+  } catch (error) {
+    log(`Incomplete delivery finalization failed: ${error.message}`);
+  }
 
   if (!sessionId) {
     log('No CLAUDE_SESSION_ID available; skipping observer cleanup');

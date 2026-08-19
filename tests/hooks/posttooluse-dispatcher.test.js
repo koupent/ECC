@@ -123,7 +123,7 @@ function runTests() {
         },
         {
           tool: 'Bash',
-          sync: ['post:governance-capture', 'post:session-activity-tracker', 'post:ecc-metrics-bridge', 'post:ecc-context-monitor'],
+          sync: ['post:governance-capture', 'post:session-activity-tracker', 'post:ecc-metrics-bridge', 'post:ecc-context-monitor', 'post:bash:delivery-progress'],
           async: ['post:bash:dispatcher', 'post:observe:continuous-learning']
         },
         {

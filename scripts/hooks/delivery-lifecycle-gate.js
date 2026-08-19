@@ -3,7 +3,7 @@
 
 const { spawnSync } = require('child_process');
 const { loadConfig } = require('../codex/config');
-const { readState, recordIncident, resolveSessionId } = require('../codex/runtime-state');
+const { readState, recordIncident, resolveSessionId, writeState } = require('../codex/runtime-state');
 
 function deny(reason) {
   return JSON.stringify({
@@ -15,9 +15,13 @@ function deny(reason) {
   });
 }
 
-function branchAt(cwd, env) {
-  const result = spawnSync('git', ['branch', '--show-current'], { cwd, env, encoding: 'utf8', timeout: 5000, windowsHide: true });
+function gitValue(cwd, env, args) {
+  const result = spawnSync('git', args, { cwd, env, encoding: 'utf8', timeout: 5000, windowsHide: true });
   return result.status === 0 ? String(result.stdout || '').trim() : '';
+}
+
+function branchAt(cwd, env) {
+  return gitValue(cwd, env, ['branch', '--show-current']);
 }
 
 function run(rawInput, options = {}) {
@@ -49,11 +53,60 @@ function run(rawInput, options = {}) {
 
   const actualBranch = branchAt(cwd, env);
   if (!actualBranch || actualBranch !== state.delivery.branch) {
-    recordIncident(
-      { type: 'delivery_branch_mismatch', severity: 'critical', message: `expected ${state.delivery.branch}; actual ${actualBranch || '<none>'}` },
-      { cwd, env }
-    );
+    // Gateがfail-closeしている復旧可能な不一致は、即criticalではない。同じDeliveryで
+    // 同じ不一致を繰り返し記録せず、複数回の独立発生だけを中央昇格の対象にする。
+    if (state.delivery.branch_mismatch_actual !== (actualBranch || '<none>')) {
+      recordIncident(
+        {
+          type: 'delivery_branch_mismatch',
+          severity: 'minor',
+          target: 'ecc',
+          hook_id: 'delivery-lifecycle-gate',
+          message: 'The current branch did not match the branch recorded for the active Delivery.',
+          metadata: { expected: state.delivery.branch, actual: actualBranch || '<none>' }
+        },
+        { cwd, env }
+      );
+      writeState(input, {
+        delivery: {
+          ...state.delivery,
+          branch_mismatch_actual: actualBranch || '<none>',
+          branch_mismatch_recorded_at: new Date().toISOString()
+        }
+      }, env);
+    }
     return deny(`[ECC Delivery Gate] Expected issue-linked branch ${state.delivery.branch}, but current branch is ${actualBranch || '<none>'}. Restore the recorded branch before editing.`);
+  }
+
+  if (state.delivery.branch_mismatch_actual) {
+    writeState(input, {
+      delivery: {
+        ...state.delivery,
+        branch_mismatch_actual: null,
+        branch_mismatch_recorded_at: null
+      }
+    }, env);
+  }
+
+  const toolName = String(input.tool_name || '');
+  const isEdit = ['Edit', 'Write', 'MultiEdit'].includes(toolName);
+  const head = gitValue(cwd, env, ['rev-parse', 'HEAD']);
+  if (
+    isEdit &&
+    state.delivery.committed_head &&
+    state.delivery.committed_head === head &&
+    !(
+      ['review', 'security-review'].includes(state.review_role) &&
+      state.review_status === 'ok' &&
+      state.review_head === head &&
+      state.review_worktree_clean === true &&
+      Number(state.review_blocking_findings || 0) > 0
+    )
+  ) {
+    return deny(
+      '[ECC Delivery Gate] The clean implementation commit is waiting for an independent Codex review. ' +
+      'Run `/ecc:code-review` for the current HEAD before further edits. If the review has no critical/high findings, push and create the Draft PR instead of starting another edit loop.'
+    );
   }
   return rawInput;
 }
@@ -65,4 +118,4 @@ if (require.main === module) {
   process.stdin.on('end', () => process.stdout.write(run(raw)));
 }
 
-module.exports = { branchAt, run };
+module.exports = { branchAt, gitValue, run };
