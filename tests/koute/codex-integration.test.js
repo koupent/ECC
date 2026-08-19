@@ -327,6 +327,11 @@ test('required delivery gate blocks edits until issue and branch evidence are re
   assert.match(denied.hookSpecificOutput.permissionDecisionReason, /--session "delivery-gate"/);
   assert.doesNotMatch(denied.hookSpecificOutput.permissionDecisionReason, /CLAUDE_PLUGIN_ROOT/);
   assert.match(denied.hookSpecificOutput.permissionDecisionReason, /delivery-lifecycle\.js/);
+  assert.match(denied.hookSpecificOutput.permissionDecisionReason, /reset\.js/);
+  assert.doesNotMatch(
+    fs.readFileSync(path.join(__dirname, '..', '..', 'commands', 'codex-task-reset.md'), 'utf8'),
+    /\$CLAUDE_PLUGIN_ROOT/
+  );
 
   const bash = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: 'npm test' } });
   assert.strictEqual(JSON.parse(deliveryGate.run(bash, { cwd: fixture, env: fixtureEnv })).hookSpecificOutput.permissionDecision, 'deny');

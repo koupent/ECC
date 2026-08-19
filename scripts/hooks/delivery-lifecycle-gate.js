@@ -50,9 +50,11 @@ function run(rawInput, options = {}) {
     if (isPrepareCommand || isResetCommand) return rawInput;
     const sessionId = resolveSessionId(input, env);
     const prepareScript = path.resolve(__dirname, '../codex/delivery-lifecycle.js');
+    const resetScript = path.resolve(__dirname, '../codex/reset.js');
     return deny(
       '[ECC Delivery Gate] Repository tools are blocked until duplicate Issue search, Issue selection/creation, and issue-linked branch creation complete. ' +
-        `Run node "${prepareScript}" prepare --session "${sessionId}" first, then retry the tool call.`
+        `Run node "${prepareScript}" prepare --session "${sessionId}" first, then retry the tool call. ` +
+        `If the recorded Delivery is stale or unrecoverable, explicitly reset it with node "${resetScript}" "${sessionId}".`
     );
   }
 
