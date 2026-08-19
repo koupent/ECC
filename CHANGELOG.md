@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- Delivery Gateが解決済みのreset script pathとsession IDを案内し、`/ecc:codex-task-reset`もinteractive shellに存在しない`CLAUDE_PLUGIN_ROOT`へ依存しないようにしました。
 - Draft PR作成後のterminal DeliveryをPreToolUse Gateが再遮断しないようにし、未準備状態でも明示的なstate resetを許可しました。Gateの復旧案内は未設定の`CLAUDE_PLUGIN_ROOT`へ依存せず、解決済みscript pathを表示します。
 - 調査・診断だけの依頼をDeliveryへ誤分類しないようにし、自動作成Issueのtitleを要求本文ではなく匿名fingerprintへ変更しました。
 - Claude Codeの継続turnで進行中DeliveryとContext Builder証拠を再利用し、同一Issueの既存branchを優先することで、重複調査と重複branch作成を防止しました。
