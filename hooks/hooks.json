@@ -303,7 +303,7 @@
             "timeout": 10
           }
         ],
-        "description": "Session end lifecycle marker (non-blocking)",
+        "description": "Finalize incomplete required deliveries before incident promotion, then clean up the session lifecycle marker",
         "id": "session:end:marker"
       },
       {

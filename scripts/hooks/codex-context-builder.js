@@ -2,7 +2,7 @@
 'use strict';
 
 const { loadConfig } = require('../codex/config');
-const { explicitIssueNumber, initializeDelivery, runCommand } = require('../codex/delivery-lifecycle');
+const { explicitIssueNumber, initializeDelivery, isActiveDelivery, runCommand } = require('../codex/delivery-lifecycle');
 const { runRole } = require('../codex/run-role');
 const { hash, readState, resolveSessionId } = require('../codex/runtime-state');
 
@@ -64,7 +64,10 @@ function run(rawInput, options = {}) {
   const existing = readState(input, options.env || process.env);
   if (
     existing.context_status === 'ready' && existing.context &&
-    existing.context_request_hash === hash(prompt, 32)
+    (
+      existing.context_request_hash === hash(prompt, 32) ||
+      (isActiveDelivery(delivery) && existing.context_request_hash === delivery.request_hash)
+    )
   ) {
     return JSON.stringify({
       hookSpecificOutput: {
@@ -75,7 +78,7 @@ function run(rawInput, options = {}) {
           delivery && delivery.status === 'pending'
             ? prepareInstruction
             : '',
-          'This packet is bound to the current request fingerprint; a different request automatically rebuilds it.',
+          'This packet is bound to the active Delivery. Follow-up prompts reuse it until the Delivery completes.',
           JSON.stringify(existing.context)
         ].join('\n')
       }
@@ -91,7 +94,7 @@ function run(rawInput, options = {}) {
   const output = roleRunner({
     role: 'context-builder',
     request: roleRequest,
-    requestHash: hash(prompt, 32),
+    requestHash: delivery ? delivery.request_hash : hash(prompt, 32),
     cwd,
     sessionId: input.session_id,
     env: options.env || process.env

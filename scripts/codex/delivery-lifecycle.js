@@ -9,6 +9,11 @@ const { hash, projectFingerprint, readJson, readState, recordIncident, resolveSe
 
 const DELIVERY_REQUEST = /(?:\b(?:implement|fix|change|add|remove|refactor|build|create|update)\b|実装|修正|変更|追加|削除|作成|更新|直して)/i;
 const NEGATED_DELIVERY_REQUEST = /(?:\b(?:do\s+not|don't|without)\s+(?:implement(?:ing)?|fix(?:ing)?|chang(?:e|ing)|add(?:ing)?|remov(?:e|ing)|refactor(?:ing)?|build(?:ing)?|creat(?:e|ing)|updat(?:e|ing))\b|(?:実装|修正|変更|追加|削除|作成|更新)(?:は)?(?:しないで|しない|しなくてよい|せず|不要)|直さない)/gi;
+const ACTIVE_DELIVERY_STATUSES = new Set(['pending', 'ready']);
+
+function isActiveDelivery(delivery) {
+  return Boolean(delivery && ACTIVE_DELIVERY_STATUSES.has(delivery.status));
+}
 
 function isDeliveryRequest(prompt) {
   const value = String(prompt || '').trim();
@@ -43,6 +48,23 @@ function normalizeIssueTitle(value) {
     .replace(/[\s\u3000()[\]{}「」『』【】]/g, '');
 }
 
+function deliveryBranch(issueNumber, title, currentBranch = '') {
+  const issueBranch = new RegExp(`^codex/issue-${Number(issueNumber)}(?:-|$)`, 'i');
+  return issueBranch.test(String(currentBranch || ''))
+    ? currentBranch
+    : `codex/issue-${Number(issueNumber)}-${slug(title)}`;
+}
+
+function selectDeliveryBranch(issueNumber, title, currentBranch = '', existingBranches = []) {
+  const issueBranch = new RegExp(`^codex/issue-${Number(issueNumber)}(?:-|$)`, 'i');
+  if (issueBranch.test(String(currentBranch || ''))) return currentBranch;
+  const candidates = [...new Set(existingBranches.filter(branch => issueBranch.test(String(branch || ''))))];
+  if (candidates.length > 1) {
+    throw new Error(`Issue #${Number(issueNumber)} has multiple local branches (${candidates.join(', ')}); consolidate them before continuing.`);
+  }
+  return candidates[0] || deliveryBranch(issueNumber, title, currentBranch);
+}
+
 function initializeDelivery(input, request, options = {}) {
   const env = options.env || process.env;
   const cwd = options.cwd || input.cwd || process.cwd();
@@ -52,6 +74,10 @@ function initializeDelivery(input, request, options = {}) {
   const current = readState(input, env);
   const requestHash = hash(request, 32);
   if (current.delivery && current.delivery.request_hash === requestHash) return current.delivery;
+  // Claude Code の継続turnでは、ユーザーの追記文面が変わっても同じDeliveryである。
+  // 進行中Deliveryを本文ハッシュだけで上書きすると、Context Builder、Issue、branchが
+  // 二重に作られるため、完了または明示的な新規Sessionまでは既存Deliveryを維持する。
+  if (isActiveDelivery(current.delivery)) return current.delivery;
 
   const delivery = {
     status: 'pending',
@@ -164,8 +190,15 @@ function prepareDelivery(input = {}, options = {}) {
       issue = { number: parseIssueNumber(url), title: delivery.title, url };
     }
 
-    const branch = `codex/issue-${issue.number}-${slug(delivery.title)}`;
     const currentBranch = runCommand('git', ['branch', '--show-current'], { cwd, env });
+    const existingIssueBranches = runCommand(
+      'git',
+      ['branch', '--list', `codex/issue-${issue.number}-*`, '--format=%(refname:short)'],
+      { cwd, env }
+    ).split(/\r?\n/).filter(Boolean);
+    // 再開時にタイトルやslugが変わっても、同じIssueの現在branchを優先する。
+    // これにより同一Issueへ複数branchを作ることを防ぐ。
+    const branch = selectDeliveryBranch(issue.number, delivery.title, currentBranch, existingIssueBranches);
     if (currentBranch !== branch) {
       const existing = runCommand('git', ['branch', '--list', branch], { cwd, env });
       if (existing) {
@@ -216,14 +249,17 @@ if (require.main === module) {
 
 module.exports = {
   explicitIssueNumber,
+  deliveryBranch,
   findDuplicateIssue,
   initializeDelivery,
+  isActiveDelivery,
   isDeliveryRequest,
   normalizeIssueTitle,
   parseIssueNumber,
   pendingSessionForProject,
   prepareDelivery,
   runCommand,
+  selectDeliveryBranch,
   slug,
   titleFromRequest
 };
