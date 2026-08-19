@@ -2,6 +2,7 @@
 'use strict';
 
 const { spawnSync } = require('child_process');
+const path = require('path');
 const { loadConfig } = require('../codex/config');
 const { readState, recordIncident, resolveSessionId, writeState } = require('../codex/runtime-state');
 
@@ -38,16 +39,20 @@ function run(rawInput, options = {}) {
 
   const state = readState(input, env);
   if (!state.delivery) return rawInput;
+  if (state.delivery.status === 'draft-pr') return rawInput;
   if (state.delivery.status !== 'ready') {
     const toolName = String(input.tool_name || '');
     const command = String(input.tool_input && input.tool_input.command || '');
     const isPrepareCommand = toolName === 'Bash' &&
       /scripts[\\/]codex[\\/]delivery-lifecycle\.js["']?\s+prepare(?:\s|$)/i.test(command);
-    if (isPrepareCommand) return rawInput;
+    const isResetCommand = toolName === 'Bash' &&
+      /scripts[\\/]codex[\\/]reset\.js["']?(?:\s|$)/i.test(command);
+    if (isPrepareCommand || isResetCommand) return rawInput;
     const sessionId = resolveSessionId(input, env);
+    const prepareScript = path.resolve(__dirname, '../codex/delivery-lifecycle.js');
     return deny(
       '[ECC Delivery Gate] Repository tools are blocked until duplicate Issue search, Issue selection/creation, and issue-linked branch creation complete. ' +
-        `Run node "$CLAUDE_PLUGIN_ROOT/scripts/codex/delivery-lifecycle.js" prepare --session "${sessionId}" first, then retry the tool call.`
+        `Run node "${prepareScript}" prepare --session "${sessionId}" first, then retry the tool call.`
     );
   }
 

@@ -9,6 +9,8 @@
 
 ### Fixed
 
+- Draft PR作成後のterminal DeliveryをPreToolUse Gateが再遮断しないようにし、未準備状態でも明示的なstate resetを許可しました。Gateの復旧案内は未設定の`CLAUDE_PLUGIN_ROOT`へ依存せず、解決済みscript pathを表示します。
+- 調査・診断だけの依頼をDeliveryへ誤分類しないようにし、自動作成Issueのtitleを要求本文ではなく匿名fingerprintへ変更しました。
 - Claude Codeの継続turnで進行中DeliveryとContext Builder証拠を再利用し、同一Issueの既存branchを優先することで、重複調査と重複branch作成を防止しました。
 - clean commit後は独立Codex reviewへ決定論的に遷移し、重大指摘がない状態での追加編集ループを停止するようにしました。
 - 未完了DeliveryをSessionEndまたは次回SessionStartでインシデント化し、branch不一致はfail-closeを維持しつつ同一Delivery内の重複記録と過剰なcritical昇格を抑制しました。

@@ -9,6 +9,8 @@ const { hash, projectFingerprint, readJson, readState, recordIncident, resolveSe
 
 const DELIVERY_REQUEST = /(?:\b(?:implement|fix|change|add|remove|refactor|build|create|update)\b|実装|修正|変更|追加|削除|作成|更新|直して)/i;
 const NEGATED_DELIVERY_REQUEST = /(?:\b(?:do\s+not|don't|without)\s+(?:implement(?:ing)?|fix(?:ing)?|chang(?:e|ing)|add(?:ing)?|remov(?:e|ing)|refactor(?:ing)?|build(?:ing)?|creat(?:e|ing)|updat(?:e|ing))\b|(?:実装|修正|変更|追加|削除|作成|更新)(?:は)?(?:しないで|しない|しなくてよい|せず|不要)|直さない)/gi;
+const DIAGNOSTIC_REQUEST = /(?:\b(?:investigate|review|analy[sz]e|diagnose|inspect|check)\b|調査|確認|レビュー|分析|診断|調べて|教えて)/i;
+const EXPLICIT_MUTATION_REQUEST = /(?:\b(?:implement|fix|add|remove|refactor|build|create|update)\b|(?:実装|修正|変更|追加|削除|作成|更新|直)(?:を)?(?:して|する|してください|してほしい|したい|せよ))/i;
 const ACTIVE_DELIVERY_STATUSES = new Set(['pending', 'ready']);
 
 function isActiveDelivery(delivery) {
@@ -18,12 +20,14 @@ function isActiveDelivery(delivery) {
 function isDeliveryRequest(prompt) {
   const value = String(prompt || '').trim();
   const actionable = value.replace(NEGATED_DELIVERY_REQUEST, '');
-  return value.length >= 8 && DELIVERY_REQUEST.test(actionable) && !/^\s*\/(?:help|clear|compact|status)\b/i.test(value);
+  if (value.length < 8 || /^\s*\/(?:help|clear|compact|status)\b/i.test(value)) return false;
+  if (DIAGNOSTIC_REQUEST.test(actionable) && !EXPLICIT_MUTATION_REQUEST.test(actionable)) return false;
+  return DELIVERY_REQUEST.test(actionable);
 }
 
-function titleFromRequest(request) {
-  const first = String(request || '').split(/\r?\n/).map(line => line.trim()).find(Boolean) || 'ECC delivery task';
-  return first.replace(/\s+/g, ' ').replace(/^#+\s*/, '').slice(0, 90);
+function titleFromRequest(request, requestHash = '') {
+  const fingerprint = requestHash || hash(String(request || ''), 32);
+  return `ECC delivery ${fingerprint.slice(0, 10)}`;
 }
 
 function slug(value) {
@@ -82,7 +86,7 @@ function initializeDelivery(input, request, options = {}) {
   const delivery = {
     status: 'pending',
     request_hash: requestHash,
-    title: titleFromRequest(request),
+    title: titleFromRequest(request, requestHash),
     requested_issue_number: explicitIssueNumber(request),
     base_branch: config.deliveryBaseBranch,
     issue_number: null,
