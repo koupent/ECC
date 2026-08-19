@@ -37,9 +37,49 @@
     "devcontainer": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["service"],
+      "required": ["service", "voice"],
       "properties": {
-        "service": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" }
+        "service": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+        "voice": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["mode"],
+              "properties": { "mode": { "const": "disabled" } }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["mode"],
+              "properties": { "mode": { "const": "docker-desktop" } }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["mode", "wslDistribution"],
+              "properties": {
+                "mode": { "const": "rancher-desktop" },
+                "wslDistribution": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9._-]+$"
+                },
+                "port": {
+                  "type": "integer",
+                  "minimum": 1024,
+                  "maximum": 32767,
+                  "not": { "const": 4713 },
+                  "default": 24713
+                },
+                "host": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9.-]+$",
+                  "default": "host.docker.internal"
+                }
+              }
+            }
+          ]
+        }
       }
     },
     "codex": {
