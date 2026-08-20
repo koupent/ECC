@@ -8,6 +8,7 @@ const path = require('path');
 const { hash, projectFingerprint, readJson, readState, recordIncident, resolveSessionId, stateRoot, writeState } = require('./runtime-state');
 
 const DELIVERY_REQUEST = /(?:\b(?:implement|fix|change|add|remove|refactor|build|create|update)\b|実装|修正|変更|追加|削除|作成|更新|直して)/i;
+const DELIVERY_COMPLETION_REQUEST = /(?:\b(?:complete|finish|finalize|deliver)\b|\bmerge\s+(?:it|the\s+pr|pr\s*#?\d+)\b|完遂|完了まで|仕上げて|マージまで)/i;
 const NEGATED_DELIVERY_REQUEST = /(?:\b(?:do\s+not|don't|without)\s+(?:implement(?:ing)?|fix(?:ing)?|chang(?:e|ing)|add(?:ing)?|remov(?:e|ing)|refactor(?:ing)?|build(?:ing)?|creat(?:e|ing)|updat(?:e|ing))\b|(?:実装|修正|変更|追加|削除|作成|更新)(?:は)?(?:しないで|しない|しなくてよい|せず|不要)|直さない)/gi;
 const DIAGNOSTIC_REQUEST = /(?:\b(?:investigate|review|analy[sz]e|diagnose|inspect|check)\b|調査|確認|レビュー|分析|診断|調べて|教えて)/i;
 const EXPLICIT_MUTATION_REQUEST = /(?:\b(?:implement|fix|add|remove|refactor|build|create|update)\b|(?:実装|修正|変更|追加|削除|作成|更新|直)(?:を)?(?:して|する|してください|してほしい|したい|せよ))/i;
@@ -21,8 +22,10 @@ function isDeliveryRequest(prompt) {
   const value = String(prompt || '').trim();
   const actionable = value.replace(NEGATED_DELIVERY_REQUEST, '');
   if (value.length < 8 || /^\s*\/(?:help|clear|compact|status)\b/i.test(value)) return false;
+  const completion = DELIVERY_COMPLETION_REQUEST.test(actionable);
+  if (completion && (explicitIssueNumber(value) || explicitPrNumber(value) || !DIAGNOSTIC_REQUEST.test(actionable))) return true;
   if (DIAGNOSTIC_REQUEST.test(actionable) && !EXPLICIT_MUTATION_REQUEST.test(actionable)) return false;
-  return DELIVERY_REQUEST.test(actionable);
+  return DELIVERY_REQUEST.test(actionable) || completion;
 }
 
 function titleFromRequest(request, requestHash = '') {
@@ -42,6 +45,11 @@ function slug(value) {
 
 function explicitIssueNumber(request) {
   const match = String(request || '').match(/\bissue\s*#?\s*(\d+)\b/i);
+  return match ? Number(match[1]) : null;
+}
+
+function explicitPrNumber(request) {
+  const match = String(request || '').match(/\bpr\s*#?\s*(\d+)\b/i);
   return match ? Number(match[1]) : null;
 }
 
@@ -88,6 +96,7 @@ function initializeDelivery(input, request, options = {}) {
     request_hash: requestHash,
     title: titleFromRequest(request, requestHash),
     requested_issue_number: explicitIssueNumber(request),
+    requested_pr_number: explicitPrNumber(request),
     base_branch: config.deliveryBaseBranch,
     issue_number: null,
     issue_url: null,
@@ -150,7 +159,7 @@ function findDuplicateIssue(delivery, options = {}) {
       options
     );
     const referenced = JSON.parse(raw || '{}');
-    if (String(referenced.state || '').toUpperCase() !== 'OPEN') {
+    if (String(referenced.state || '').toUpperCase() !== 'OPEN' && !options.allowClosedReferencedIssue) {
       throw new Error(`Explicitly referenced Issue #${delivery.requested_issue_number} is not open; refusing to create a duplicate.`);
     }
     return referenced;
@@ -168,6 +177,26 @@ function findDuplicateIssue(delivery, options = {}) {
   }) || null;
 }
 
+function findExistingDeliveryPr(delivery, currentBranch, options = {}) {
+  if (!currentBranch || !delivery.requested_issue_number) return null;
+  const execute = options.runCommand || runCommand;
+  const raw = execute(
+    'gh',
+    ['pr', 'list', '--head', currentBranch, '--state', 'open', '--json', 'number,url,headRefName,baseRefName,body'],
+    options
+  );
+  const issueLink = new RegExp(`(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\s+#${delivery.requested_issue_number}\\b`, 'i');
+  const candidates = JSON.parse(raw || '[]').filter(pr =>
+    pr.headRefName === currentBranch &&
+    issueLink.test(String(pr.body || '')) &&
+    (!delivery.requested_pr_number || Number(pr.number) === delivery.requested_pr_number)
+  );
+  if (candidates.length > 1) {
+    throw new Error(`Issue #${delivery.requested_issue_number} has multiple open PRs on ${currentBranch}; keep exactly one before continuing.`);
+  }
+  return candidates[0] || null;
+}
+
 function prepareDelivery(input = {}, options = {}) {
   const env = options.env || process.env;
   const cwd = options.cwd || input.cwd || process.cwd();
@@ -181,7 +210,13 @@ function prepareDelivery(input = {}, options = {}) {
     const dirty = runCommand('git', ['status', '--porcelain'], { cwd, env });
     if (dirty) throw new Error('Delivery preparation requires a clean working tree; preserve or commit existing changes first.');
 
-    let issue = findDuplicateIssue(delivery, { cwd, env });
+    const currentBranch = runCommand('git', ['branch', '--show-current'], { cwd, env });
+    const existingPr = findExistingDeliveryPr(delivery, currentBranch, { cwd, env });
+    let issue = findDuplicateIssue(delivery, {
+      cwd,
+      env,
+      allowClosedReferencedIssue: Boolean(existingPr)
+    });
     if (!issue) {
       const body = [
         'ECC deterministic delivery workflow がユーザー要求から自動作成しました。',
@@ -194,7 +229,6 @@ function prepareDelivery(input = {}, options = {}) {
       issue = { number: parseIssueNumber(url), title: delivery.title, url };
     }
 
-    const currentBranch = runCommand('git', ['branch', '--show-current'], { cwd, env });
     const existingIssueBranches = runCommand(
       'git',
       ['branch', '--list', `codex/issue-${issue.number}-*`, '--format=%(refname:short)'],
@@ -202,7 +236,9 @@ function prepareDelivery(input = {}, options = {}) {
     ).split(/\r?\n/).filter(Boolean);
     // 再開時にタイトルやslugが変わっても、同じIssueの現在branchを優先する。
     // これにより同一Issueへ複数branchを作ることを防ぐ。
-    const branch = selectDeliveryBranch(issue.number, delivery.title, currentBranch, existingIssueBranches);
+    const branch = existingPr
+      ? currentBranch
+      : selectDeliveryBranch(issue.number, delivery.title, currentBranch, existingIssueBranches);
     if (currentBranch !== branch) {
       const existing = runCommand('git', ['branch', '--list', branch], { cwd, env });
       if (existing) {
@@ -219,6 +255,7 @@ function prepareDelivery(input = {}, options = {}) {
       issue_number: Number(issue.number),
       issue_url: issue.url,
       branch,
+      draft_pr_url: existingPr ? existingPr.url : delivery.draft_pr_url,
       prepared_at: new Date().toISOString()
     };
     writeState(input, { delivery: next }, env);
@@ -253,8 +290,10 @@ if (require.main === module) {
 
 module.exports = {
   explicitIssueNumber,
+  explicitPrNumber,
   deliveryBranch,
   findDuplicateIssue,
+  findExistingDeliveryPr,
   initializeDelivery,
   isActiveDelivery,
   isDeliveryRequest,
