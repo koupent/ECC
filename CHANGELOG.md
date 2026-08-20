@@ -11,6 +11,7 @@
 
 ### Fixed
 
+- 必須Codex roleをBash backgroundで起動すると非対話Claude Code終了時に証拠が失われるため、PreToolUseで拒否してforeground完了を強制するようにしました。
 - Delivery Gateが解決済みのreset script pathとsession IDを案内し、`/ecc:codex-task-reset`もinteractive shellに存在しない`CLAUDE_PLUGIN_ROOT`へ依存しないようにしました。
 - Draft PR作成後のterminal DeliveryをPreToolUse Gateが再遮断しないようにし、未準備状態でも明示的なstate resetを許可しました。Gateの復旧案内は未設定の`CLAUDE_PLUGIN_ROOT`へ依存せず、解決済みscript pathを表示します。
 - 調査・診断だけの依頼をDeliveryへ誤分類しないようにし、自動作成Issueのtitleを要求本文ではなく匿名fingerprintへ変更しました。
