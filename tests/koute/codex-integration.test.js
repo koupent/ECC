@@ -36,8 +36,10 @@ const deliveryFinalizer = require('../../scripts/hooks/delivery-session-finalize
 const configProtection = require('../../scripts/hooks/config-protection');
 const {
   explicitIssueNumber,
+  explicitPrNumber,
   deliveryBranch,
   findDuplicateIssue,
+  findExistingDeliveryPr,
   initializeDelivery,
   isDeliveryRequest,
   normalizeIssueTitle,
@@ -213,6 +215,10 @@ test('delivery request classifier ignores chat and recognizes implementation wor
   assert.strictEqual(isDeliveryRequest('設定変更の影響を調査してください'), false);
   assert.strictEqual(isDeliveryRequest('設定変更の影響を調査し、必要なら設定を修正してください'), true);
   assert.strictEqual(isDeliveryRequest('設計について相談したいです'), false);
+  assert.strictEqual(isDeliveryRequest('Issue #251とPR #257を完遂してください'), true);
+  assert.strictEqual(isDeliveryRequest('Finish PR #257 and merge it after the required gate.'), true);
+  assert.strictEqual(isDeliveryRequest('Issue #251とPR #257を完遂し、GitHub MERGED確認まで進めてください'), true);
+  assert.strictEqual(isDeliveryRequest('Review PR #257 merge status and report it.'), false);
   assert.match(titleFromRequest('秘密を含むかもしれない音声入力です'), /^ECC delivery [0-9a-f]{10}$/);
   assert.doesNotMatch(titleFromRequest('秘密を含むかもしれない音声入力です'), /秘密|音声/);
   assert.strictEqual(parseIssueNumber('https://github.com/acme/repo/issues/42'), 42);
@@ -223,6 +229,8 @@ test('delivery preparation prioritizes an explicit open Issue reference and norm
   assert.strictEqual(explicitIssueNumber('GitHub Issue #9「proxyへ移行」'), 9);
   assert.strictEqual(explicitIssueNumber('issue 42 を修正してください'), 42);
   assert.strictEqual(explicitIssueNumber('Issue番号を調査してください'), null);
+  assert.strictEqual(explicitPrNumber('Issue #9 と PR #57 を完遂してください'), 57);
+  assert.strictEqual(explicitPrNumber('PR番号を確認してください'), null);
   assert.strictEqual(normalizeIssueTitle('Proxy（移行）'), normalizeIssueTitle('proxy ( 移行 )'));
 
   const delivery = {
@@ -238,6 +246,38 @@ test('delivery preparation prioritizes an explicit open Issue reference and norm
     }
   });
   assert.strictEqual(issue.number, 9);
+  assert.throws(
+    () => findDuplicateIssue(delivery, {
+      runCommand() {
+        return JSON.stringify({ number: 9, title: 'closed', url: 'https://example.invalid/issues/9', state: 'CLOSED' });
+      }
+    }),
+    /not open/
+  );
+  assert.strictEqual(
+    findDuplicateIssue(delivery, {
+      allowClosedReferencedIssue: true,
+      runCommand() {
+        return JSON.stringify({ number: 9, title: 'closed', url: 'https://example.invalid/issues/9', state: 'CLOSED' });
+      }
+    }).state,
+    'CLOSED'
+  );
+  const existingPr = findExistingDeliveryPr(
+    { requested_issue_number: 9, requested_pr_number: 57 },
+    'legacy-issue-9',
+    {
+      runCommand(binary, args) {
+        assert.strictEqual(binary, 'gh');
+        assert.deepStrictEqual(args.slice(0, 5), ['pr', 'list', '--head', 'legacy-issue-9', '--state']);
+        return JSON.stringify([
+          { number: 56, url: 'https://example.invalid/pull/56', headRefName: 'legacy-issue-9', body: 'Closes #9' },
+          { number: 57, url: 'https://example.invalid/pull/57', headRefName: 'legacy-issue-9', body: 'Closes #9' }
+        ]);
+      }
+    }
+  );
+  assert.strictEqual(existingPr.number, 57);
   assert.strictEqual(
     deliveryBranch(9, 'changed title', 'codex/issue-9-original-title'),
     'codex/issue-9-original-title'
