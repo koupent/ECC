@@ -2,11 +2,11 @@
 
 This is a **production-ready AI coding plugin** providing 67 specialized agents, 281 skills, 99 commands, and automated hook workflows for software development.
 
-**Version:** 2.1.0-koute.22
+**Version:** 2.1.0-koute.24
 
 ## Core Principles
 
-1. **Agent-First** — Delegate to specialized agents for domain tasks
+1. **Agent-Aware** — Delegate only when the runtime and higher-priority instructions permit it
 2. **Test-Driven** — Write tests before implementation, 80%+ coverage required
 3. **Security-First** — Never compromise on security; validate all inputs
 4. **Immutability** — Always create new objects, never mutate existing ones
@@ -50,7 +50,12 @@ This is a **production-ready AI coding plugin** providing 67 specialized agents,
 
 ## Agent Orchestration
 
-Use agents proactively without user prompt:
+This catalog describes available roles; it does not automatically spawn an agent. Delegate only
+when the runtime exposes the required tool and higher-priority system, organization, project, or
+user instructions permit it. Otherwise, apply the same planning, testing, and review checklist in
+the parent context. Never claim an agent ran without invoking it and collecting its result.
+
+When delegation is permitted, consider the matching specialist for genuinely bounded work:
 - Complex feature requests → **planner**
 - Code just written/modified → **code-reviewer**
 - Bug fix or new feature → **tdd-guide**
@@ -60,7 +65,8 @@ Use agents proactively without user prompt:
 - Autonomous loops / loop monitoring → **loop-operator**
 - Harness config reliability and cost → **harness-optimizer**
 
-Use parallel execution for independent operations — launch multiple agents simultaneously.
+Use parallel execution only for independent operations when the runtime permits delegation and the
+parent can collect every result before ending its turn. Fire-and-forget delegation is forbidden.
 
 ## Security Guidelines
 

@@ -30,7 +30,7 @@ function executor(binary, args) {
   if (key.startsWith('gh pr list --head codex/issue-11-lock')) {
     return {
       ok: true,
-      stdout: JSON.stringify([{ number: 24, url: 'https://example.invalid/pull/24', isDraft: true, body: 'Closes #11', baseRefName: 'main' }]),
+      stdout: JSON.stringify([{ number: 24, url: 'https://example.invalid/pull/24', isDraft: true, body: 'Closes #11', baseRefName: 'main', headRefOid: 'abc123' }]),
       stderr: ''
     };
   }
@@ -49,8 +49,10 @@ function validEntry() {
       waste_loops: 0,
       review_role: 'review',
       review_status: 'ok',
+      review_complete: true,
       review_head: 'abc123',
       review_worktree_clean: true,
+      review_blocking_findings: 0,
       delivery: {
         status: 'draft-pr',
         requested_issue_number: 11,
@@ -87,6 +89,41 @@ test('fails when an explicitly requested Issue was replaced', () => {
   const report = audit({ cwd: path.resolve('.'), issueNumber: 11 }, { entry, command: executor });
   assert.strictEqual(report.status, 'FAIL');
   assert.strictEqual(report.checks.find(item => item.id === 'explicit-issue-reused').pass, false);
+});
+
+test('fails when a nominally successful review still records a release blocker', () => {
+  const entry = validEntry();
+  entry.state.review_blocking_findings = 1;
+  const report = audit({ cwd: path.resolve('.'), issueNumber: 11 }, { entry, command: executor });
+  assert.strictEqual(report.status, 'FAIL');
+  assert.strictEqual(report.checks.find(item => item.id === 'commit-bound-review').pass, false);
+});
+
+test('fails closed when release-blocker evidence is missing or malformed', () => {
+  for (const value of [undefined, null, '0', Number.NaN]) {
+    const entry = validEntry();
+    entry.state.review_blocking_findings = value;
+    const report = audit({ cwd: path.resolve('.'), issueNumber: 11 }, { entry, command: executor });
+    assert.strictEqual(report.status, 'FAIL');
+    assert.strictEqual(report.checks.find(item => item.id === 'commit-bound-review').pass, false);
+  }
+});
+
+test('fails when a Draft PR is not bound to the reviewed HEAD', () => {
+  const staleExecutor = (binary, args) => {
+    const key = `${binary} ${args.join(' ')}`;
+    if (key.startsWith('gh pr list --head codex/issue-11-lock')) {
+      return {
+        ok: true,
+        stdout: JSON.stringify([{ number: 24, url: 'https://example.invalid/pull/24', isDraft: true, body: 'Closes #11', baseRefName: 'main', headRefOid: 'stale' }]),
+        stderr: ''
+      };
+    }
+    return executor(binary, args);
+  };
+  const report = audit({ cwd: path.resolve('.'), issueNumber: 11 }, { entry: validEntry(), command: staleExecutor });
+  assert.strictEqual(report.status, 'FAIL');
+  assert.strictEqual(report.checks.find(item => item.id === 'github-delivery-pr').pass, false);
 });
 
 test('accepts squash-merged delivery evidence bound to the reviewed HEAD', () => {

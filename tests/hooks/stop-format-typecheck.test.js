@@ -13,7 +13,11 @@ const os = require('os');
 const path = require('path');
 
 const accumulator = require('../../scripts/hooks/post-edit-accumulator');
-const { parseAccumulator } = require('../../scripts/hooks/stop-format-typecheck');
+const { parseAccumulator, formatterDiagnostics } = require('../../scripts/hooks/stop-format-typecheck');
+const stopFormatSource = fs.readFileSync(
+  path.resolve(__dirname, '../../scripts/hooks/stop-format-typecheck.js'),
+  'utf8'
+);
 
 function test(name, fn) {
   try {
@@ -153,6 +157,22 @@ if (test('handles .tsx and .jsx extensions', () => {
 
 console.log('\nstop-format-typecheck: accumulator cleanup');
 console.log('==========================================\n');
+
+if (test('stop hook checks formatting without mutating reviewed files', () => {
+  assert.ok(stopFormatSource.includes("'--check'"));
+  assert.doesNotMatch(stopFormatSource, /'--write'/);
+})) passed++; else failed++;
+
+if (test('formatter failures include bounded sanitized diagnostics', () => {
+  const output = formatterDiagnostics('prettier', {
+    stdout: '\u001b[31msrc/example.ts differs\u001b[0m',
+    stderr: 'x'.repeat(5000)
+  });
+  assert.match(output, /prettier formatting check failed/);
+  assert.match(output, /src\/example\.ts differs/);
+  assert.ok(!output.includes('\u001b'));
+  assert.ok(output.length < 4100);
+})) passed++; else failed++;
 
 if (test('stop hook removes accumulator file after reading it', () => {
   cleanAccumFile();

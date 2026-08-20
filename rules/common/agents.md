@@ -18,17 +18,26 @@ Located in `~/.claude/agents/`:
 | rust-reviewer | Rust code review | Rust projects |
 | harmonyos-app-resolver | HarmonyOS app development | HarmonyOS/ArkTS projects |
 
-## Immediate Agent Usage
+## Agent Usage Policy
 
-No user prompt needed:
-1. Complex feature requests - Use **planner** agent
-2. Code just written/modified - Use **code-reviewer** agent
-3. Bug fix or new feature - Use **tdd-guide** agent
-4. Architectural decision - Use **architect** agent
+This rule describes when delegation is useful; it does not automatically spawn an agent.
+The parent model must invoke the available Agent or Task tool. Higher-priority system,
+runtime, organization, and user instructions always take precedence over this rule.
+
+When delegation tools are available and higher-priority instructions permit their use:
+1. Complex feature requests - Consider the **planner** agent
+2. Code just written/modified - Consider the **code-reviewer** agent
+3. Bug fix or new feature - Consider the **tdd-guide** agent
+4. Architectural decision - Consider the **architect** agent
+
+When delegation is unavailable or prohibited, keep the work in the parent context and apply
+the same planning, testing, and review checklists directly. Never claim that an agent ran when
+no tool invocation and result collection occurred.
 
 ## Parallel Task Execution
 
-ALWAYS use parallel Task execution for independent operations:
+Use parallel Task execution for genuinely independent operations only when the runtime permits
+delegation and the parent can collect every result before ending its turn:
 
 ```markdown
 # GOOD: Parallel execution
@@ -53,7 +62,9 @@ Applies to every agent at every depth (parent, child, grandchild):
 
 ## Multi-Perspective Analysis
 
-For complex problems, use split role sub-agents:
+For complex problems, consider split-role sub-agents when delegation is permitted and the
+perspectives are genuinely independent:
+
 - Factual reviewer
 - Senior engineer
 - Security expert

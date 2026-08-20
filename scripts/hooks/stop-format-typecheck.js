@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * Stop Hook: Batch format and typecheck all JS/TS files edited this response
+ * Stop Hook: Batch formatting check and typecheck all JS/TS files edited this response
  *
  * Cross-platform (Windows, macOS, Linux)
  *
  * Reads the accumulator written by post-edit-accumulator.js and processes all
- * edited files in one pass: groups files by project root for a single formatter
+ * edited files in one pass: groups files by project root for a single non-mutating formatter
  * invocation per root, and groups .ts/.tsx files by tsconfig dir for a single
  * tsc --noEmit per tsconfig. The accumulator is cleared on read so repeated
  * Stop calls do not double-process files.
@@ -45,6 +45,20 @@ function getAccumFile() {
   return path.join(os.tmpdir(), `ecc-edited-${sessionId}.txt`);
 }
 
+function formatterDiagnostics(formatter, result) {
+  const detail = [result && result.stdout, result && result.stderr, result && result.message]
+    .filter(Boolean)
+    .map(value => String(value))
+    .join('\n')
+    // eslint-disable-next-line no-control-regex -- 外部コマンドのANSI制御列を診断文から除去する。
+    .replace(new RegExp('\\u001b\\[[0-9;]*m', 'g'), '')
+    // eslint-disable-next-line no-control-regex -- ログへ制御文字を持ち込まない。
+    .replace(new RegExp('[\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f]', 'g'), '')
+    .trim()
+    .slice(0, 4000);
+  return detail ? `[Hook] ${formatter} formatting check failed:\n${detail}\n` : '';
+}
+
 function formatBatch(projectRoot, files, timeoutMs) {
   const formatter = detectFormatter(projectRoot);
   if (!formatter) return;
@@ -57,8 +71,8 @@ function formatBatch(projectRoot, files, timeoutMs) {
 
   const fileArgs =
     formatter === 'biome'
-      ? [...resolved.prefix, 'check', '--write', ...existingFiles]
-      : [...resolved.prefix, '--write', ...existingFiles];
+      ? [...resolved.prefix, 'check', ...existingFiles]
+      : [...resolved.prefix, '--check', ...existingFiles];
 
   try {
     if (process.platform === 'win32' && resolved.bin.endsWith('.cmd')) {
@@ -68,11 +82,13 @@ function formatBatch(projectRoot, files, timeoutMs) {
       }
       const result = spawnSync(resolved.bin, fileArgs, { cwd: projectRoot, shell: true, stdio: 'pipe', timeout: timeoutMs });
       if (result.error) throw result.error;
+      if (result.status !== 0) process.stderr.write(formatterDiagnostics(formatter, result));
     } else {
       execFileSync(resolved.bin, fileArgs, { cwd: projectRoot, stdio: ['pipe', 'pipe', 'pipe'], timeout: timeoutMs });
     }
-  } catch {
-    // Formatter not installed or failed — non-blocking
+  } catch (error) {
+    const diagnostics = formatterDiagnostics(formatter, error);
+    if (diagnostics) process.stderr.write(diagnostics);
   }
 }
 
@@ -223,4 +239,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { run, parseAccumulator };
+module.exports = { formatterDiagnostics, run, parseAccumulator };

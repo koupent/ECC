@@ -12,7 +12,7 @@ const DELIVERY_COMPLETION_REQUEST = /(?:\b(?:complete|finish|finalize|deliver)\b
 const NEGATED_DELIVERY_REQUEST = /(?:\b(?:do\s+not|don't|without)\s+(?:implement(?:ing)?|fix(?:ing)?|chang(?:e|ing)|add(?:ing)?|remov(?:e|ing)|refactor(?:ing)?|build(?:ing)?|creat(?:e|ing)|updat(?:e|ing))\b|(?:実装|修正|変更|追加|削除|作成|更新)(?:は)?(?:しないで|しない|しなくてよい|せず|不要)|直さない)/gi;
 const DIAGNOSTIC_REQUEST = /(?:\b(?:investigate|review|analy[sz]e|diagnose|inspect|check)\b|調査|確認|レビュー|分析|診断|調べて|教えて)/i;
 const EXPLICIT_MUTATION_REQUEST = /(?:\b(?:implement|fix|add|remove|refactor|build|create|update)\b|(?:実装|修正|変更|追加|削除|作成|更新|直)(?:を)?(?:して|する|してください|してほしい|したい|せよ))/i;
-const ACTIVE_DELIVERY_STATUSES = new Set(['pending', 'ready']);
+const ACTIVE_DELIVERY_STATUSES = new Set(['deferred', 'pending', 'ready']);
 
 function isActiveDelivery(delivery) {
   return Boolean(delivery && ACTIVE_DELIVERY_STATUSES.has(delivery.status));
@@ -81,10 +81,20 @@ function initializeDelivery(input, request, options = {}) {
   const env = options.env || process.env;
   const cwd = options.cwd || input.cwd || process.cwd();
   const config = loadConfig(cwd, env);
-  if (config.deliveryWorkflow !== 'required' || !isDeliveryRequest(request)) return null;
+  if (config.deliveryWorkflow !== 'required') return null;
 
   const current = readState(input, env);
   const requestHash = hash(request, 32);
+  if (
+    options.deferred &&
+    current.delivery &&
+    current.delivery.status === 'pending'
+  ) {
+    const deferred = { ...current.delivery, status: 'deferred' };
+    writeState(input, { delivery: deferred, project: projectFingerprint(cwd) }, env);
+    return deferred;
+  }
+  if (!isDeliveryRequest(request)) return null;
   if (current.delivery && current.delivery.request_hash === requestHash) return current.delivery;
   // Claude Code の継続turnでは、ユーザーの追記文面が変わっても同じDeliveryである。
   // 進行中Deliveryを本文ハッシュだけで上書きすると、Context Builder、Issue、branchが
@@ -92,7 +102,9 @@ function initializeDelivery(input, request, options = {}) {
   if (isActiveDelivery(current.delivery)) return current.delivery;
 
   const delivery = {
-    status: 'pending',
+    // Plan modeではIssueやbranchをまだ変更しない一方、承認後の同じturnで
+    // 実装へ移っても必須Deliveryを迂回できないよう意図だけを先に記録する。
+    status: options.deferred ? 'deferred' : 'pending',
     request_hash: requestHash,
     title: titleFromRequest(request, requestHash),
     requested_issue_number: explicitIssueNumber(request),
@@ -115,7 +127,8 @@ function pendingSessionForProject(cwd, env = process.env) {
     candidates = fs.readdirSync(sessionsDir)
       .filter(file => file.endsWith('.json'))
       .map(file => readJson(path.join(sessionsDir, file)))
-      .filter(state => state && state.project === project && state.delivery && state.delivery.status === 'pending')
+      .filter(state => state && state.project === project && state.delivery &&
+        ['deferred', 'pending'].includes(state.delivery.status))
       .sort((left, right) => String(right.updated_at || '').localeCompare(String(left.updated_at || '')));
   } catch {
     return '';
@@ -202,7 +215,7 @@ function prepareDelivery(input = {}, options = {}) {
   const cwd = options.cwd || input.cwd || process.cwd();
   const state = readState(input, env);
   const delivery = state.delivery;
-  if (!delivery || delivery.status !== 'pending') {
+  if (!delivery || !['deferred', 'pending'].includes(delivery.status)) {
     throw new Error('No pending required delivery task. Submit the implementation request first.');
   }
 

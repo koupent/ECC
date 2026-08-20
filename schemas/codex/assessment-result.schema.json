@@ -2,18 +2,20 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "additionalProperties": false,
-  "required": ["status", "summary", "findings", "followups"],
+  "required": ["status", "review_complete", "summary", "findings", "followups"],
   "properties": {
     "status": { "type": "string", "enum": ["ok", "blocked"] },
+    "review_complete": { "type": "boolean" },
     "summary": { "type": "string" },
     "findings": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["severity", "title", "path", "line", "evidence", "recommendation", "fingerprint"],
+        "required": ["severity", "disposition", "title", "path", "line", "evidence", "recommendation", "fingerprint"],
         "properties": {
           "severity": { "type": "string", "enum": ["critical", "high", "medium", "low", "info"] },
+          "disposition": { "type": "string", "enum": ["release-blocker", "owner-action", "follow-up"] },
           "title": { "type": "string" },
           "path": { "type": ["string", "null"] },
           "line": { "type": ["integer", "null"], "minimum": 1 },

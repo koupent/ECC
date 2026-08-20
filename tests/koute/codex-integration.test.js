@@ -16,7 +16,7 @@ const {
   resetState,
   writeState
 } = require('../../scripts/codex/runtime-state');
-const { isTestPath, requireUsableResult, roleInstructions, runRole, validateResult, workingTreeSignature } = require('../../scripts/codex/run-role');
+const { isTestPath, normalizeReviewResult, requireUsableResult, reviewSnapshot, roleInstructions, runRole, validateResult, workingTreeSignature } = require('../../scripts/codex/run-role');
 const {
   acquireLock,
   classifyTarget,
@@ -120,7 +120,9 @@ function createCodexShim(mode, fixture) {
       "  fs.writeFileSync(path.join(process.cwd(), 'tests', 'contract.test.ts'), 'test placeholder\\n');",
       "}",
       "const context = {status:'ok',summary:'fixture context',files:['src/product.ts'],constraints:[],risks:[],verification:[]};",
-      "const assessment = {status:'ok',summary:'fixture assessment',findings:[]};",
+      "const ownerActionFinding = {severity:'high',disposition:'owner-action',title:'owner step',path:'docs/runbook.md',line:1,evidence:'external host setup is required',recommendation:'complete the host setup',fingerprint:'owner-step'};",
+      "const blockerFinding = {severity:'high',disposition:'release-blocker',title:'unsafe change',path:'src/product.ts',line:1,evidence:'the implementation is unsafe',recommendation:'fix the implementation',fingerprint:'release-blocker'};",
+      "const assessment = mode === 'owner-action' ? {status:'blocked',review_complete:true,summary:'owner action remains',findings:[ownerActionFinding],followups:['Track the external host setup']} : mode === 'contradictory-blocker' ? {status:'ok',review_complete:true,summary:'incorrect model status',findings:[blockerFinding],followups:[]} : {status:'ok',review_complete:true,summary:'fixture assessment',findings:[],followups:[]};",
       "fs.writeFileSync(output, JSON.stringify(mode === 'context' ? context : assessment));"
     ].join('\n'),
     'utf8'
@@ -402,6 +404,31 @@ test('required delivery gate blocks edits until issue and branch evidence are re
     fs.readFileSync(path.join(__dirname, '..', '..', 'commands', 'codex-task-reset.md'), 'utf8'),
     /\$CLAUDE_PLUGIN_ROOT/
   );
+  assert.strictEqual(deliveryGate.isExactLifecycleCommand(
+    'node "/plugin/scripts/codex/delivery-lifecycle.js" prepare --session "delivery-gate"',
+    'prepare'
+  ), true);
+  assert.strictEqual(deliveryGate.isExactLifecycleCommand(
+    '"C:\\Program Files\\Node (x86)\\node.exe" "C:\\A&B\\scripts\\codex\\delivery-lifecycle.js" prepare --session "delivery-gate"',
+    'prepare'
+  ), true);
+  assert.strictEqual(deliveryGate.isExactLifecycleCommand(
+    'node "/opt/A&B/ECC/scripts/codex/reset.js" "delivery-gate"',
+    'reset'
+  ), true);
+  for (const bypass of [
+    'echo node /plugin/scripts/codex/delivery-lifecycle.js prepare',
+    'node /plugin/scripts/codex/delivery-lifecycle.js prepare && git add .',
+    'node /plugin/scripts/codex/delivery-lifecycle.js prepare; git add .',
+    'node /plugin/scripts/codex/delivery-lifecycle.js prepare --session x&make',
+    'node /plugin/scripts/codex/reset.js x&make',
+    'node "/plugin/$(make)/scripts/codex/reset.js" x',
+    'node "${NODE_BINARY@P}" "/plugin/scripts/codex/delivery-lifecycle.js" prepare',
+    'node "${CLAUDE_PLUGIN_ROOT@P}/scripts/codex/reset.js" x',
+    'node /plugin/scripts/codex/delivery-lifecycle.js prepare $(git add .)'
+  ]) {
+    assert.strictEqual(deliveryGate.isExactLifecycleCommand(bypass, 'prepare'), false, bypass);
+  }
 
   const bash = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: 'npm test' } });
   assert.strictEqual(JSON.parse(deliveryGate.run(bash, { cwd: fixture, env: fixtureEnv })).hookSpecificOutput.permissionDecision, 'deny');
@@ -453,6 +480,7 @@ test('delivery completion gate rejects a review that is not bound to the current
     last_role: 'review',
     review_role: 'review',
     review_status: 'ok',
+    review_complete: true,
     review_head: 'stale-commit',
     review_worktree_clean: true
   }, fixtureEnv);
@@ -464,9 +492,15 @@ test('delivery completion gate rejects a review that is not bound to the current
   writeState(input, {
     review_role: 'review',
     review_status: 'ok',
+    review_complete: true,
     review_head: head,
-    review_worktree_clean: true
+    review_worktree_clean: true,
+    review_blocking_findings: 1
   }, fixtureEnv);
+  const blockingReview = JSON.parse(deliveryCompletion.run(JSON.stringify(input), { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(blockingReview.decision, 'block');
+  assert.match(blockingReview.reason, /release-blocking findings/);
+  writeState(input, { review_blocking_findings: 0 }, fixtureEnv);
   const invalidPrData = JSON.parse(deliveryCompletion.run(JSON.stringify(input), {
     cwd: fixture,
     env: fixtureEnv,
@@ -485,7 +519,7 @@ test('delivery completion gate rejects a review that is not bound to the current
       if (binary === 'gh') {
         return {
           ok: true,
-          stdout: JSON.stringify([{ url: 'https://example.invalid/pr/1', isDraft: true, number: 1, body: 'Closes #7', baseRefName: 'develop' }]),
+          stdout: JSON.stringify([{ url: 'https://example.invalid/pr/1', isDraft: true, number: 1, body: 'Closes #7', baseRefName: 'develop', headRefOid: head }]),
           stderr: ''
         };
       }
@@ -503,7 +537,7 @@ test('delivery completion gate rejects a review that is not bound to the current
       if (binary === 'gh') {
         return {
           ok: true,
-          stdout: JSON.stringify([{ url: 'https://example.invalid/pr/2', isDraft: true, number: 2, body: 'Closes #7', baseRefName: 'main' }]),
+          stdout: JSON.stringify([{ url: 'https://example.invalid/pr/2', isDraft: true, number: 2, body: 'Closes #7', baseRefName: 'main', headRefOid: head }]),
           stderr: ''
         };
       }
@@ -545,8 +579,10 @@ test('squash completion requires a current Local Merge Gate status and confirms 
     delivery: { status: 'ready', issue_number: 73, branch, base_branch: 'main' },
     review_role: 'review',
     review_status: 'ok',
+    review_complete: true,
     review_head: head,
-    review_worktree_clean: true
+    review_worktree_clean: true,
+    review_blocking_findings: 0
   }, fixtureEnv);
 
   const calls = [];
@@ -691,7 +727,8 @@ test('a clean commit is recorded and further edits wait for an independent revie
 
   writeState(input, {
     review_role: 'review',
-    review_status: 'ok',
+    review_status: 'blocked',
+    review_complete: true,
     review_head: recorded.delivery.committed_head,
     review_worktree_clean: true,
     review_blocking_findings: 1
@@ -858,6 +895,82 @@ test('context builder reuses the task packet instead of starting a duplicate Cod
   assert.match(output.hookSpecificOutput.additionalContext, /"summary":"cached"/);
 });
 
+test('plan mode records deferred delivery intent and blocks the first approved edit until prepare', () => {
+  const fixture = createGitFixture('plan-mode-context-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'plan-mode-context-state') };
+  const output = JSON.parse(contextBuilder.run(JSON.stringify({
+    session_id: 'plan-mode-context',
+    cwd: fixture,
+    permission_mode: 'plan',
+    prompt: '認証処理を修正してください'
+  }), {
+    cwd: fixture,
+    env: fixtureEnv,
+    runRole() {
+      return {
+        ok: true,
+        result: { status: 'ok', summary: 'planning context', files: [], constraints: [], risks: [], verification: [] }
+      };
+    }
+  }));
+  const state = readState({ session_id: 'plan-mode-context' }, fixtureEnv);
+  assert.strictEqual(state.delivery.status, 'deferred');
+  assert.match(output.hookSpecificOutput.additionalContext, /delivery-lifecycle\.js/);
+  assert.match(output.hookSpecificOutput.additionalContext, /planning context/);
+
+  const planBash = JSON.stringify({
+    session_id: 'plan-mode-context',
+    cwd: fixture,
+    permission_mode: 'plan',
+    tool_name: 'Bash',
+    tool_input: { command: 'git status --short' }
+  });
+  assert.strictEqual(deliveryGate.run(planBash, { cwd: fixture, env: fixtureEnv }), planBash);
+
+  const approvedEdit = JSON.stringify({
+    session_id: 'plan-mode-context',
+    cwd: fixture,
+    permission_mode: 'default',
+    tool_name: 'Edit',
+    tool_input: { file_path: path.join(fixture, 'src', 'product.ts') }
+  });
+  const denied = JSON.parse(deliveryGate.run(approvedEdit, { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(denied.hookSpecificOutput.permissionDecisionReason, /delivery-lifecycle\.js/);
+
+  const planStop = JSON.stringify({ session_id: 'plan-mode-context', cwd: fixture, permission_mode: 'plan' });
+  assert.strictEqual(deliveryCompletion.run(planStop, { cwd: fixture, env: fixtureEnv }), planStop);
+  const approvedStop = JSON.parse(deliveryCompletion.run(JSON.stringify({
+    session_id: 'plan-mode-context', cwd: fixture, permission_mode: 'default'
+  }), { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(approvedStop.decision, 'block');
+  assert.match(approvedStop.reason, /delivery-prepare/);
+});
+
+test('switching an existing pending delivery into plan mode defers it without repository side effects', () => {
+  const fixture = createGitFixture('pending-to-plan-context-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'pending-to-plan-context-state') };
+  const input = { session_id: 'pending-to-plan-context', cwd: fixture };
+  const request = '認証処理を修正してください';
+  assert.strictEqual(initializeDelivery(input, request, { cwd: fixture, env: fixtureEnv }).status, 'pending');
+  assert.strictEqual(initializeDelivery(input, 'まず設計だけ確認したいです', {
+    cwd: fixture,
+    env: fixtureEnv,
+    deferred: true
+  }).status, 'deferred');
+  assert.strictEqual(readState(input, fixtureEnv).delivery.status, 'deferred');
+});
+
 test('test write allowlist accepts contracts and rejects product source', () => {
   assert.ok(isTestPath('tests/api/contract.test.ts'));
   assert.ok(isTestPath('lib/foo.spec.dart'));
@@ -882,6 +995,185 @@ test('role result validator rejects malformed output', () => {
   assert.doesNotThrow(() =>
     validateResult({ status: 'ok', summary: 'x', files: [], constraints: [], risks: [], verification: [] }, 'context-result.schema.json')
   );
+  assert.throws(
+    () => validateResult({
+      status: 'blocked',
+      review_complete: true,
+      summary: 'owner action',
+      findings: [{ severity: 'critical', disposition: 'owner-action' }],
+      followups: ['perform the action']
+    }, 'assessment-result.schema.json'),
+    /Critical findings must be classified as release-blocker/
+  );
+  assert.throws(
+    () => validateResult({
+      status: 'ok',
+      review_complete: true,
+      summary: 'high follow-up',
+      findings: [{ severity: 'high', disposition: 'follow-up' }],
+      followups: ['fix later']
+    }, 'assessment-result.schema.json'),
+    /High findings cannot be classified as follow-up/
+  );
+  assert.throws(
+    () => validateResult({
+      status: 'blocked',
+      review_complete: true,
+      summary: 'owner action',
+      findings: [{ severity: 'high', disposition: 'owner-action' }],
+      followups: []
+    }, 'assessment-result.schema.json'),
+    /require at least one explicit follow-up/
+  );
+});
+
+test('review normalization makes release blockers authoritative over model status', () => {
+  const blocker = {
+    severity: 'high',
+    disposition: 'release-blocker',
+    fingerprint: 'authoritative-blocker'
+  };
+  const normalized = normalizeReviewResult({
+    status: 'ok',
+    review_complete: true,
+    summary: 'contradictory result',
+    findings: [blocker],
+    followups: []
+  });
+  assert.strictEqual(normalized.result.status, 'blocked');
+  assert.strictEqual(normalized.releaseBlockers.length, 1);
+  const medium = normalizeReviewResult({
+    status: 'ok',
+    review_complete: true,
+    summary: 'lower severity blocker',
+    findings: [{ ...blocker, severity: 'medium' }],
+    followups: []
+  });
+  assert.strictEqual(medium.result.status, 'blocked');
+  assert.strictEqual(medium.releaseBlockers.length, 1);
+
+  const ownerOnly = normalizeReviewResult({
+    status: 'blocked',
+    review_complete: true,
+    summary: 'owner action remains',
+    findings: [{ severity: 'high', disposition: 'owner-action', fingerprint: 'owner-step' }],
+    followups: ['complete the owner action']
+  });
+  assert.strictEqual(ownerOnly.result.status, 'ok');
+
+  const incomplete = normalizeReviewResult({
+    status: 'ok',
+    review_complete: false,
+    summary: 'inspection stopped early',
+    findings: [],
+    followups: []
+  });
+  assert.strictEqual(incomplete.result.status, 'blocked');
+});
+
+test('review instructions require full-file and workflow-structure inspection', () => {
+  const instructions = roleInstructions('review', 'review this delivery');
+  assert.match(instructions, /Read every changed file in full/);
+  assert.match(instructions, /ordered procedure/);
+  assert.match(instructions, /owner-action/);
+});
+
+test('clean review snapshots are reused instead of rerunning Codex', () => {
+  const fixture = createGitFixture('review-cache-repo');
+  const fixtureEnv = {
+    ...env,
+    ECC_KOUTE_STATE_DIR: path.join(temp, 'review-cache-state'),
+    ECC_CODEX_BINARY: createCodexShim('review-cache', fixture)
+  };
+  const first = runRole({ role: 'review', request: 'review fixture', cwd: fixture, sessionId: 'review-cache', env: fixtureEnv });
+  const second = runRole({ role: 'review', request: 'review fixture', cwd: fixture, sessionId: 'review-cache', env: fixtureEnv });
+  assert.strictEqual(first.ok, true, JSON.stringify(first));
+  assert.strictEqual(second.ok, true, JSON.stringify(second));
+  assert.strictEqual(second.cached, true);
+  assert.strictEqual(readState({ session_id: 'review-cache' }, fixtureEnv).codex_calls, 1);
+});
+
+test('a materially different review request does not reuse a prior review snapshot', () => {
+  const fixture = createGitFixture('review-request-cache-repo');
+  const fixtureEnv = {
+    ...env,
+    ECC_KOUTE_STATE_DIR: path.join(temp, 'review-request-cache-state'),
+    ECC_CODEX_BINARY: createCodexShim('review-request-cache', fixture)
+  };
+  const first = runRole({ role: 'review', request: 'review correctness', cwd: fixture, sessionId: 'review-request-cache', env: fixtureEnv });
+  const second = runRole({ role: 'review', request: 'review security boundaries', cwd: fixture, sessionId: 'review-request-cache', env: fixtureEnv });
+  assert.strictEqual(first.ok, true, JSON.stringify(first));
+  assert.strictEqual(second.ok, true, JSON.stringify(second));
+  assert.notStrictEqual(second.cached, true);
+  assert.strictEqual(readState({ session_id: 'review-request-cache' }, fixtureEnv).codex_calls, 2);
+});
+
+test('an incomplete blocked review is not cached and can be retried with the same request', () => {
+  const fixture = createGitFixture('review-incomplete-cache-repo');
+  const fixtureEnv = {
+    ...env,
+    ECC_KOUTE_STATE_DIR: path.join(temp, 'review-incomplete-cache-state'),
+    ECC_CODEX_BINARY: createCodexShim('review-cache', fixture)
+  };
+  const session = { session_id: 'review-incomplete-cache' };
+  const request = 'review incomplete fixture';
+  writeState(session, {
+    review_role: 'review',
+    review_status: 'blocked',
+    review_complete: false,
+    review_worktree_clean: true,
+    review_blocking_findings: 0,
+    review_snapshot: reviewSnapshot(fixture, {}),
+    review_request_hash: hash(request, 32),
+    review_result: { status: 'blocked', review_complete: false, summary: 'review incomplete', findings: [], followups: [] }
+  }, fixtureEnv);
+  const result = runRole({ role: 'review', request, cwd: fixture, sessionId: session.session_id, env: fixtureEnv });
+  assert.strictEqual(result.ok, true, JSON.stringify(result));
+  assert.notStrictEqual(result.cached, true);
+  assert.strictEqual(result.result.status, 'ok');
+});
+
+test('owner-only external actions do not create an unclosable review blocker', () => {
+  const fixture = createGitFixture('review-owner-action-repo');
+  const fixtureEnv = {
+    ...env,
+    ECC_KOUTE_STATE_DIR: path.join(temp, 'review-owner-action-state'),
+    ECC_CODEX_BINARY: createCodexShim('owner-action', fixture)
+  };
+  const output = runRole({ role: 'review', request: 'review owner action', cwd: fixture, sessionId: 'review-owner-action', env: fixtureEnv });
+  const state = readState({ session_id: 'review-owner-action' }, fixtureEnv);
+  assert.strictEqual(output.ok, true, JSON.stringify(output));
+  assert.strictEqual(output.result.status, 'ok');
+  assert.strictEqual(state.review_status, 'ok');
+  assert.strictEqual(state.review_blocking_findings, 0);
+  assert.deepStrictEqual(state.review_owner_actions.map(item => item.fingerprint), ['owner-step']);
+});
+
+test('run-role persists a contradictory release blocker as blocked', () => {
+  const fixture = createGitFixture('review-release-blocker-repo');
+  const fixtureEnv = {
+    ...env,
+    ECC_KOUTE_STATE_DIR: path.join(temp, 'review-release-blocker-state'),
+    ECC_CODEX_BINARY: createCodexShim('contradictory-blocker', fixture)
+  };
+  const output = runRole({ role: 'review', request: 'review blocker', cwd: fixture, sessionId: 'review-release-blocker', env: fixtureEnv });
+  const state = readState({ session_id: 'review-release-blocker' }, fixtureEnv);
+  assert.strictEqual(output.ok, true, JSON.stringify(output));
+  assert.strictEqual(output.result.status, 'blocked');
+  assert.strictEqual(state.review_status, 'blocked');
+  assert.strictEqual(state.review_blocking_findings, 1);
+});
+
+test('distributed agent rules defer to runtime capabilities and do not claim automatic spawning', () => {
+  const agentsRule = fs.readFileSync(path.join(__dirname, '..', '..', 'rules', 'common', 'agents.md'), 'utf8');
+  const rootAgents = fs.readFileSync(path.join(__dirname, '..', '..', 'AGENTS.md'), 'utf8');
+  assert.doesNotMatch(agentsRule, /No user prompt needed/);
+  assert.doesNotMatch(agentsRule, /ALWAYS use parallel Task execution/);
+  assert.match(agentsRule, /higher-priority/);
+  assert.match(agentsRule, /does not automatically spawn/i);
+  assert.doesNotMatch(rootAgents, /Use agents proactively without user prompt/);
+  assert.match(rootAgents, /higher-priority/);
+  assert.match(rootAgents, /does not automatically spawn/i);
 });
 
 test('insufficient Context Builder output triggers Claude fallback', () => {

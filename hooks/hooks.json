@@ -230,7 +230,7 @@
             "timeout": 300
           }
         ],
-        "description": "Batch format (Biome/Prettier) and typecheck (tsc) all JS/TS files edited this response — runs once at Stop instead of after every Edit",
+        "description": "Batch-check formatting (Biome/Prettier) and typecheck (tsc) for JS/TS files edited this response without mutating reviewed files",
         "id": "stop:format-typecheck"
       },
       {

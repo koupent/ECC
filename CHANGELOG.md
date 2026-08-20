@@ -4,6 +4,8 @@
 
 ### Changed
 
+- 独立Codexレビューが差分だけでなく変更ファイル全体、呼出元、利用側、手順順序、前提条件、ロールバック経路まで確認するようにしました。指摘は`release-blocker`、`owner-action`、`follow-up`へ分類します。
+- サブエージェントRulesは自動起動を保証せず、上位指示とランタイムで許可された場合だけモデルが明示的に委任する契約へ改めました。
 - Kit導入プロジェクト向けに、現HEADの`Local Merge Gate`成功後だけPRをReady化して通常squash mergeし、GitHub上の`MERGED`まで確認するCompletion方式を追加しました。従来のDraft PR停止は既定値として維持します。
 - PreToolUse Hookが直接の`gh pr merge`とsuccess commit status投稿を拒否し、Local Merge GateとCompletion Gateの決定論的経路へ統一します。
 - Harness incidents now route deterministically to ECC, Engineering Environment Kit, or product follow-up labels, and background remediation is opt-in so the normal Claude Code CLI workflow remains the default repair path.
@@ -11,6 +13,8 @@
 
 ### Fixed
 
+- plan modeではContext Builderだけを実行し、Issue作成やbranch切替を開始しないようにしました。
+- 同じHEAD、base、worktree差分へ独立Codexレビューを繰り返さず、外部所有者作業だけが残るレビューを閉じられない修正ループへ入れないようにしました。CRITICAL指摘を`owner-action`へ分類することは拒否します。
 - 必須Codex roleをBash backgroundで起動すると非対話Claude Code終了時に証拠が失われるため、PreToolUseで拒否してforeground完了を強制するようにしました。
 - Delivery Gateが解決済みのreset script pathとsession IDを案内し、`/ecc:codex-task-reset`もinteractive shellに存在しない`CLAUDE_PLUGIN_ROOT`へ依存しないようにしました。
 - Draft PR作成後のterminal DeliveryをPreToolUse Gateが再遮断しないようにし、未準備状態でも明示的なstate resetを許可しました。Gateの復旧案内は未設定の`CLAUDE_PLUGIN_ROOT`へ依存せず、解決済みscript pathを表示します。

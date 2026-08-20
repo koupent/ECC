@@ -25,6 +25,40 @@ function branchAt(cwd, env) {
   return gitValue(cwd, env, ['branch', '--show-current']);
 }
 
+function hasExecutableShellControl(command) {
+  let quote = null;
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index];
+    if (quote) {
+      if (character === quote) quote = null;
+      else if (
+        quote === '"' &&
+        (character === '`' || (character === '$' && ['(', '{'].includes(command[index + 1])))
+      ) return true;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if ('\r\n;&|<>`(){}^'.includes(character) || (character === '$' && command[index + 1] === '(')) return true;
+  }
+  return quote !== null;
+}
+
+function isExactLifecycleCommand(command, action) {
+  const value = String(command || '').trim();
+  if (!value || hasExecutableShellControl(value)) return false;
+  const node = String.raw`(?:node(?:\.exe)?|"[^"]*node(?:\.exe)?"|'[^']*node(?:\.exe)?')`;
+  const scriptName = action === 'prepare' ? 'delivery-lifecycle\\.js' : 'reset\\.js';
+  const script = String.raw`(?:"[^"]*scripts[\\/]codex[\\/]${scriptName}"|'[^']*scripts[\\/]codex[\\/]${scriptName}'|[^\s]+scripts[\\/]codex[\\/]${scriptName})`;
+  const argument = String.raw`(?:"[^"]+"|'[^']+'|[^\s]+)`;
+  const tail = action === 'prepare'
+    ? String.raw`prepare(?:\s+--session\s+${argument})?`
+    : argument;
+  return new RegExp(String.raw`^${node}\s+${script}\s+${tail}\s*$`, 'i').test(value);
+}
+
 function run(rawInput, options = {}) {
   let input;
   try {
@@ -43,10 +77,12 @@ function run(rawInput, options = {}) {
   if (state.delivery.status !== 'ready') {
     const toolName = String(input.tool_name || '');
     const command = String(input.tool_input && input.tool_input.command || '');
-    const isPrepareCommand = toolName === 'Bash' &&
-      /scripts[\\/]codex[\\/]delivery-lifecycle\.js["']?\s+prepare(?:\s|$)/i.test(command);
-    const isResetCommand = toolName === 'Bash' &&
-      /scripts[\\/]codex[\\/]reset\.js["']?(?:\s|$)/i.test(command);
+    const permissionMode = String(input.permission_mode || input.permissionMode || '').toLowerCase();
+    // Plan mode中はClaude自身のread-only制約に任せて調査を許可する。承認後は同じ
+    // deferred stateが残るため、最初のBash/Edit/Writeをprepare完了までfail-closeする。
+    if (state.delivery.status === 'deferred' && permissionMode === 'plan') return rawInput;
+    const isPrepareCommand = toolName === 'Bash' && isExactLifecycleCommand(command, 'prepare');
+    const isResetCommand = toolName === 'Bash' && isExactLifecycleCommand(command, 'reset');
     if (isPrepareCommand || isResetCommand) return rawInput;
     const sessionId = resolveSessionId(input, env);
     const prepareScript = path.resolve(__dirname, '../codex/delivery-lifecycle.js');
@@ -104,10 +140,12 @@ function run(rawInput, options = {}) {
     state.delivery.committed_head === head &&
     !(
       ['review', 'security-review'].includes(state.review_role) &&
-      state.review_status === 'ok' &&
+      state.review_status === 'blocked' &&
+      state.review_complete === true &&
       state.review_head === head &&
       state.review_worktree_clean === true &&
-      Number(state.review_blocking_findings || 0) > 0
+      Number.isInteger(state.review_blocking_findings) &&
+      state.review_blocking_findings > 0
     )
   ) {
     return deny(
@@ -125,4 +163,4 @@ if (require.main === module) {
   process.stdin.on('end', () => process.stdout.write(run(raw)));
 }
 
-module.exports = { branchAt, gitValue, run };
+module.exports = { branchAt, gitValue, isExactLifecycleCommand, run };

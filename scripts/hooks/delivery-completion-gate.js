@@ -115,6 +115,11 @@ function run(rawInput, options = {}) {
   const state = readState(input, env);
   const delivery = state.delivery;
   if (!delivery) return rawInput;
+  if (delivery.status === 'deferred') {
+    const permissionMode = String(input.permission_mode || input.permissionMode || '').toLowerCase();
+    if (permissionMode === 'plan') return rawInput;
+    return block('The approved plan has not entered the required delivery workflow. Run `/ecc:delivery-prepare` before implementation so Issue deduplication and the issue-linked branch are recorded.');
+  }
   if (delivery.status === 'pending') {
     return block('The required delivery has not been prepared. Run `/ecc:delivery-prepare` so Issue deduplication and the issue-linked branch are recorded before continuing.');
   }
@@ -138,6 +143,9 @@ function run(rawInput, options = {}) {
   if (
     !['review', 'security-review'].includes(state.review_role) ||
     state.review_status !== 'ok' ||
+    state.review_complete !== true ||
+    !Number.isInteger(state.review_blocking_findings) ||
+    state.review_blocking_findings !== 0 ||
     state.review_worktree_clean !== true ||
     state.review_head !== head.stdout
   ) {
@@ -160,12 +168,13 @@ function run(rawInput, options = {}) {
     recordIncident({ type: 'delivery_pr_schema_failure', severity: 'minor', message: error.message }, { cwd, env });
     return block('Draft PR status returned invalid data. Keep the gate enabled, repair GitHub CLI connectivity, and retry.');
   }
-  const matchingHead = config.deliveryCompletion === 'squash-merge'
-    ? entries.filter(pr => pr.headRefOid === head.stdout && ['OPEN', 'MERGED'].includes(pr.state || 'OPEN'))
-    : entries;
+  const matchingHead = entries.filter(pr =>
+    pr.headRefOid === head.stdout &&
+    (config.deliveryCompletion !== 'squash-merge' || ['OPEN', 'MERGED'].includes(pr.state || 'OPEN'))
+  );
   const candidate = config.deliveryCompletion === 'squash-merge'
     ? matchingHead.length === 1 && matchingHead[0]
-    : entries.find(pr => pr.isDraft === true);
+    : matchingHead.find(pr => pr.isDraft === true);
   if (!candidate) {
     const detail = config.deliveryCompletion === 'squash-merge' && matchingHead.length > 1
       ? `Multiple open PRs exist for ${branch}; keep exactly one.`

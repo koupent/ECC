@@ -45,7 +45,7 @@ while waiting for a monitor notification; the completed process must write revie
 the current session state before the delivery can continue.
 
 ```bash
-node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --request "Review the complete current delivery diff (uncommitted diff when present, otherwise the committed issue-branch diff against its base) for correctness, security, regressions, and release blockers" --session "$CLAUDE_SESSION_ID"
+node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --request "Review the complete current delivery. Use the diff to identify scope, then read every changed file in full and trace relevant callers, consumers, tests, configuration, and ordered operational procedures for correctness, security, regressions, and release blockers." --session "$CLAUDE_SESSION_ID"
 ```
 
 Use its findings as independent evidence in the ECC review. If Codex reports a
@@ -81,11 +81,15 @@ Read each changed file in full. Check for:
 
 Generate report with:
 - Severity: CRITICAL, HIGH, MEDIUM, LOW
+- Disposition: `release-blocker`, `owner-action`, `follow-up`
 - File location and line numbers
 - Issue description
 - Suggested fix
 
-Block commit if CRITICAL or HIGH issues found.
+Block commit only when a `release-blocker` remains. `owner-action` is an explicit
+non-blocking operator follow-up, and `follow-up` is a non-blocking repository
+improvement. CRITICAL findings must always be `release-blocker`; HIGH findings
+must be `release-blocker` or `owner-action`.
 Never approve code with security vulnerabilities.
 
 ---
@@ -143,7 +147,7 @@ Apply the review checklist across 7 categories:
 | **Completeness** | Missing tests, missing error handling, incomplete migrations, missing docs |
 | **Maintainability** | Dead code, magic numbers, deep nesting, unclear naming, missing types |
 
-Assign severity to each finding:
+Assign both severity and disposition to each finding:
 
 | Severity | Meaning | Action |
 |---|---|---|
@@ -151,6 +155,12 @@ Assign severity to each finding:
 | **HIGH** | Bug or logic error likely to cause issues | Should fix before merge |
 | **MEDIUM** | Code quality issue or missing best practice | Fix recommended |
 | **LOW** | Style nit or minor suggestion | Optional |
+
+| Disposition | Meaning | Merge effect |
+|---|---|---|
+| `release-blocker` | Repository-fixable defect that makes this merge unsafe | Must be fixed before merge |
+| `owner-action` | External host, credential, approval, deployment, or operator step | Record an explicit follow-up; does not block the repository merge by itself |
+| `follow-up` | Non-blocking repository improvement | Track separately when useful |
 
 ### Phase 4 — VALIDATE
 
@@ -193,15 +203,14 @@ Form recommendation based on findings:
 
 | Condition | Decision |
 |---|---|
-| Zero CRITICAL/HIGH issues, validation passes | **APPROVE** |
-| Only MEDIUM/LOW issues, validation passes | **APPROVE** with comments |
-| Any HIGH issues or validation failures | **REQUEST CHANGES** |
-| Any CRITICAL issues | **BLOCK** — must fix before merge |
+| No `release-blocker`, validation passes | **APPROVE** (include owner actions and follow-ups) |
+| Any HIGH `release-blocker` or validation failure | **REQUEST CHANGES** |
+| Any CRITICAL `release-blocker` | **BLOCK** — must fix before merge |
 
 Special cases:
 - Draft PR → Always use **COMMENT** (not approve/block)
 - Only docs/config changes → Lighter review, focus on correctness
-- Explicit `--approve` or `--request-changes` flag → Override decision (but still report all findings)
+- Explicit `--approve` or `--request-changes` flag → May affect presentation only when validation passes and no `release-blocker` remains; it never overrides a blocker
 
 ### Phase 6 — REPORT
 
@@ -221,16 +230,16 @@ Create review artifact at `.claude/reviews/pr-<NUMBER>-review.md` unless the rep
 ## Findings
 
 ### CRITICAL
-<findings or "None">
+<findings with disposition, or "None">
 
 ### HIGH
-<findings or "None">
+<findings with disposition, or "None">
 
 ### MEDIUM
-<findings or "None">
+<findings with disposition, or "None">
 
 ### LOW
-<findings or "None">
+<findings with disposition, or "None">
 
 ## Validation Results
 

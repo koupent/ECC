@@ -96,9 +96,11 @@ function audit(options = {}, dependencies = {}) {
     check('issue-branch', branch.ok && branch.stdout === delivery.branch, delivery.branch, branch.ok ? branch.stdout : branch.stderr),
     check('commit-bound-review', head.ok && state.review_status === 'ok' &&
       ['review', 'security-review'].includes(state.review_role) &&
+      state.review_complete === true &&
+      Number.isInteger(state.review_blocking_findings) && state.review_blocking_findings === 0 &&
       state.review_worktree_clean === true && state.review_head === head.stdout,
-      'fresh independent review bound to clean HEAD',
-      `role=${state.review_role}, status=${state.review_status}, clean=${state.review_worktree_clean}, head=${state.review_head}`),
+      'fresh independent review with zero release blockers bound to clean HEAD',
+      `role=${state.review_role}, status=${state.review_status}, complete=${state.review_complete}, blockers=${state.review_blocking_findings}, clean=${state.review_worktree_clean}, head=${state.review_head}`),
     check('codex-delegation', Number(state.codex_calls || 0) >= 2 && Number(state.codex_failures || 0) === 0,
       'at least 2 successful calls and 0 failures',
       `calls=${state.codex_calls || 0}, failures=${state.codex_failures || 0}`),
@@ -108,7 +110,8 @@ function audit(options = {}, dependencies = {}) {
       `${squashMerged ? 'closed' : 'open'} Issue #${delivery.issue_number}`, issue.ok ? JSON.stringify(issueData) : issue.stderr),
     check('github-delivery-pr', squashMerged
       ? Boolean(merged) && merged.baseRefName === delivery.base_branch && merged.headRefOid === delivery.merged_head && issueLink.test(String(merged.body || ''))
-      : Boolean(draft) && draft.baseRefName === delivery.base_branch && issueLink.test(String(draft.body || '')),
+      : Boolean(draft) && draft.baseRefName === delivery.base_branch &&
+        draft.headRefOid === head.stdout && issueLink.test(String(draft.body || '')),
       squashMerged
         ? `Merged PR targeting ${delivery.base_branch} with Closes #${delivery.issue_number}`
         : `Draft PR targeting ${delivery.base_branch} with Closes #${delivery.issue_number}`,
