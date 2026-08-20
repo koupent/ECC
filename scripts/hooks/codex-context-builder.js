@@ -14,6 +14,11 @@ function shouldSkip(prompt) {
   return !value || /^\/(?:ecc:)?(?:codex-|help|clear|compact|status)/i.test(value);
 }
 
+function isPlanMode(input) {
+  const mode = input && (input.permission_mode || input.permissionMode);
+  return String(mode || '').toLowerCase() === 'plan';
+}
+
 function requestWithExplicitIssueSnapshot(prompt, options = {}) {
   const issueNumber = explicitIssueNumber(prompt);
   if (!issueNumber) return prompt;
@@ -59,7 +64,14 @@ function run(rawInput, options = {}) {
   const prompt = input.prompt || input.user_prompt || '';
   if (!config.enabled || shouldSkip(prompt)) return rawInput;
 
-  const delivery = initializeDelivery(input, prompt, { cwd, env: options.env || process.env });
+  // plan modeではIssue作成やbranch切替を行わず、Deliveryの意図だけを外部stateへ
+  // deferredとして記録する。ExitPlanMode承認後にUserPromptSubmitが再発火しなくても、
+  // 最初の変更をDelivery Gateで確実に止められる。
+  const delivery = initializeDelivery(input, prompt, {
+    cwd,
+    env: options.env || process.env,
+    deferred: isPlanMode(input)
+  });
 
   const existing = readState(input, options.env || process.env);
   if (
@@ -75,7 +87,7 @@ function run(rawInput, options = {}) {
         additionalContext: [
           '[ECC Codex Context Builder cached packet]',
           'Reuse the existing task context below. Do not rerun broad exploration.',
-          delivery && delivery.status === 'pending'
+          delivery && ['deferred', 'pending'].includes(delivery.status)
             ? prepareInstruction
             : '',
           'This packet is bound to the active Delivery. Follow-up prompts reuse it until the Delivery completes.',
@@ -103,7 +115,7 @@ function run(rawInput, options = {}) {
     ? [
         '[ECC Codex Context Builder]',
         'Codex completed the initial repository investigation. Do not repeat broad exploration already covered below.',
-        delivery && delivery.status === 'pending'
+        delivery && ['deferred', 'pending'].includes(delivery.status)
           ? prepareInstruction
           : '',
         'If GateGuard requests first-touch facts, present the relevant facts from this packet and retry; do not re-read the same files merely to satisfy the gate.',
@@ -132,4 +144,4 @@ if (require.main === module) {
   process.stdin.on('end', () => process.stdout.write(run(raw)));
 }
 
-module.exports = { requestWithExplicitIssueSnapshot, run, shouldSkip };
+module.exports = { isPlanMode, requestWithExplicitIssueSnapshot, run, shouldSkip };

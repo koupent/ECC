@@ -58,8 +58,14 @@ function readState(input = {}, env = process.env) {
     protected_config_approvals: [],
     review_role: null,
     review_status: null,
+    review_complete: null,
     review_head: null,
-    review_worktree_clean: false
+    review_worktree_clean: false,
+    review_blocking_findings: null,
+    review_owner_actions: [],
+    review_result: null,
+    review_snapshot: null,
+    review_request_hash: null
   });
 }
 
