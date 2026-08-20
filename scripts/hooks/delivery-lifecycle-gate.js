@@ -39,7 +39,7 @@ function run(rawInput, options = {}) {
 
   const state = readState(input, env);
   if (!state.delivery) return rawInput;
-  if (state.delivery.status === 'draft-pr') return rawInput;
+  if (state.delivery.status === 'draft-pr' || state.delivery.status === 'merged') return rawInput;
   if (state.delivery.status !== 'ready') {
     const toolName = String(input.tool_name || '');
     const command = String(input.tool_input && input.tool_input.command || '');

@@ -29,6 +29,8 @@ const contextGate = require('../../scripts/hooks/codex-context-gate');
 const contextBuilder = require('../../scripts/hooks/codex-context-builder');
 const deliveryGate = require('../../scripts/hooks/delivery-lifecycle-gate');
 const deliveryCompletion = require('../../scripts/hooks/delivery-completion-gate');
+const localMergePolicy = require('../../scripts/hooks/local-merge-policy-gate');
+const { PRE_BASH_HOOKS } = require('../../scripts/hooks/bash-hook-dispatcher');
 const deliveryProgress = require('../../scripts/hooks/delivery-progress');
 const deliveryFinalizer = require('../../scripts/hooks/delivery-session-finalizer');
 const configProtection = require('../../scripts/hooks/config-protection');
@@ -172,6 +174,34 @@ test('project config opts into standard Codex integration', () => {
   assert.strictEqual(config.reviewModel, 'gpt-5.6-sol');
   assert.strictEqual(config.timeoutSeconds, 1800);
   assert.strictEqual(config.deliveryWorkflow, 'advisory');
+  assert.strictEqual(config.deliveryCompletion, 'draft-pr');
+  assert.strictEqual(config.mergeGate.statusContext, 'Local Merge Gate');
+});
+
+test('project config opts into commit-status backed squash merge completion', () => {
+  const fixture = createGitFixture('squash-config-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({
+      profile: 'standard',
+      deliveryWorkflow: 'required',
+      deliveryCompletion: 'squash-merge',
+      mergeGate: {
+        provider: 'commit-status',
+        command: 'engineering-kit-merge-gate',
+        adapter: 'scripts/ci/project-verify.sh',
+        statusContext: 'Local Merge Gate',
+        strategy: 'squash'
+      },
+      codex: { enabled: true }
+    }),
+    'utf8'
+  );
+  const config = loadConfig(fixture, env);
+  assert.strictEqual(config.deliveryCompletion, 'squash-merge');
+  assert.strictEqual(config.mergeGate.provider, 'commit-status');
+  assert.strictEqual(config.mergeGate.adapter, 'scripts/ci/project-verify.sh');
+  assert.strictEqual(config.mergeGate.strategy, 'squash');
 });
 
 test('delivery request classifier ignores chat and recognizes implementation work', () => {
@@ -443,6 +473,110 @@ test('delivery completion gate rejects a review that is not bound to the current
   const completed = readState(input, fixtureEnv);
   assert.strictEqual(completed.delivery.status, 'draft-pr');
   assert.strictEqual(completed.delivery.draft_pr_url, 'https://example.invalid/pr/2');
+});
+
+test('squash completion requires a current Local Merge Gate status and confirms the merged PR', () => {
+  const fixture = createGitFixture('delivery-squash-completion-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({
+      profile: 'standard',
+      deliveryWorkflow: 'required',
+      deliveryCompletion: 'squash-merge',
+      mergeGate: {
+        provider: 'commit-status',
+        command: 'engineering-kit-merge-gate',
+        adapter: 'scripts/ci/project-verify.sh',
+        statusContext: 'Local Merge Gate',
+        strategy: 'squash'
+      },
+      codex: { enabled: true }
+    }),
+    'utf8'
+  );
+  assert.strictEqual(spawnSync('git', ['add', '.ecc/config.json'], { cwd: fixture }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'enable squash completion'], { cwd: fixture }).status, 0);
+  const branch = 'codex/issue-73-local-gate';
+  assert.strictEqual(spawnSync('git', ['switch', '-c', branch], { cwd: fixture }).status, 0);
+  const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-squash-state') };
+  const input = { session_id: 'delivery-squash', cwd: fixture };
+  writeState(input, {
+    delivery: { status: 'ready', issue_number: 73, branch, base_branch: 'main' },
+    review_role: 'review',
+    review_status: 'ok',
+    review_head: head,
+    review_worktree_clean: true
+  }, fixtureEnv);
+
+  const calls = [];
+  const execute = (binary, args, commandCwd, commandEnv) => {
+    calls.push([binary, ...args]);
+    if (binary !== 'gh') return deliveryCompletion.command(binary, args, commandCwd, commandEnv);
+    if (args[0] === 'pr' && args[1] === 'list') {
+      return { ok: true, stdout: JSON.stringify([{ url: 'https://example.invalid/pr/8', isDraft: true, number: 8, body: 'Closes #73', baseRefName: 'main', headRefOid: head }]), stderr: '' };
+    }
+    if (args[0] === 'repo') return { ok: true, stdout: 'acme/example', stderr: '' };
+    if (args[0] === 'api') {
+      return { ok: true, stdout: JSON.stringify({ sha: head, statuses: [{ context: 'Local Merge Gate', state: 'success', target_url: 'https://example.invalid/evidence' }] }), stderr: '' };
+    }
+    if (args[0] === 'pr' && args[1] === 'ready') return { ok: true, stdout: '', stderr: '' };
+    if (args[0] === 'pr' && args[1] === 'merge') return { ok: true, stdout: '', stderr: '' };
+    if (args[0] === 'pr' && args[1] === 'view') {
+      return { ok: true, stdout: JSON.stringify({ state: 'MERGED', isDraft: false, headRefOid: head, url: 'https://example.invalid/pr/8' }), stderr: '' };
+    }
+    throw new Error(`unexpected gh command: ${args.join(' ')}`);
+  };
+
+  const raw = JSON.stringify(input);
+  assert.strictEqual(deliveryCompletion.run(raw, { cwd: fixture, env: fixtureEnv, command: execute }), raw);
+  const completed = readState(input, fixtureEnv);
+  assert.strictEqual(completed.delivery.status, 'merged');
+  assert.strictEqual(completed.delivery.merged_pr_url, 'https://example.invalid/pr/8');
+  assert.ok(calls.some(call => call.join(' ') === 'gh pr ready 8'));
+  assert.ok(calls.some(call => call.join(' ') === 'gh pr merge 8 --squash'));
+
+  writeState(input, { delivery: { status: 'ready', issue_number: 73, branch, base_branch: 'main' } }, fixtureEnv);
+  const stale = JSON.parse(deliveryCompletion.run(raw, {
+    cwd: fixture,
+    env: fixtureEnv,
+    command(binary, args, commandCwd, commandEnv) {
+      if (binary !== 'gh') return deliveryCompletion.command(binary, args, commandCwd, commandEnv);
+      if (args[0] === 'pr' && args[1] === 'list') return execute(binary, args, commandCwd, commandEnv);
+      if (args[0] === 'repo') return { ok: true, stdout: 'acme/example', stderr: '' };
+      if (args[0] === 'api') return { ok: true, stdout: JSON.stringify({ sha: 'stale', statuses: [{ context: 'Local Merge Gate', state: 'success' }] }), stderr: '' };
+      throw new Error(`unexpected gh command: ${args.join(' ')}`);
+    }
+  }));
+  assert.strictEqual(stale.decision, 'block');
+  assert.match(stale.reason, /current HEAD/);
+});
+
+test('local merge policy blocks merge bypasses and direct success status publication', () => {
+  assert.ok(PRE_BASH_HOOKS.some(hook => hook.id === 'pre:bash:local-merge-policy'));
+  const fixture = createGitFixture('local-merge-policy-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({
+      profile: 'standard',
+      deliveryWorkflow: 'required',
+      deliveryCompletion: 'squash-merge',
+      mergeGate: { provider: 'commit-status', statusContext: 'Local Merge Gate', strategy: 'squash' },
+      codex: { enabled: true }
+    }),
+    'utf8'
+  );
+  const bash = command => JSON.stringify({ cwd: fixture, tool_name: 'Bash', tool_input: { command } });
+  for (const command of [
+    'gh pr merge 12 --squash',
+    'gh pr merge 12 --admin --squash',
+    'gh api repos/acme/example/statuses/abc -f state=success -f context="Local Merge Gate"'
+  ]) {
+    const denied = JSON.parse(localMergePolicy.run(bash(command), { cwd: fixture, env }));
+    assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny', command);
+  }
+  const ordinary = bash('gh pr view 12 --json state');
+  assert.strictEqual(localMergePolicy.run(ordinary, { cwd: fixture, env }), ordinary);
 });
 
 test('delivery completion gate does not allow a required pending delivery to stop silently', () => {

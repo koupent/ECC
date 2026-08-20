@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Kit導入プロジェクト向けに、現HEADの`Local Merge Gate`成功後だけPRをReady化して通常squash mergeし、GitHub上の`MERGED`まで確認するCompletion方式を追加しました。従来のDraft PR停止は既定値として維持します。
+- PreToolUse Hookが直接の`gh pr merge`とsuccess commit status投稿を拒否し、Local Merge GateとCompletion Gateの決定論的経路へ統一します。
 - Harness incidents now route deterministically to ECC, Engineering Environment Kit, or product follow-up labels, and background remediation is opt-in so the normal Claude Code CLI workflow remains the default repair path.
 - Default MCP connector set reduced to a single connector (`chrome-devtools`) per the new connector policy (`docs/MCP-CONNECTOR-POLICY.md`). The six previous defaults (`github`, `context7`, `exa`, `memory`, `playwright`, `sequential-thinking`) were retired after the June 2026 audit: their jobs are covered by skills wrapping CLIs/REST APIs (`github-ops`, `documentation-lookup`, `exa-search`, e2e skills) or by harness-native features (memory, extended thinking, web search). All six remain opt-in via `mcp-configs/mcp-servers.json`.
 

@@ -35,6 +35,14 @@ The project opts in by committing `.ecc/config.json`:
 {
   "profile": "standard",
   "rules": ["common", "typescript", "react", "nextjs"],
+  "deliveryCompletion": "squash-merge",
+  "mergeGate": {
+    "provider": "commit-status",
+    "command": "engineering-kit-merge-gate",
+    "adapter": "scripts/ci/project-verify.sh",
+    "statusContext": "Local Merge Gate",
+    "strategy": "squash"
+  },
   "codex": {
     "enabled": true,
     "contextModel": "gpt-5.6-terra",

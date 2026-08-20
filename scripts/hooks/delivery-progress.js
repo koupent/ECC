@@ -40,7 +40,8 @@ function run(rawInput, options = {}) {
 
   const env = options.env || process.env;
   const cwd = options.cwd || input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
-  if (loadConfig(cwd, env).deliveryWorkflow !== 'required') return rawInput;
+  const config = loadConfig(cwd, env);
+  if (config.deliveryWorkflow !== 'required') return rawInput;
   const state = readState(input, env);
   if (!state.delivery || state.delivery.status !== 'ready') return rawInput;
 
@@ -68,7 +69,9 @@ function run(rawInput, options = {}) {
       '[ECC Delivery Progress]',
       `Current clean commit ${head} is recorded.`,
       'Run the independent Codex review now. Do not begin another edit cycle before that review.',
-      'If the review has no critical/high findings, push this branch and create the linked Draft PR.'
+      config.deliveryCompletion === 'squash-merge'
+        ? `If the review has no critical/high findings, push this branch, create the linked Draft PR, and run ${config.mergeGate.command}. The Completion Gate will Ready and squash merge it.`
+        : 'If the review has no critical/high findings, push this branch and create the linked Draft PR.'
     ].join('\n')
   };
 }
