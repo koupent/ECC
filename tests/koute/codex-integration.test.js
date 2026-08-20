@@ -577,6 +577,28 @@ test('local merge policy blocks merge bypasses and direct success status publica
   }
   const ordinary = bash('gh pr view 12 --json state');
   assert.strictEqual(localMergePolicy.run(ordinary, { cwd: fixture, env }), ordinary);
+
+  const backgroundReview = JSON.stringify({
+    cwd: fixture,
+    tool_name: 'Bash',
+    tool_input: {
+      command: 'node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --request test',
+      run_in_background: true
+    }
+  });
+  const backgroundDenied = JSON.parse(localMergePolicy.run(backgroundReview, { cwd: fixture, env }));
+  assert.strictEqual(backgroundDenied.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(backgroundDenied.hookSpecificOutput.permissionDecisionReason, /foreground/);
+
+  const foregroundReview = JSON.stringify({
+    cwd: fixture,
+    tool_name: 'Bash',
+    tool_input: {
+      command: 'node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --request test',
+      run_in_background: false
+    }
+  });
+  assert.strictEqual(localMergePolicy.run(foregroundReview, { cwd: fixture, env }), foregroundReview);
 });
 
 test('delivery completion gate does not allow a required pending delivery to stop silently', () => {

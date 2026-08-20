@@ -40,6 +40,10 @@ complete committed branch diff against its base branch instead. Only stop with
 
 Run the fork's fresh-context Codex reviewer first:
 
+Run this required reviewer in the foreground. Do not use Bash background execution or return
+while waiting for a monitor notification; the completed process must write review evidence into
+the current session state before the delivery can continue.
+
 ```bash
 node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --request "Review the complete current delivery diff (uncommitted diff when present, otherwise the committed issue-branch diff against its base) for correctness, security, regressions, and release blockers" --session "$CLAUDE_SESSION_ID"
 ```

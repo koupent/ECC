@@ -20,6 +20,10 @@ function isDirectSuccessStatus(command) {
   return statusEndpoint && successState;
 }
 
+function isCodexRoleRunner(command) {
+  return /(?:^|[\\/])run-role\.js(?:["']?\s|$)/i.test(String(command || ''));
+}
+
 function run(rawInput, options = {}) {
   let input;
   try {
@@ -35,6 +39,9 @@ function run(rawInput, options = {}) {
   if (config.deliveryCompletion !== 'squash-merge') return rawInput;
 
   const command = String(input.tool_input && input.tool_input.command || '');
+  if (input.tool_input && input.tool_input.run_in_background === true && isCodexRoleRunner(command)) {
+    return deny('必須Codex roleはforegroundで完了させてください。backgroundではClaude CLI終了時に子processと外部state証拠が失われます。');
+  }
   if (/\bgh\s+pr\s+merge\b/i.test(command)) {
     return deny('PRのmergeはCompletion Gateだけが実行できます。Local Merge Gateを通し、通常のStopフローへ戻ってください。');
   }
@@ -51,4 +58,4 @@ if (require.main === module) {
   process.stdin.on('end', () => process.stdout.write(run(raw)));
 }
 
-module.exports = { deny, isDirectSuccessStatus, run };
+module.exports = { deny, isCodexRoleRunner, isDirectSuccessStatus, run };
