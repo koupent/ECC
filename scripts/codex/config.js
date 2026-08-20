@@ -35,6 +35,7 @@ function readProjectConfig(cwd = process.cwd()) {
 function loadConfig(cwd = process.cwd(), env = process.env) {
   const project = readProjectConfig(cwd);
   const codex = project.value.codex || {};
+  const mergeGate = project.value.mergeGate || {};
   return {
     projectRoot: project.root,
     projectConfigPath: project.file,
@@ -50,7 +51,15 @@ function loadConfig(cwd = process.cwd(), env = process.env) {
     forkRepo: env.ECC_FORK_REPOSITORY || codex.forkRepository || 'koupent/ECC',
     autoRemediation: envEnabled(env.ECC_INCIDENT_AUTO_REMEDIATE, codex.autoRemediation === true),
     deliveryWorkflow: env.ECC_DELIVERY_WORKFLOW || project.value.deliveryWorkflow || 'advisory',
-    deliveryBaseBranch: env.ECC_DELIVERY_BASE_BRANCH || project.value.deliveryBaseBranch || 'main'
+    deliveryBaseBranch: env.ECC_DELIVERY_BASE_BRANCH || project.value.deliveryBaseBranch || 'main',
+    deliveryCompletion: env.ECC_DELIVERY_COMPLETION || project.value.deliveryCompletion || 'draft-pr',
+    mergeGate: {
+      provider: env.ECC_MERGE_GATE_PROVIDER || mergeGate.provider || 'commit-status',
+      command: env.ECC_MERGE_GATE_COMMAND || mergeGate.command || 'engineering-kit-merge-gate',
+      adapter: env.ECC_MERGE_GATE_ADAPTER || mergeGate.adapter || '',
+      statusContext: env.ECC_MERGE_GATE_STATUS_CONTEXT || mergeGate.statusContext || 'Local Merge Gate',
+      strategy: env.ECC_MERGE_GATE_STRATEGY || mergeGate.strategy || 'squash'
+    }
   };
 }
 

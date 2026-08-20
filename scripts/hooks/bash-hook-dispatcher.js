@@ -8,6 +8,7 @@ const {
 } = require('./pretooluse-visible-output');
 
 const { run: runBlockNoVerify } = require('./block-no-verify');
+const { run: runLocalMergePolicy } = require('./local-merge-policy-gate');
 const { run: runAutoTmuxDev } = require('./auto-tmux-dev');
 const { run: runTmuxReminder } = require('./pre-bash-tmux-reminder');
 const { run: runGitPushReminder } = require('./pre-bash-git-push-reminder');
@@ -24,6 +25,11 @@ const PRE_BASH_HOOKS = [
     id: 'pre:bash:block-no-verify',
     profiles: 'minimal,standard,strict',
     run: rawInput => runBlockNoVerify(rawInput),
+  },
+  {
+    id: 'pre:bash:local-merge-policy',
+    profiles: 'standard,strict',
+    run: rawInput => runLocalMergePolicy(rawInput),
   },
   {
     id: 'pre:bash:auto-tmux-dev',

@@ -29,6 +29,77 @@ function block(reason) {
   return JSON.stringify({ decision: 'block', reason: `[ECC Delivery Completion Gate] ${reason}` });
 }
 
+function parseJson(response, description) {
+  try {
+    return JSON.parse(response.stdout || 'null');
+  } catch (error) {
+    throw new Error(`${description} returned invalid JSON: ${error.message}`);
+  }
+}
+
+function verifyCommitStatus(execute, config, head, cwd, env) {
+  const repository = execute('gh', ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'], cwd, env);
+  if (!repository.ok || !repository.stdout) {
+    return { ok: false, reason: `GitHub repository could not be resolved: ${repository.stderr || 'empty repository'}` };
+  }
+  const response = execute('gh', ['api', `repos/${repository.stdout}/commits/${head}/status`], cwd, env);
+  if (!response.ok) {
+    return { ok: false, reason: `commit status could not be read: ${response.stderr || 'gh api failed'}` };
+  }
+  let payload;
+  try {
+    payload = parseJson(response, 'commit status');
+  } catch (error) {
+    return { ok: false, reason: error.message };
+  }
+  if (payload.sha !== head) {
+    return { ok: false, reason: `Local Merge Gate status is not bound to current HEAD ${head}.` };
+  }
+  const status = Array.isArray(payload.statuses)
+    ? payload.statuses.find(entry => entry && entry.context === config.mergeGate.statusContext)
+    : null;
+  if (!status || status.state !== 'success') {
+    return {
+      ok: false,
+      reason: `${config.mergeGate.statusContext} is ${status && status.state || 'missing'} for current HEAD ${head}. Run ${config.mergeGate.command} and retry.`
+    };
+  }
+  return { ok: true, status };
+}
+
+function completeBySquashMerge(execute, config, delivery, pr, head, cwd, env) {
+  if (config.mergeGate.provider !== 'commit-status' || config.mergeGate.strategy !== 'squash') {
+    return { ok: false, reason: 'squash-merge completion requires mergeGate provider=commit-status and strategy=squash.' };
+  }
+  if (pr.headRefOid !== head) {
+    return { ok: false, reason: `PR #${pr.number} is not bound to current HEAD ${head}. Push the current commit before merging.` };
+  }
+  const gate = verifyCommitStatus(execute, config, head, cwd, env);
+  if (!gate.ok) return gate;
+
+  if (pr.state === 'MERGED') return { ok: true, pr, status: gate.status };
+
+  if (pr.isDraft) {
+    const ready = execute('gh', ['pr', 'ready', String(pr.number)], cwd, env);
+    if (!ready.ok) return { ok: false, reason: `PR #${pr.number} could not be marked ready: ${ready.stderr || 'gh pr ready failed'}` };
+  }
+  const merge = execute('gh', ['pr', 'merge', String(pr.number), '--squash'], cwd, env);
+  if (!merge.ok) return { ok: false, reason: `PR #${pr.number} could not be squash merged: ${merge.stderr || 'gh pr merge failed'}` };
+
+  const view = execute('gh', ['pr', 'view', String(pr.number), '--json', 'state,isDraft,headRefOid,url'], cwd, env);
+  if (!view.ok) return { ok: false, reason: `Merged PR could not be confirmed: ${view.stderr || 'gh pr view failed'}` };
+  let merged;
+  try {
+    merged = parseJson(view, 'merged PR');
+  } catch (error) {
+    return { ok: false, reason: error.message };
+  }
+  if (merged.state !== 'MERGED' || merged.headRefOid !== head) {
+    return { ok: false, reason: `GitHub did not confirm PR #${pr.number} as merged for current HEAD ${head}.` };
+  }
+  return { ok: true, pr: merged, status: gate.status };
+}
+
 function run(rawInput, options = {}) {
   let input;
   try {
@@ -73,7 +144,11 @@ function run(rawInput, options = {}) {
     return block('A fresh independent Codex review is not bound to the current clean commit. Commit the validated implementation, run `/ecc:code-review` on that commit, address release-blocking findings, and then continue.');
   }
 
-  const prs = execute('gh', ['pr', 'list', '--head', branch, '--state', 'open', '--json', 'url,isDraft,number,body,baseRefName'], cwd, env);
+  const prs = execute('gh', [
+    'pr', 'list', '--head', branch,
+    '--state', config.deliveryCompletion === 'squash-merge' ? 'all' : 'open',
+    '--json', 'url,isDraft,number,body,baseRefName,headRefOid,state'
+  ], cwd, env);
   if (!prs.ok) {
     recordIncident({ type: 'delivery_pr_lookup_failure', severity: 'minor', message: prs.stderr || 'gh pr list failed' }, { cwd, env });
     return block('Draft PR status could not be verified. Confirm GitHub authentication, push the branch, and create a Draft PR; do not bypass this gate.');
@@ -85,19 +160,49 @@ function run(rawInput, options = {}) {
     recordIncident({ type: 'delivery_pr_schema_failure', severity: 'minor', message: error.message }, { cwd, env });
     return block('Draft PR status returned invalid data. Keep the gate enabled, repair GitHub CLI connectivity, and retry.');
   }
-  const draft = entries.find(pr => pr.isDraft === true);
-  if (!draft) {
-    return block(`No open Draft PR exists for ${branch}. Push the branch and create one with \`gh pr create --draft --base ${delivery.base_branch}\`, linking Issue #${delivery.issue_number}. Do not Ready or merge it.`);
+  const matchingHead = config.deliveryCompletion === 'squash-merge'
+    ? entries.filter(pr => pr.headRefOid === head.stdout && ['OPEN', 'MERGED'].includes(pr.state || 'OPEN'))
+    : entries;
+  const candidate = config.deliveryCompletion === 'squash-merge'
+    ? matchingHead.length === 1 && matchingHead[0]
+    : entries.find(pr => pr.isDraft === true);
+  if (!candidate) {
+    const detail = config.deliveryCompletion === 'squash-merge' && matchingHead.length > 1
+      ? `Multiple open PRs exist for ${branch}; keep exactly one.`
+      : `No open Draft PR exists for ${branch}. Push the branch and create one with \`gh pr create --draft --base ${delivery.base_branch}\`, linking Issue #${delivery.issue_number}.`;
+    return block(detail);
   }
-  if (draft.baseRefName !== delivery.base_branch) {
-    return block(`Draft PR #${draft.number} targets ${draft.baseRefName || '<unknown>'}, but this delivery is based on ${delivery.base_branch}. Recreate or retarget the Draft PR without bypassing the gate.`);
+  if (candidate.baseRefName !== delivery.base_branch) {
+    return block(`Draft PR #${candidate.number} targets ${candidate.baseRefName || '<unknown>'}, but this delivery is based on ${delivery.base_branch}. Recreate or retarget the Draft PR without bypassing the gate.`);
   }
   const issueLink = new RegExp(`(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\s+#${delivery.issue_number}\\b`, 'i');
-  if (!issueLink.test(String(draft.body || ''))) {
-    return block(`Draft PR #${draft.number} is not linked to Issue #${delivery.issue_number}. Add \`Closes #${delivery.issue_number}\` to the PR body.`);
+  if (!issueLink.test(String(candidate.body || ''))) {
+    return block(`Draft PR #${candidate.number} is not linked to Issue #${delivery.issue_number}. Add \`Closes #${delivery.issue_number}\` to the PR body.`);
   }
 
-  writeState(input, { delivery: { ...delivery, status: 'draft-pr', draft_pr_url: draft.url, completed_at: new Date().toISOString() } }, env);
+  if (config.deliveryCompletion === 'squash-merge') {
+    const completion = completeBySquashMerge(execute, config, delivery, candidate, head.stdout, cwd, env);
+    if (!completion.ok) {
+      recordIncident(
+        { type: 'delivery_squash_merge_blocked', severity: 'minor', message: completion.reason, hook_id: 'delivery-completion' },
+        { cwd, env }
+      );
+      return block(completion.reason);
+    }
+    writeState(input, {
+      delivery: {
+        ...delivery,
+        status: 'merged',
+        draft_pr_url: candidate.url,
+        merged_pr_url: completion.pr.url || candidate.url,
+        merged_head: head.stdout,
+        completed_at: new Date().toISOString()
+      }
+    }, env);
+    return rawInput;
+  }
+
+  writeState(input, { delivery: { ...delivery, status: 'draft-pr', draft_pr_url: candidate.url, completed_at: new Date().toISOString() } }, env);
   return rawInput;
 }
 
@@ -108,4 +213,4 @@ if (require.main === module) {
   process.stdin.on('end', () => process.stdout.write(run(raw)));
 }
 
-module.exports = { block, command, isTransientGitHubFailure, run };
+module.exports = { block, command, completeBySquashMerge, isTransientGitHubFailure, parseJson, run, verifyCommitStatus };

@@ -89,6 +89,32 @@ test('fails when an explicitly requested Issue was replaced', () => {
   assert.strictEqual(report.checks.find(item => item.id === 'explicit-issue-reused').pass, false);
 });
 
+test('accepts squash-merged delivery evidence bound to the reviewed HEAD', () => {
+  const entry = validEntry();
+  entry.state.delivery = {
+    ...entry.state.delivery,
+    status: 'merged',
+    merged_pr_url: 'https://example.invalid/pull/24',
+    merged_head: 'abc123'
+  };
+  const mergedExecutor = (binary, args) => {
+    const key = `${binary} ${args.join(' ')}`;
+    if (key.startsWith('gh issue view 11')) {
+      return { ok: true, stdout: JSON.stringify({ number: 11, state: 'CLOSED', url: 'https://example.invalid/issues/11' }), stderr: '' };
+    }
+    if (key.startsWith('gh pr list --head codex/issue-11-lock')) {
+      return {
+        ok: true,
+        stdout: JSON.stringify([{ number: 24, url: 'https://example.invalid/pull/24', isDraft: false, state: 'MERGED', headRefOid: 'abc123', body: 'Closes #11', baseRefName: 'main' }]),
+        stderr: ''
+      };
+    }
+    return executor(binary, args);
+  };
+  const report = audit({ cwd: path.resolve('.'), issueNumber: 11 }, { entry, command: mergedExecutor });
+  assert.strictEqual(report.status, 'PASS');
+});
+
 test('parses the explicit issue argument', () => {
   assert.deepStrictEqual(parseArgs(['--issue', '11']), { issueNumber: 11 });
 });

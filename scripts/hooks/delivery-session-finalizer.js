@@ -27,7 +27,7 @@ function reportIncomplete(input, state, options = {}) {
     severity: hasCommit ? 'critical' : 'minor',
     target: 'ecc',
     hook_id: 'delivery-session-finalizer',
-    message: `Required delivery ended before Draft PR completion (status=${delivery.status}, stage=${delivery.completion_stage || 'not-recorded'}).`,
+    message: `Required delivery ended before configured completion (status=${delivery.status}, stage=${delivery.completion_stage || 'not-recorded'}).`,
     metadata: {
       issue_number: delivery.issue_number || delivery.requested_issue_number || null,
       stage: delivery.completion_stage || null,
