@@ -277,7 +277,14 @@ function runRole(options) {
   const input = { session_id: options.sessionId || resolveSessionId({}, env) };
   // 明示的なcwdがなければ、進行中Deliveryのworktreeで実行する。共有ツリーでレビュー
   // すると、証拠が実装コミットではないHEADに結び付き、完了Gateを通せない。
-  const cwd = path.resolve(options.cwd || deliveryWorkspace(readState(input, env), process.cwd()));
+  const workspace = options.cwd || deliveryWorkspace(readState(input, env), process.cwd());
+  if (!workspace) {
+    throw new Error(
+      'The worktree recorded for the active delivery is missing or belongs to another repository. ' +
+        'Restore it or pass an explicit --cwd; Codex roles never fall back to the shared working tree.'
+    );
+  }
+  const cwd = path.resolve(workspace);
   const config = loadConfig(cwd, env);
   if (!config.enabled && !options.force) throw new Error(`Codex integration is not enabled by ${config.projectConfigPath}`);
 

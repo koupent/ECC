@@ -569,6 +569,22 @@ test('preparation issues an Issue worktree instead of switching the shared worki
     tool_input: { command: `git -C "${ready.worktree_path}" commit -am "fix"` }
   });
   assert.strictEqual(deliveryGate.run(worktreeCommit, { cwd: fixture, env: fixtureEnv }), worktreeCommit);
+  const worktreeCd = JSON.stringify({
+    ...input,
+    tool_name: 'Bash',
+    tool_input: { command: `cd "${ready.worktree_path}" && git commit -am "fix"` }
+  });
+  assert.strictEqual(deliveryGate.run(worktreeCd, { cwd: fixture, env: fixtureEnv }), worktreeCd);
+  // pathを引数に書いただけのGit書き込みは、共有ツリーで走るので拒否する。
+  const mentionOnly = JSON.stringify({
+    ...input,
+    tool_name: 'Bash',
+    tool_input: { command: `git add "${path.join(ready.worktree_path, 'src', 'product.ts')}"` }
+  });
+  assert.strictEqual(
+    JSON.parse(deliveryGate.run(mentionOnly, { cwd: fixture, env: fixtureEnv })).hookSpecificOutput.permissionDecision,
+    'deny'
+  );
   const readOnly = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: 'git status --porcelain' } });
   assert.strictEqual(deliveryGate.run(readOnly, { cwd: fixture, env: fixtureEnv }), readOnly);
 });
@@ -761,6 +777,123 @@ test('completion accepts review evidence bound to the delivery worktree, not the
   }), raw);
   assert.ok(inspected.every(([binary, , commandCwd]) => binary !== 'git' || commandCwd === worktreePath));
   assert.strictEqual(readState(input, fixtureEnv).delivery.status, 'draft-pr');
+});
+
+test('an isolated delivery only allows Git writes that actually run in the worktree', () => {
+  const shared = path.join(temp, 'targets-shared');
+  const workspace = path.join(temp, 'targets-shared-worktrees', 'codex-issue-79');
+  for (const command of [
+    `cd "${workspace}" && git commit -am "fix"`,
+    `cd "${workspace}" && cd src && git add .`,
+    `git -C "${workspace}" push origin HEAD`,
+    `git -C "${workspace}" -c user.name=ECC commit -m "fix"`,
+    `git -C"${workspace}" restore src/product.ts`,
+    'git -C ../targets-shared-worktrees/codex-issue-79 commit -m "fix"',
+    'git status --porcelain',
+    'git log --oneline -5',
+    `cd "${workspace}" && npm test`,
+    'npm test'
+  ]) {
+    assert.strictEqual(deliveryGate.targetsWorkspace(command, workspace, shared), true, command);
+  }
+  for (const command of [
+    'git commit -am "fix"',
+    // pathを名指ししても、gitは共有ツリーで走る。
+    `git add "${workspace}/src/product.ts"`,
+    `echo "${workspace}" && git commit -am "fix"`,
+    `cd "${workspace}" && cd .. && git reset --hard`,
+    // 展開が必要なcd先は追跡できないので、worktreeの中だと決めつけない。
+    'cd "$DELIVERY_WORKTREE" && git commit -m "fix"',
+    `cd "${workspace}" && git -C "${shared}" reset --hard`,
+    `git -C "${workspace}" commit -m "fix"; git reset --hard`
+  ]) {
+    assert.strictEqual(deliveryGate.targetsWorkspace(command, workspace, shared), false, command);
+  }
+});
+
+test('a delivery whose worktree is gone fails closed instead of falling back to the shared tree', () => {
+  const fixture = createGitFixture('delivery-worktree-lost-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  assert.strictEqual(spawnSync('git', ['add', '.ecc/config.json'], { cwd: fixture }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'require delivery workflow'], { cwd: fixture }).status, 0);
+  const baseBranch = spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  const branch = 'codex/issue-79-worktree-lost';
+  const worktreePath = path.join(temp, 'delivery-worktree-lost-tree');
+  assert.strictEqual(
+    spawnSync('git', ['worktree', 'add', '--quiet', '-b', branch, worktreePath], { cwd: fixture }).status,
+    0
+  );
+  fs.writeFileSync(path.join(worktreePath, 'src', 'product.ts'), 'export const product = false;\n', 'utf8');
+  assert.strictEqual(spawnSync('git', ['add', 'src/product.ts'], { cwd: worktreePath }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'implement in worktree'], { cwd: worktreePath }).status, 0);
+  const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: worktreePath, encoding: 'utf8' }).stdout.trim();
+
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-worktree-lost-state') };
+  const input = { session_id: 'delivery-worktree-lost', cwd: fixture };
+  writeState(input, {
+    delivery: {
+      status: 'ready',
+      issue_number: 79,
+      branch,
+      base_branch: baseBranch,
+      worktree_path: worktreePath,
+      worktree_shared: false,
+      committed_head: head
+    },
+    review_role: 'review',
+    review_status: 'ok',
+    review_complete: true,
+    review_head: head,
+    review_worktree_clean: true,
+    review_blocking_findings: 0
+  }, fixtureEnv);
+
+  // 払い出したworktreeが外部の操作で消えた状態。共有ツリーはcleanなbase branchのまま。
+  fs.rmSync(worktreePath, { recursive: true, force: true });
+  assert.strictEqual(deliveryWorkspace(readState(input, fixtureEnv), fixture), null);
+
+  const sharedEdit = JSON.stringify({
+    ...input,
+    tool_name: 'Edit',
+    tool_input: { file_path: path.join(fixture, 'src', 'product.ts') }
+  });
+  const denied = JSON.parse(deliveryGate.run(sharedEdit, { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(denied.hookSpecificOutput.permissionDecisionReason, /no longer a working tree of this repository/);
+  assert.ok(readEvents(fixtureEnv).some(event => event.type === 'delivery_worktree_missing'));
+
+  const raw = JSON.stringify(input);
+  const blocked = JSON.parse(deliveryCompletion.run(raw, {
+    cwd: fixture,
+    env: fixtureEnv,
+    command: () => { throw new Error('completion must not inspect any working tree'); }
+  }));
+  assert.strictEqual(blocked.decision, 'block');
+  assert.match(blocked.reason, /no longer a working tree of this repository/);
+
+  // 共有ツリーのコミットをDeliveryの成果として拾わない。
+  const committed = JSON.stringify({
+    ...input,
+    tool_name: 'Bash',
+    tool_input: { command: 'git commit -m "unrelated"' },
+    tool_response: { exit_code: 0 }
+  });
+  assert.match(
+    deliveryProgress.run(committed, { cwd: fixture, env: fixtureEnv }).additionalContext,
+    /missing or belongs to another repository/
+  );
+  assert.strictEqual(readState(input, fixtureEnv).delivery.committed_head, head);
+
+  // 別リポジトリを指す記録も同じくfail-closeする。
+  const foreign = createGitFixture('delivery-worktree-foreign-repo');
+  writeState(input, {
+    delivery: { ...readState(input, fixtureEnv).delivery, worktree_path: foreign }
+  }, fixtureEnv);
+  assert.strictEqual(deliveryWorkspace(readState(input, fixtureEnv), fixture), null);
 });
 
 test('delivery completion gate rejects a review that is not bound to the current clean commit', () => {

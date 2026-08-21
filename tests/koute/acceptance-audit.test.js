@@ -152,6 +152,24 @@ test('accepts squash-merged delivery evidence bound to the reviewed HEAD', () =>
   assert.strictEqual(report.status, 'PASS');
 });
 
+test('fails closed when the recorded delivery worktree is gone instead of auditing the shared tree', () => {
+  const entry = validEntry();
+  entry.state.delivery.worktree_path = path.join(path.resolve('.'), 'no-such-delivery-worktree');
+  entry.state.delivery.worktree_shared = false;
+  const executed = [];
+  const tracking = (binary, args, cwd) => {
+    executed.push(`${binary} ${args.join(' ')} @${cwd}`);
+    return executor(binary, args);
+  };
+  const report = audit({ cwd: path.resolve('.'), issueNumber: 11 }, { entry, command: tracking });
+  assert.strictEqual(report.status, 'FAIL');
+  for (const id of ['worktree-clean', 'issue-branch', 'commit-bound-review']) {
+    assert.strictEqual(report.checks.find(item => item.id === id).pass, false, id);
+  }
+  // 共有ツリーのGit状態は証拠として読まない。
+  assert.ok(executed.every(command => !command.startsWith('git ')), executed.join(' | '));
+});
+
 test('parses the explicit issue argument', () => {
   assert.deepStrictEqual(parseArgs(['--issue', '11']), { issueNumber: 11 });
 });

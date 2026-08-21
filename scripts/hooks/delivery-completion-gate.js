@@ -135,6 +135,12 @@ function run(rawInput, options = {}) {
   // 検証は記録済みのDelivery worktreeで行う。共有ツリーを見ると、別branchのcleanな
   // HEADを根拠に完了させたり、worktreeの正しいコミットを未完了と誤判定したりする。
   const workspace = deliveryWorkspace(state, cwd);
+  if (!workspace) {
+    return block(
+      `Issue #${delivery.issue_number} is bound to the delivery worktree ${delivery.worktree_path}, but that path is no longer a working tree of this repository. ` +
+        'Restore it with `git worktree add` or reset the delivery; completion is never verified against the shared working tree.'
+    );
+  }
 
   const status = execute('git', ['status', '--porcelain'], workspace, env);
   if (!status.ok) return block(`Could not inspect the delivery worktree ${workspace}: ${status.stderr || 'git status failed'}`);

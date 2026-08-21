@@ -50,7 +50,10 @@ node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --request "Review th
 
 Without an explicit `--cwd`, the reviewer runs in the worktree recorded for the
 active delivery, so the review evidence binds to the commit that will be merged
-rather than to whatever the shared working tree currently holds.
+rather than to whatever the shared working tree currently holds. If that worktree
+is missing or now belongs to another repository, the reviewer stops instead of
+reviewing the shared working tree; restore the worktree or pass an explicit
+`--cwd`.
 
 Use its findings as independent evidence in the ECC review. If Codex reports a
 fallback, continue with the native review. ECC retains control of review count,

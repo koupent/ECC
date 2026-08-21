@@ -48,6 +48,17 @@ function run(rawInput, options = {}) {
   // コミットは払い出したworktreeで行われる。共有ツリーのHEADを読むと、Deliveryの
   // コミットを取り逃してレビュー要求が出ないまま進む。
   const workspace = deliveryWorkspace(state, cwd);
+  if (!workspace) {
+    // 記録済みworktreeが失われている間は、共有ツリーのHEADをDeliveryのコミットとして
+    // 記録しない。ここで拾うと、別作業のコミットにレビュー証拠が結び付く。
+    return {
+      additionalContext: [
+        '[ECC Delivery Progress]',
+        `The worktree recorded for Issue #${state.delivery.issue_number} (${state.delivery.worktree_path}) is missing or belongs to another repository.`,
+        'The shared working tree is never read as delivery evidence. Restore that worktree or reset the delivery before continuing.'
+      ].join('\n')
+    };
+  }
   const branch = gitValue(workspace, env, ['branch', '--show-current']);
   const head = gitValue(workspace, env, ['rev-parse', 'HEAD']);
   const dirty = gitValue(workspace, env, ['status', '--porcelain']);

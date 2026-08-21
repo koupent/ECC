@@ -40,6 +40,15 @@ Worktree handling is deliberately fail-closed:
   tree. Set `deliveryWorktreeRoot` in `.ecc/config.json` or
   `ECC_DELIVERY_WORKTREE_ROOT` to place it elsewhere.
 
+Once a delivery is bound to its own worktree, every later stage stays bound to it.
+The Delivery Gate, the commit observer, `/ecc:code-review`, the Completion Gate and
+the acceptance audit read that worktree only. If the recorded directory is gone or
+now belongs to another repository, they stop and ask you to restore it or reset the
+delivery; none of them falls back to the shared working tree. While the delivery is
+isolated, a write-capable `git` command is allowed only when it actually runs in the
+worktree (`cd "<worktree_path>" && git ...` or `git -C "<worktree_path>" ...`);
+mentioning the path elsewhere in the command line is not enough.
+
 The branch and base refs must be shell-safe (letters, digits, `.`, `_`, `/`, `-`,
 no leading `-` and no `..`). Git also accepts refs containing `;`, `&` or `$()`,
 which a shell would read as several commands, so the preparer refuses them instead

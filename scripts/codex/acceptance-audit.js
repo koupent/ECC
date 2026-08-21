@@ -62,10 +62,16 @@ function audit(options = {}, dependencies = {}) {
   const delivery = state.delivery || {};
   const squashMerged = delivery.status === 'merged';
   // Deliveryが払い出したworktreeを持つなら、Git側の証拠はそのツリーで確認する。
+  // worktreeが失われているDeliveryは、共有ツリーのcleanなHEADで合格させない。
   const workspace = deliveryWorkspace(state, cwd);
-  const gitStatus = execute('git', ['status', '--porcelain'], workspace, env);
-  const branch = execute('git', ['branch', '--show-current'], workspace, env);
-  const head = execute('git', ['rev-parse', 'HEAD'], workspace, env);
+  const unavailable = {
+    ok: false,
+    stdout: '',
+    stderr: `recorded delivery worktree ${delivery.worktree_path || '<none>'} is unavailable`
+  };
+  const gitStatus = workspace ? execute('git', ['status', '--porcelain'], workspace, env) : unavailable;
+  const branch = workspace ? execute('git', ['branch', '--show-current'], workspace, env) : unavailable;
+  const head = workspace ? execute('git', ['rev-parse', 'HEAD'], workspace, env) : unavailable;
   const issue = delivery.issue_number
     ? execute('gh', ['issue', 'view', String(delivery.issue_number), '--json', 'number,state,url'], cwd, env)
     : { ok: false, stdout: '', stderr: 'delivery issue is missing' };

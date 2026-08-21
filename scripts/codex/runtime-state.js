@@ -133,8 +133,10 @@ function projectFingerprint(cwd = process.cwd()) {
 }
 
 // 進行中のDeliveryが払い出されたworktreeを持つ場合、branch・HEAD・作業ツリーの
-// 検証はそのworktreeで行う。記録が消えている、あるいは別リポジトリを指している
-// stateでは共有ツリーへ戻し、無関係なツリーを操作対象にしない。
+// 検証はそのworktreeで行う。worktreeを記録していないDeliveryは従来どおり共有ツリーが
+// 作業場所である。記録済みのworktreeが消えている、あるいは別リポジトリを指している
+// ときはnullを返してfail-closeさせる。ここで共有ツリーへ戻すと、隔離したはずの
+// Deliveryを共有ツリーのbranchとHEADで判定し、Issueが指摘した衝突を再現してしまう。
 function deliveryWorkspace(state, cwd = process.cwd()) {
   const fallback = path.resolve(cwd || process.cwd());
   const recorded = state && state.delivery && state.delivery.worktree_path;
@@ -142,11 +144,11 @@ function deliveryWorkspace(state, cwd = process.cwd()) {
   const target = path.resolve(recorded);
   if (target === fallback) return fallback;
   try {
-    if (!fs.statSync(target).isDirectory()) return fallback;
+    if (!fs.statSync(target).isDirectory()) return null;
   } catch {
-    return fallback;
+    return null;
   }
-  return projectFingerprint(target) === projectFingerprint(fallback) ? target : fallback;
+  return projectFingerprint(target) === projectFingerprint(fallback) ? target : null;
 }
 
 function redactText(value) {
