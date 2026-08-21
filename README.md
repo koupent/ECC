@@ -40,7 +40,7 @@ For projects with `"deliveryWorkflow": "required"`, implementation requests are
 bound to the following Hook-enforced lifecycle:
 
 1. Codex builds the initial repository evidence packet before broad Claude exploration.
-2. `/ecc:delivery-prepare` searches open Issues, selects or creates one, and creates its `codex/issue-*` branch.
+2. `/ecc:delivery-prepare` searches open Issues, selects or creates one, and records its issue-linked branch. The branch prefix is `deliveryBranchPrefix` from `.ecc/config.json` (default `codex`, so `codex/issue-*`), and `--title` / `--branch-suffix` name the Issue and branch instead of leaving a generated fingerprint.
 3. Repository edits fail closed until that external-state evidence and branch agree.
 4. A fresh Codex review, clean commit, push, and open Draft PR are required before the task can stop.
 

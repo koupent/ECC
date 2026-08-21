@@ -18,6 +18,11 @@
     "legacyHarness": { "const": "replace" },
     "deliveryWorkflow": { "enum": ["advisory", "required"] },
     "deliveryBaseBranch": { "type": "string", "minLength": 1 },
+    "deliveryBranchPrefix": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*(?:/[A-Za-z0-9_-]+)*$",
+      "default": "codex"
+    },
     "legacyPreserve": {
       "type": "array",
       "uniqueItems": true,

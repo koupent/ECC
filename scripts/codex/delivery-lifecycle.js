@@ -18,6 +18,16 @@ const PREPARABLE_DELIVERY_STATUSES = new Set(['deferred', 'pending', 'awaiting-b
 // 埋めると複数のshell commandとして解釈されうる。この文字集合はshellのmetacharacterを
 // 一切含まないので、通過したrefは追加の引用なしでコマンド文字列へ入れて安全である。
 const SAFE_GIT_REF = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+// 既定の接頭辞。既存プロジェクトと記録済みstateのbranch名を変えないため変更しない。
+const DEFAULT_BRANCH_PREFIX = 'codex';
+// `--title` はGitHub Issueのタイトルになる。1行に収まる長さへ制限し、改行や制御文字を弾く。
+const DELIVERY_TITLE_LIMIT = 120;
+const PREPARE_OPTIONS = new Map([
+  ['--session', 'session'],
+  ['--title', 'title'],
+  ['--branch-suffix', 'branchSuffix']
+]);
+const PREPARE_USAGE = 'usage: delivery-lifecycle.js prepare [--session <id>] [--title "<issue title>"] [--branch-suffix <ascii-slug>]';
 
 function isActiveDelivery(delivery) {
   return Boolean(delivery && ACTIVE_DELIVERY_STATUSES.has(delivery.status));
@@ -82,21 +92,81 @@ function assertSafeGitRef(value, label) {
   return ref;
 }
 
-function deliveryBranch(issueNumber, title, currentBranch = '') {
-  const issueBranch = new RegExp(`^codex/issue-${Number(issueNumber)}(?:-|$)`, 'i');
-  return issueBranch.test(String(currentBranch || ''))
-    ? currentBranch
-    : `codex/issue-${Number(issueNumber)}-${slug(title)}`;
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function selectDeliveryBranch(issueNumber, title, currentBranch = '', existingBranches = []) {
-  const issueBranch = new RegExp(`^codex/issue-${Number(issueNumber)}(?:-|$)`, 'i');
+function normalizeBranchPrefix(value) {
+  // 末尾の `/` は書き方の揺れなので受け入れる。区切りはこのモジュールが必ず付ける。
+  const prefix = String(value === undefined || value === null ? '' : value).trim().replace(/\/+$/, '');
+  if (!prefix) return DEFAULT_BRANCH_PREFIX;
+  return assertSafeGitRef(prefix, 'Delivery branch prefix');
+}
+
+function issueBranchPrefixes(prefix) {
+  const configured = normalizeBranchPrefix(prefix);
+  // 接頭辞を変えた後も、変更前に作られた `codex/issue-N-*` を同じIssueのbranchとして拾う。
+  // 拾わないと、記録済みの作業branchがあるIssueへ2本目のbranchを作ってしまう。
+  return configured.toLowerCase() === DEFAULT_BRANCH_PREFIX ? [configured] : [configured, DEFAULT_BRANCH_PREFIX];
+}
+
+function issueBranchPattern(issueNumber, prefix) {
+  // 設定値は正規表現へ直接は入れない。shell-safeな検証を通した文字だけを、さらにエスケープする。
+  const prefixes = issueBranchPrefixes(prefix).map(escapeRegExp).join('|');
+  return new RegExp(`^(?:${prefixes})/issue-${Number(issueNumber)}(?:-|$)`, 'i');
+}
+
+function issueBranchPatterns(issueNumber, prefix) {
+  return issueBranchPrefixes(prefix).map(value => `${value}/issue-${Number(issueNumber)}-*`);
+}
+
+function deliveryBranch(issueNumber, title, currentBranch = '', prefix = DEFAULT_BRANCH_PREFIX) {
+  return issueBranchPattern(issueNumber, prefix).test(String(currentBranch || ''))
+    ? currentBranch
+    : `${normalizeBranchPrefix(prefix)}/issue-${Number(issueNumber)}-${slug(title)}`;
+}
+
+function selectDeliveryBranch(issueNumber, title, currentBranch = '', existingBranches = [], prefix = DEFAULT_BRANCH_PREFIX) {
+  const issueBranch = issueBranchPattern(issueNumber, prefix);
   if (issueBranch.test(String(currentBranch || ''))) return currentBranch;
   const candidates = [...new Set(existingBranches.filter(branch => issueBranch.test(String(branch || ''))))];
   if (candidates.length > 1) {
     throw new Error(`Issue #${Number(issueNumber)} has multiple local branches (${candidates.join(', ')}); consolidate them before continuing.`);
   }
-  return candidates[0] || deliveryBranch(issueNumber, title, currentBranch);
+  return candidates[0] || deliveryBranch(issueNumber, title, currentBranch, prefix);
+}
+
+function hasControlCharacter(value) {
+  return Array.from(String(value)).some(character => {
+    const code = character.codePointAt(0);
+    return code < 32 || code === 127;
+  });
+}
+
+function assertDeliveryTitle(value) {
+  const title = String(value === undefined || value === null ? '' : value).trim();
+  // 改行や制御文字はIssueのタイトルにもGateの案内文にも載せられない。先頭ハイフンは
+  // `gh issue create` のoptionと見分けの付かない名前になるので同じく受け付けない。
+  if (!title || title.length > DELIVERY_TITLE_LIMIT || hasControlCharacter(title) || title.startsWith('-')) {
+    throw new Error(
+      `Delivery title "${title}" is not usable as a GitHub Issue title. ` +
+        `Give one line of 1-${DELIVERY_TITLE_LIMIT} characters that does not start with "-".`
+    );
+  }
+  return title;
+}
+
+function assertBranchSuffix(value) {
+  const suffix = String(value === undefined || value === null ? '' : value).trim();
+  // slugはASCII以外を落とすので、日本語だけのsuffixは黙って `task` になる。意味を持たない
+  // branch名を作る代わりに、branchへ載せるASCIIを明示してもらう。
+  if (!/^[A-Za-z0-9][A-Za-z0-9 ._-]*$/.test(suffix)) {
+    throw new Error(
+      `Delivery branch suffix "${suffix}" is not usable. Use ASCII letters and digits (spaces, '.', '_' and '-' are allowed inside), ` +
+        'because the branch slug keeps ASCII only. A non-ASCII title can still be given with --title.'
+    );
+  }
+  return suffix;
 }
 
 function initializeDelivery(input, request, options = {}) {
@@ -255,13 +325,28 @@ function branchSwitchPlan(delivery, branch, currentBranch, options = {}) {
 function prepareDelivery(input = {}, options = {}) {
   const env = options.env || process.env;
   const cwd = options.cwd || input.cwd || process.cwd();
+  const config = loadConfig(cwd, env);
   const state = readState(input, env);
   const delivery = state.delivery;
   if (!delivery || !PREPARABLE_DELIVERY_STATUSES.has(delivery.status)) {
     throw new Error('No pending required delivery task. Submit the implementation request first.');
   }
 
+  // 入力の検証はincidentを記録するtryの外で行う。CLIの打ち間違いはDeliveryの障害ではない。
+  const requestedTitle = options.title === undefined ? '' : assertDeliveryTitle(options.title);
+  const requestedSuffix = options.branchSuffix === undefined ? '' : assertBranchSuffix(options.branchSuffix);
+  // 名前はIssueとbranchを記録する前にしか決められない。記録後の改名はGateが突き合わせる
+  // branchを壊すので、ここで拒否して「名前を決めてからprepareする」経路だけを残す。
+  if ((requestedTitle || requestedSuffix) && (delivery.issue_number || delivery.branch)) {
+    throw new Error(
+      `Issue #${delivery.issue_number || '?'} and branch ${delivery.branch || '<none>'} are already recorded for this delivery, so its name is fixed. ` +
+        'Run this command again without --title/--branch-suffix, or reset the delivery and name it before preparation.'
+    );
+  }
+  const named = requestedTitle ? { ...delivery, title: requestedTitle } : delivery;
+
   try {
+    const branchPrefix = normalizeBranchPrefix(config.deliveryBranchPrefix);
     const dirty = runCommand('git', ['status', '--porcelain'], { cwd, env });
     if (dirty) throw new Error('Delivery preparation requires a clean working tree; preserve or commit existing changes first.');
 
@@ -274,8 +359,8 @@ function prepareDelivery(input = {}, options = {}) {
     let draftPrUrl = delivery.draft_pr_url;
 
     if (!resumed) {
-      const existingPr = findExistingDeliveryPr(delivery, currentBranch, { cwd, env });
-      issue = findDuplicateIssue(delivery, {
+      const existingPr = findExistingDeliveryPr(named, currentBranch, { cwd, env });
+      issue = findDuplicateIssue(named, {
         cwd,
         env,
         allowClosedReferencedIssue: Boolean(existingPr)
@@ -284,29 +369,29 @@ function prepareDelivery(input = {}, options = {}) {
         const body = [
           'ECC deterministic delivery workflow がユーザー要求から自動作成しました。',
           '',
-          `Request fingerprint: \`${delivery.request_hash}\``,
+          `Request fingerprint: \`${named.request_hash}\``,
           '',
           'このIssueに紐づくDraft PRが作成されるまで自動クローズしません。'
         ].join('\n');
-        const url = runCommand('gh', ['issue', 'create', '--title', delivery.title, '--body', body], { cwd, env });
-        issue = { number: parseIssueNumber(url), title: delivery.title, url };
+        const url = runCommand('gh', ['issue', 'create', '--title', named.title, '--body', body], { cwd, env });
+        issue = { number: parseIssueNumber(url), title: named.title, url };
       }
 
       const existingIssueBranches = runCommand(
         'git',
-        ['branch', '--list', `codex/issue-${issue.number}-*`, '--format=%(refname:short)'],
+        ['branch', '--list', ...issueBranchPatterns(issue.number, branchPrefix), '--format=%(refname:short)'],
         { cwd, env }
       ).split(/\r?\n/).filter(Boolean);
       // 再開時にタイトルやslugが変わっても、同じIssueの現在branchを優先する。
       // これにより同一Issueへ複数branchを作ることを防ぐ。
       branch = existingPr
         ? currentBranch
-        : selectDeliveryBranch(issue.number, delivery.title, currentBranch, existingIssueBranches);
+        : selectDeliveryBranch(issue.number, requestedSuffix || named.title, currentBranch, existingIssueBranches, branchPrefix);
       draftPrUrl = existingPr ? existingPr.url : delivery.draft_pr_url;
     }
 
     const prepared = {
-      ...delivery,
+      ...named,
       issue_number: Number(issue.number),
       issue_url: issue.url,
       branch,
@@ -322,7 +407,7 @@ function prepareDelivery(input = {}, options = {}) {
       : {
           ...prepared,
           status: 'awaiting-branch',
-          branch_switch: branchSwitchPlan(delivery, branch, currentBranch, { cwd, env })
+          branch_switch: branchSwitchPlan(named, branch, currentBranch, { cwd, env })
         };
     writeState(input, { delivery: next }, env);
     return next;
@@ -335,14 +420,34 @@ function prepareDelivery(input = {}, options = {}) {
   }
 }
 
+function parsePrepareOptions(argv) {
+  const options = {};
+  for (let index = 0; index < argv.length; index += 1) {
+    const flag = argv[index];
+    const key = PREPARE_OPTIONS.get(flag);
+    const value = argv[index + 1];
+    // Gateは厳密なコマンド一致でしかprepareを通さない。ここで曖昧な入力を受けると、
+    // Gateが許した文字列とこのCLIが読む意味がずれる。
+    if (!key) throw new Error(`Unknown option ${flag}; ${PREPARE_USAGE}`);
+    if (options[key] !== undefined) throw new Error(`${flag} was given more than once; ${PREPARE_USAGE}`);
+    if (value === undefined || PREPARE_OPTIONS.has(value)) throw new Error(`${flag} requires a value; ${PREPARE_USAGE}`);
+    options[key] = value;
+    index += 1;
+  }
+  return options;
+}
+
 function main() {
   const command = process.argv[2];
-  const sessionIndex = process.argv.indexOf('--session');
-  const explicitSession = sessionIndex >= 0 ? process.argv[sessionIndex + 1] : process.env.CLAUDE_SESSION_ID;
+  if (command !== 'prepare') throw new Error(PREPARE_USAGE);
+  const options = parsePrepareOptions(process.argv.slice(3));
+  const explicitSession = options.session || process.env.CLAUDE_SESSION_ID;
   const sessionId = explicitSession || pendingSessionForProject(process.cwd(), process.env);
-  if (command !== 'prepare') throw new Error('usage: delivery-lifecycle.js prepare --session <id>');
   if (!sessionId) throw new Error('No unique pending delivery session for this project; retry the exact session-bound command from the Delivery Gate.');
-  const delivery = prepareDelivery({ session_id: sessionId, cwd: process.cwd() });
+  const delivery = prepareDelivery(
+    { session_id: sessionId, cwd: process.cwd() },
+    { title: options.title, branchSuffix: options.branchSuffix }
+  );
   // stdoutのJSONは機械可読の契約なので、切替要求という人間向けの指示はstderrへ出す。
   if (delivery.status === 'awaiting-branch' && delivery.branch_switch) {
     process.stderr.write(
@@ -364,6 +469,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+  assertBranchSuffix,
+  assertDeliveryTitle,
   branchSwitchPlan,
   explicitIssueNumber,
   explicitPrNumber,
@@ -374,8 +481,11 @@ module.exports = {
   isActiveDelivery,
   isDeliveryRequest,
   isSafeGitRef,
+  issueBranchPatterns,
+  normalizeBranchPrefix,
   normalizeIssueTitle,
   parseIssueNumber,
+  parsePrepareOptions,
   pendingSessionForProject,
   prepareDelivery,
   runCommand,

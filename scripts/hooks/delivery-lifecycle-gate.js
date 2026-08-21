@@ -7,6 +7,8 @@ const { loadConfig } = require('../codex/config');
 const { isSafeGitRef } = require('../codex/delivery-lifecycle');
 const { readState, recordIncident, resolveSessionId, writeState } = require('../codex/runtime-state');
 
+const PREPARE_FLAGS = ['--session', '--title', '--branch-suffix'];
+
 function deny(reason) {
   return JSON.stringify({
     hookSpecificOutput: {
@@ -47,6 +49,19 @@ function hasExecutableShellControl(command) {
   return quote !== null;
 }
 
+function hasRepeatedPrepareFlag(command) {
+  // 引用符の内側はflagの値なので数えない。`--title "add a --title option"` のような
+  // 正当なコマンドを、値に含まれる語だけで拒否しないためである。
+  const outsideQuotes = String(command).replace(/"[^"]*"|'[^']*'/g, ' ');
+  const seen = new Set();
+  for (const token of outsideQuotes.trim().split(/\s+/)) {
+    if (!PREPARE_FLAGS.includes(token)) continue;
+    if (seen.has(token)) return true;
+    seen.add(token);
+  }
+  return false;
+}
+
 function isExactLifecycleCommand(command, action) {
   const value = String(command || '').trim();
   if (!value || hasExecutableShellControl(value)) return false;
@@ -54,10 +69,13 @@ function isExactLifecycleCommand(command, action) {
   const scriptName = action === 'prepare' ? 'delivery-lifecycle\\.js' : 'reset\\.js';
   const script = String.raw`(?:"[^"]*scripts[\\/]codex[\\/]${scriptName}"|'[^']*scripts[\\/]codex[\\/]${scriptName}'|[^\s]+scripts[\\/]codex[\\/]${scriptName})`;
   const argument = String.raw`(?:"[^"]+"|'[^']+'|[^\s]+)`;
+  // prepareが解釈するflagだけを、それぞれ1回まで許す。任意のflagを許すとGateの
+  // fail-closed契約が緩むため、CLI側のallowlistと同じ集合をここでも固定する。
   const tail = action === 'prepare'
-    ? String.raw`prepare(?:\s+--session\s+${argument})?`
+    ? String.raw`prepare(?:\s+--(?:session|title|branch-suffix)\s+${argument})*`
     : argument;
-  return new RegExp(String.raw`^${node}\s+${script}\s+${tail}\s*$`, 'i').test(value);
+  if (!new RegExp(String.raw`^${node}\s+${script}\s+${tail}\s*$`, 'i').test(value)) return false;
+  return action !== 'prepare' || !hasRepeatedPrepareFlag(value);
 }
 
 function unquoteToken(value) {
@@ -128,6 +146,8 @@ function run(rawInput, options = {}) {
       '[ECC Delivery Gate] Repository tools are blocked until duplicate Issue search, Issue selection/creation, and the issue-linked branch are recorded. ' +
         'Preparation records that branch without switching to it; if the current branch differs, it will ask you to run one exact switch command yourself. ' +
         `Run node "${prepareScript}" prepare --session "${sessionId}" first, then retry the tool call. ` +
+        'Add --title "<one line>" to that command to name the Issue and branch yourself (and --branch-suffix <ascii-slug> when the title is not ASCII); ' +
+        'without it the recorded name is only a request fingerprint, and it cannot be changed after preparation. ' +
         `If the recorded Delivery is stale or unrecoverable, explicitly reset it with node "${resetScript}" "${sessionId}".`
     );
   }

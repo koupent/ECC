@@ -39,6 +39,8 @@ const deliveryProgress = require('../../scripts/hooks/delivery-progress');
 const deliveryFinalizer = require('../../scripts/hooks/delivery-session-finalizer');
 const configProtection = require('../../scripts/hooks/config-protection');
 const {
+  assertBranchSuffix,
+  assertDeliveryTitle,
   branchSwitchPlan,
   explicitIssueNumber,
   explicitPrNumber,
@@ -48,8 +50,11 @@ const {
   initializeDelivery,
   isDeliveryRequest,
   isSafeGitRef,
+  issueBranchPatterns,
+  normalizeBranchPrefix,
   normalizeIssueTitle,
   parseIssueNumber,
+  parsePrepareOptions,
   pendingSessionForProject,
   prepareDelivery,
   selectDeliveryBranch,
@@ -186,6 +191,8 @@ test('project config opts into standard Codex integration', () => {
   assert.strictEqual(config.timeoutSeconds, 1800);
   assert.strictEqual(config.deliveryWorkflow, 'advisory');
   assert.strictEqual(config.deliveryCompletion, 'draft-pr');
+  assert.strictEqual(config.deliveryBranchPrefix, 'codex');
+  assert.strictEqual(loadConfig(repo, { ...env, ECC_DELIVERY_BRANCH_PREFIX: 'feat' }).deliveryBranchPrefix, 'feat');
   assert.strictEqual(config.mergeGate.statusContext, 'Local Merge Gate');
   assert.deepStrictEqual(config.incidentHandling, {
     mode: 'report-only',
@@ -324,6 +331,85 @@ test('delivery preparation prioritizes an explicit open Issue reference and norm
   );
 });
 
+test('the delivery branch prefix is configurable, keeps codex as the default, and still finds branches named before the change', () => {
+  assert.strictEqual(normalizeBranchPrefix(undefined), 'codex');
+  assert.strictEqual(normalizeBranchPrefix('  feat/  '), 'feat');
+  assert.strictEqual(normalizeBranchPrefix('team/feat'), 'team/feat');
+  for (const unsafe of ['feat;git push --force', 'feat branch', '-feat', 'feat/../main']) {
+    assert.throws(() => normalizeBranchPrefix(unsafe), /Delivery branch prefix .* not shell-safe/, unsafe);
+  }
+
+  assert.strictEqual(deliveryBranch(10, 'Changed title', 'main', 'feat'), 'feat/issue-10-changed-title');
+  assert.strictEqual(deliveryBranch(10, 'Changed title', 'main'), 'codex/issue-10-changed-title');
+  // 接頭辞を変えても、変更前に作られた同じIssueのbranchは再利用する。ここで拾わないと
+  // 記録済みの作業がある Issue へ2本目のbranchを作ってしまう。
+  assert.strictEqual(
+    selectDeliveryBranch(9, 'changed title', 'main', ['codex/issue-9-original-title'], 'feat'),
+    'codex/issue-9-original-title'
+  );
+  assert.strictEqual(deliveryBranch(9, 'changed title', 'codex/issue-9-original-title', 'feat'), 'codex/issue-9-original-title');
+  assert.deepStrictEqual(issueBranchPatterns(9, 'feat'), ['feat/issue-9-*', 'codex/issue-9-*']);
+  assert.deepStrictEqual(issueBranchPatterns(9, 'codex'), ['codex/issue-9-*']);
+});
+
+test('prepare accepts an explicit name and refuses to rename a delivery whose Issue and branch are recorded', () => {
+  assert.deepStrictEqual(
+    parsePrepareOptions(['--session', 'abc', '--title', 'Collapse edition duplicates', '--branch-suffix', 'edition-duplicates']),
+    { session: 'abc', title: 'Collapse edition duplicates', branchSuffix: 'edition-duplicates' }
+  );
+  assert.deepStrictEqual(parsePrepareOptions([]), {});
+  assert.throws(() => parsePrepareOptions(['--issue', '9']), /Unknown option --issue/);
+  assert.throws(() => parsePrepareOptions(['--title']), /--title requires a value/);
+  assert.throws(() => parsePrepareOptions(['--title', '--session']), /--title requires a value/);
+  assert.throws(() => parsePrepareOptions(['--title', 'a', '--title', 'b']), /--title was given more than once/);
+
+  assert.strictEqual(assertDeliveryTitle('  Collapse edition duplicates  '), 'Collapse edition duplicates');
+  assert.strictEqual(assertDeliveryTitle('出演作品を全フロアから取得する'), '出演作品を全フロアから取得する');
+  for (const invalid of ['', '   ', '-not-an-option', 'two\nlines', 'x'.repeat(121)]) {
+    assert.throws(() => assertDeliveryTitle(invalid), /not usable as a GitHub Issue title/, JSON.stringify(invalid));
+  }
+  assert.strictEqual(assertBranchSuffix('edition duplicates'), 'edition duplicates');
+  // 日本語だけのsuffixは slug が `task` に潰すので、意味のない名前を作らずASCIIを求める。
+  for (const invalid of ['出演作品', '-leading', '']) {
+    assert.throws(() => assertBranchSuffix(invalid), /is not usable/, invalid);
+  }
+
+  const fixture = createGitFixture('delivery-explicit-name-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-explicit-name-state') };
+  const recorded = { session_id: 'delivery-explicit-name-recorded', cwd: fixture };
+  writeState(recorded, {
+    delivery: {
+      status: 'awaiting-branch',
+      request_hash: 'explicit-name-fixture',
+      title: 'ECC delivery 18bf1502e0',
+      base_branch: 'main',
+      issue_number: 78,
+      issue_url: 'https://example.invalid/issues/78',
+      branch: 'codex/issue-78-ecc-delivery-18bf1502e0'
+    }
+  }, fixtureEnv);
+  assert.throws(
+    () => prepareDelivery(recorded, { cwd: fixture, env: fixtureEnv, title: 'Rename after the fact' }),
+    /already recorded for this delivery/
+  );
+
+  const pending = { session_id: 'delivery-explicit-name-pending', cwd: fixture };
+  writeState(pending, {
+    delivery: { status: 'pending', request_hash: 'explicit-name-pending', title: 'ECC delivery 6ed29bec5e', base_branch: 'main' }
+  }, fixtureEnv);
+  assert.throws(
+    () => prepareDelivery(pending, { cwd: fixture, env: fixtureEnv, title: '-not-an-option' }),
+    /not usable as a GitHub Issue title/
+  );
+  // 不正な入力はDeliveryの障害ではないので、incidentを増やさずに拒否する。
+  assert.strictEqual(readEvents(fixtureEnv).filter(event => event.type === 'delivery_prepare_failure').length, 0);
+});
+
 test('follow-up prompts preserve the active delivery and reuse its Context Builder packet', () => {
   const fixture = createGitFixture('delivery-follow-up-repo');
   fs.writeFileSync(
@@ -448,6 +534,23 @@ test('required delivery gate blocks edits until issue and branch evidence are re
     'node "/opt/A&B/ECC/scripts/codex/reset.js" "delivery-gate"',
     'reset'
   ), true);
+  // 名前を指定するprepareも、prepareが解釈するflagだけを1回ずつという厳密な形で許可する。
+  assert.strictEqual(deliveryGate.isExactLifecycleCommand(
+    'node "/plugin/scripts/codex/delivery-lifecycle.js" prepare --session "delivery-gate" --title "Collapse edition duplicates"',
+    'prepare'
+  ), true);
+  assert.strictEqual(deliveryGate.isExactLifecycleCommand(
+    'node "/plugin/scripts/codex/delivery-lifecycle.js" prepare --title "Add a --title option" --branch-suffix title-option --session "delivery-gate"',
+    'prepare'
+  ), true);
+  for (const rejected of [
+    'node "/plugin/scripts/codex/delivery-lifecycle.js" prepare --title "a" --title "b"',
+    'node "/plugin/scripts/codex/delivery-lifecycle.js" prepare --body "unexpected"',
+    'node "/plugin/scripts/codex/delivery-lifecycle.js" prepare --title Collapse edition duplicates',
+    'node "/plugin/scripts/codex/delivery-lifecycle.js" prepare --title "x" && git add .'
+  ]) {
+    assert.strictEqual(deliveryGate.isExactLifecycleCommand(rejected, 'prepare'), false, rejected);
+  }
   for (const bypass of [
     'echo node /plugin/scripts/codex/delivery-lifecycle.js prepare',
     'node /plugin/scripts/codex/delivery-lifecycle.js prepare && git add .',

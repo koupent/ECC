@@ -66,7 +66,6 @@ function run(rawInput, options = {}) {
   const cwd = options.cwd || input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const config = loadConfig(cwd, options.env || process.env);
   const sessionId = resolveSessionId(input, options.env || process.env);
-  const prepareInstruction = `Before the first edit, run node "$CLAUDE_PLUGIN_ROOT/scripts/codex/delivery-lifecycle.js" prepare --session "${sessionId}". The Delivery Gate will fail closed until Issue deduplication and the issue-linked branch are recorded.`;
   const prompt = input.prompt || input.user_prompt || '';
   if (!config.enabled || shouldSkip(prompt)) return rawInput;
 
@@ -78,6 +77,13 @@ function run(rawInput, options = {}) {
     env: options.env || process.env,
     deferred: isPlanMode(input)
   });
+
+  // Issueとbranchを記録した後の改名はGateのbranch照合を壊すため受け付けない。
+  // 名前を選べるのはこの最初のprepareだけなので、そのときだけ指定方法を案内する。
+  const naming = delivery && !delivery.issue_number && !delivery.branch
+    ? ' Add --title "<one line describing the change>" to that command (and --branch-suffix <ascii-slug> when the title is not ASCII) so the Issue and branch get a meaningful name instead of a request fingerprint; the name cannot be changed afterwards.'
+    : '';
+  const prepareInstruction = `Before the first edit, run node "$CLAUDE_PLUGIN_ROOT/scripts/codex/delivery-lifecycle.js" prepare --session "${sessionId}".${naming} The Delivery Gate will fail closed until Issue deduplication and the issue-linked branch are recorded.`;
 
   const existing = readState(input, options.env || process.env);
   if (

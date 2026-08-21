@@ -37,4 +37,30 @@ assert.strictEqual(
 assert.strictEqual(validate(config({ mode: 'auto' })), false);
 assert.strictEqual(validate(config({ mode: 'docker-desktop', unexpected: true })), false);
 
+function deliveryConfig(overrides) {
+  return {
+    version: 1,
+    profile: 'standard',
+    rulePacks: ['common'],
+    codexSandbox: 'required',
+    legacyHarness: 'replace',
+    deliveryWorkflow: 'required',
+    ...overrides
+  };
+}
+
+// 既定は現行維持なので、接頭辞を書かない設定も有効なままでなければならない。
+assert.strictEqual(validate(deliveryConfig({})), true, JSON.stringify(validate.errors));
+for (const prefix of ['codex', 'feat', 'team/feat']) {
+  assert.strictEqual(
+    validate(deliveryConfig({ deliveryBranchPrefix: prefix })),
+    true,
+    `${prefix}: ${JSON.stringify(validate.errors)}`
+  );
+}
+// Git refとしてもshell引数としても安全な形だけを受ける。
+for (const prefix of ['', 'feat/', '-feat', 'feat branch', 'feat;git push --force', 'feat/../main']) {
+  assert.strictEqual(validate(deliveryConfig({ deliveryBranchPrefix: prefix })), false, prefix);
+}
+
 process.stdout.write('ECC project config voice schema tests passed\n');
