@@ -18,6 +18,18 @@
     "legacyHarness": { "const": "replace" },
     "deliveryWorkflow": { "enum": ["advisory", "required"] },
     "deliveryBaseBranch": { "type": "string", "minLength": 1 },
+    "deliveryCompletion": { "enum": ["draft-pr", "squash-merge"] },
+    "mergeGate": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "const": "commit-status" },
+        "command": { "type": "string", "minLength": 1 },
+        "adapter": { "type": "string", "minLength": 1 },
+        "statusContext": { "type": "string", "minLength": 1 },
+        "strategy": { "const": "squash" }
+      }
+    },
     "legacyPreserve": {
       "type": "array",
       "uniqueItems": true,

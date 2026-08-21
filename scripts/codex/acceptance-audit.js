@@ -4,6 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { loadConfig } = require('./config');
 const { projectFingerprint, readJson, stateRoot } = require('./runtime-state');
 
 function command(binary, args, cwd, env) {
@@ -60,7 +61,11 @@ function audit(options = {}, dependencies = {}) {
 
   const state = entry.state;
   const delivery = state.delivery || {};
-  const squashMerged = delivery.status === 'merged';
+  const config = dependencies.config || loadConfig(cwd, env);
+  // squash-merge指定のプロジェクトでは `draft-pr` は完了ではない。取り込み証拠を
+  // 要求する側へ倒すことで、未統合のDeliveryが監査上「完了」に見えないようにする。
+  const requiresMerge = config.deliveryCompletion === 'squash-merge';
+  const expectsMerge = requiresMerge || delivery.status === 'merged';
   const gitStatus = execute('git', ['status', '--porcelain'], cwd, env);
   const branch = execute('git', ['branch', '--show-current'], cwd, env);
   const head = execute('git', ['rev-parse', 'HEAD'], cwd, env);
@@ -68,7 +73,7 @@ function audit(options = {}, dependencies = {}) {
     ? execute('gh', ['issue', 'view', String(delivery.issue_number), '--json', 'number,state,url'], cwd, env)
     : { ok: false, stdout: '', stderr: 'delivery issue is missing' };
   const prs = delivery.branch
-    ? execute('gh', ['pr', 'list', '--head', delivery.branch, '--state', squashMerged ? 'all' : 'open', '--json', 'url,isDraft,number,body,baseRefName,state,headRefOid'], cwd, env)
+    ? execute('gh', ['pr', 'list', '--head', delivery.branch, '--state', expectsMerge ? 'all' : 'open', '--json', 'url,isDraft,number,body,baseRefName,state,headRefOid'], cwd, env)
     : { ok: false, stdout: '', stderr: 'delivery branch is missing' };
 
   let issueData = null;
@@ -87,11 +92,13 @@ function audit(options = {}, dependencies = {}) {
       (delivery.requested_issue_number === issueNumber && delivery.issue_number === issueNumber),
       issueNumber ? `requested=${issueNumber}, selected=${issueNumber}` : 'selected issue',
       `requested=${delivery.requested_issue_number}, selected=${delivery.issue_number}`),
-    check('delivery-stop-gate', ['draft-pr', 'merged'].includes(delivery.status) && Boolean(delivery.completed_at),
-      'draft-pr or merged with completed_at', delivery.status),
-    check('delivery-pr-url', squashMerged ? Boolean(delivery.merged_pr_url) : Boolean(delivery.draft_pr_url),
-      squashMerged ? 'non-empty merged PR URL' : 'non-empty Draft PR URL',
-      squashMerged ? delivery.merged_pr_url : delivery.draft_pr_url),
+    check('delivery-stop-gate',
+      (requiresMerge ? delivery.status === 'merged' : ['draft-pr', 'merged'].includes(delivery.status)) &&
+        Boolean(delivery.completed_at),
+      requiresMerge ? 'merged with completed_at' : 'draft-pr or merged with completed_at', delivery.status),
+    check('delivery-pr-url', expectsMerge ? Boolean(delivery.merged_pr_url) : Boolean(delivery.draft_pr_url),
+      expectsMerge ? 'non-empty merged PR URL' : 'non-empty Draft PR URL',
+      expectsMerge ? delivery.merged_pr_url : delivery.draft_pr_url),
     check('worktree-clean', gitStatus.ok && !gitStatus.stdout, 'clean', gitStatus.ok ? gitStatus.stdout || 'clean' : gitStatus.stderr),
     check('issue-branch', branch.ok && branch.stdout === delivery.branch, delivery.branch, branch.ok ? branch.stdout : branch.stderr),
     check('commit-bound-review', head.ok && state.review_status === 'ok' &&
@@ -106,16 +113,16 @@ function audit(options = {}, dependencies = {}) {
       `calls=${state.codex_calls || 0}, failures=${state.codex_failures || 0}`),
     check('waste-loops', Number(state.waste_loops || 0) === 0, '0', state.waste_loops || 0),
     check('github-issue', issue.ok && issueData && issueData.number === delivery.issue_number &&
-      (squashMerged ? issueData.state === 'CLOSED' : issueData.state === 'OPEN'),
-      `${squashMerged ? 'closed' : 'open'} Issue #${delivery.issue_number}`, issue.ok ? JSON.stringify(issueData) : issue.stderr),
-    check('github-delivery-pr', squashMerged
+      (expectsMerge ? issueData.state === 'CLOSED' : issueData.state === 'OPEN'),
+      `${expectsMerge ? 'closed' : 'open'} Issue #${delivery.issue_number}`, issue.ok ? JSON.stringify(issueData) : issue.stderr),
+    check('github-delivery-pr', expectsMerge
       ? Boolean(merged) && merged.baseRefName === delivery.base_branch && merged.headRefOid === delivery.merged_head && issueLink.test(String(merged.body || ''))
       : Boolean(draft) && draft.baseRefName === delivery.base_branch &&
         draft.headRefOid === head.stdout && issueLink.test(String(draft.body || '')),
-      squashMerged
+      expectsMerge
         ? `Merged PR targeting ${delivery.base_branch} with Closes #${delivery.issue_number}`
         : `Draft PR targeting ${delivery.base_branch} with Closes #${delivery.issue_number}`,
-      squashMerged
+      expectsMerge
         ? merged ? `PR #${merged.number}, base=${merged.baseRefName}` : prs.stderr || 'matching merged PR not found'
         : draft ? `PR #${draft.number}, base=${draft.baseRefName}` : prs.stderr || 'matching Draft PR not found')
   ];

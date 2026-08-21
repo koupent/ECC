@@ -66,6 +66,32 @@ function validEntry() {
   };
 }
 
+function mergedEntry() {
+  const entry = validEntry();
+  entry.state.delivery = {
+    ...entry.state.delivery,
+    status: 'merged',
+    merged_pr_url: 'https://example.invalid/pull/24',
+    merged_head: 'abc123'
+  };
+  return entry;
+}
+
+function mergedExecutor(binary, args) {
+  const key = `${binary} ${args.join(' ')}`;
+  if (key.startsWith('gh issue view 11')) {
+    return { ok: true, stdout: JSON.stringify({ number: 11, state: 'CLOSED', url: 'https://example.invalid/issues/11' }), stderr: '' };
+  }
+  if (key.startsWith('gh pr list --head codex/issue-11-lock')) {
+    return {
+      ok: true,
+      stdout: JSON.stringify([{ number: 24, url: 'https://example.invalid/pull/24', isDraft: false, state: 'MERGED', headRefOid: 'abc123', body: 'Closes #11', baseRefName: 'main' }]),
+      stderr: ''
+    };
+  }
+  return executor(binary, args);
+}
+
 process.stdout.write('\n=== ECC acceptance audit tests ===\n');
 
 test('passes only when external state, Git, and GitHub agree', () => {
@@ -127,28 +153,27 @@ test('fails when a Draft PR is not bound to the reviewed HEAD', () => {
 });
 
 test('accepts squash-merged delivery evidence bound to the reviewed HEAD', () => {
-  const entry = validEntry();
-  entry.state.delivery = {
-    ...entry.state.delivery,
-    status: 'merged',
-    merged_pr_url: 'https://example.invalid/pull/24',
-    merged_head: 'abc123'
-  };
-  const mergedExecutor = (binary, args) => {
-    const key = `${binary} ${args.join(' ')}`;
-    if (key.startsWith('gh issue view 11')) {
-      return { ok: true, stdout: JSON.stringify({ number: 11, state: 'CLOSED', url: 'https://example.invalid/issues/11' }), stderr: '' };
-    }
-    if (key.startsWith('gh pr list --head codex/issue-11-lock')) {
-      return {
-        ok: true,
-        stdout: JSON.stringify([{ number: 24, url: 'https://example.invalid/pull/24', isDraft: false, state: 'MERGED', headRefOid: 'abc123', body: 'Closes #11', baseRefName: 'main' }]),
-        stderr: ''
-      };
-    }
-    return executor(binary, args);
-  };
-  const report = audit({ cwd: path.resolve('.'), issueNumber: 11 }, { entry, command: mergedExecutor });
+  const report = audit({ cwd: path.resolve('.'), issueNumber: 11 }, { entry: mergedEntry(), command: mergedExecutor });
+  assert.strictEqual(report.status, 'PASS');
+});
+
+test('a squash-merge project does not accept an unmerged draft-pr Delivery as complete', () => {
+  const report = audit(
+    { cwd: path.resolve('.'), issueNumber: 11 },
+    { entry: validEntry(), command: executor, config: { deliveryCompletion: 'squash-merge' } }
+  );
+  assert.strictEqual(report.status, 'FAIL');
+  const stopGate = report.checks.find(item => item.id === 'delivery-stop-gate');
+  assert.strictEqual(stopGate.pass, false);
+  assert.strictEqual(stopGate.expected, 'merged with completed_at');
+  assert.strictEqual(report.checks.find(item => item.id === 'github-delivery-pr').pass, false);
+});
+
+test('a squash-merge project accepts the merged Delivery', () => {
+  const report = audit(
+    { cwd: path.resolve('.'), issueNumber: 11 },
+    { entry: mergedEntry(), command: mergedExecutor, config: { deliveryCompletion: 'squash-merge' } }
+  );
   assert.strictEqual(report.status, 'PASS');
 });
 

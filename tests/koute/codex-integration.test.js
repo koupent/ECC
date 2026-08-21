@@ -6,7 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
-const { loadConfig } = require('../../scripts/codex/config');
+const { deliveryCompletionDefaulted, loadConfig } = require('../../scripts/codex/config');
 const {
   hash,
   readState,
@@ -714,6 +714,16 @@ test('delivery completion gate rejects a review that is not bound to the current
   const completed = readState(input, fixtureEnv);
   assert.strictEqual(completed.delivery.status, 'draft-pr');
   assert.strictEqual(completed.delivery.draft_pr_url, 'https://example.invalid/pr/2');
+
+  // draft-pr既定のプロジェクトでは、完了したDeliveryはこれまで通りStopを止めず、
+  // GitHubへの再問い合わせも起こさない。
+  assert.strictEqual(deliveryCompletion.run(rawInput, {
+    cwd: fixture,
+    env: fixtureEnv,
+    command() {
+      throw new Error('a completed draft-pr delivery must not be verified again');
+    }
+  }), rawInput);
 });
 
 test('squash completion requires a current Local Merge Gate status and confirms the merged PR', () => {
@@ -795,6 +805,136 @@ test('squash completion requires a current Local Merge Gate status and confirms 
   assert.match(stale.reason, /current HEAD/);
 });
 
+test('a Delivery already recorded as draft-pr still completes by squash merge when the project requires it', () => {
+  const fixture = createGitFixture('delivery-squash-resume-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({
+      profile: 'standard',
+      deliveryWorkflow: 'required',
+      deliveryCompletion: 'squash-merge',
+      mergeGate: {
+        provider: 'commit-status',
+        command: 'engineering-kit-merge-gate',
+        statusContext: 'Local Merge Gate',
+        strategy: 'squash'
+      },
+      codex: { enabled: true }
+    }),
+    'utf8'
+  );
+  assert.strictEqual(spawnSync('git', ['add', '.ecc/config.json'], { cwd: fixture }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'enable squash completion'], { cwd: fixture }).status, 0);
+  const branch = 'codex/issue-69-resume';
+  assert.strictEqual(spawnSync('git', ['switch', '-c', branch], { cwd: fixture }).status, 0);
+  const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-squash-resume-state') };
+  const input = { session_id: 'delivery-squash-resume', cwd: fixture };
+  // 過去のturnで書かれた draft-pr。これまではここで完了経路へ入れなかった。
+  writeState(input, {
+    delivery: {
+      status: 'draft-pr',
+      issue_number: 69,
+      branch,
+      base_branch: 'main',
+      draft_pr_url: 'https://example.invalid/pr/9',
+      completed_at: '2026-08-20T14:29:52.372Z'
+    },
+    review_role: 'review',
+    review_status: 'ok',
+    review_complete: true,
+    review_head: head,
+    review_worktree_clean: true,
+    review_blocking_findings: 0
+  }, fixtureEnv);
+
+  let calls = [];
+  let prState = 'OPEN';
+  const execute = (binary, args, commandCwd, commandEnv) => {
+    calls.push([binary, ...args].join(' '));
+    if (binary !== 'gh') return deliveryCompletion.command(binary, args, commandCwd, commandEnv);
+    if (args[0] === 'pr' && args[1] === 'list') {
+      assert.deepStrictEqual(args.slice(args.indexOf('--state'), args.indexOf('--state') + 2), ['--state', 'all']);
+      return {
+        ok: true,
+        stdout: JSON.stringify([{
+          url: 'https://example.invalid/pr/9',
+          isDraft: prState === 'OPEN',
+          number: 9,
+          body: 'Closes #69',
+          baseRefName: 'main',
+          headRefOid: head,
+          state: prState
+        }]),
+        stderr: ''
+      };
+    }
+    if (args[0] === 'repo') return { ok: true, stdout: 'acme/example', stderr: '' };
+    if (args[0] === 'api') {
+      return { ok: true, stdout: JSON.stringify({ sha: head, statuses: [{ context: 'Local Merge Gate', state: 'success' }] }), stderr: '' };
+    }
+    if (args[0] === 'pr' && args[1] === 'ready') return { ok: true, stdout: '', stderr: '' };
+    if (args[0] === 'pr' && args[1] === 'merge') {
+      prState = 'MERGED';
+      return { ok: true, stdout: '', stderr: '' };
+    }
+    if (args[0] === 'pr' && args[1] === 'view') {
+      return { ok: true, stdout: JSON.stringify({ state: 'MERGED', isDraft: false, headRefOid: head, url: 'https://example.invalid/pr/9' }), stderr: '' };
+    }
+    throw new Error(`unexpected gh command: ${args.join(' ')}`);
+  };
+
+  const raw = JSON.stringify(input);
+  assert.strictEqual(deliveryCompletion.run(raw, { cwd: fixture, env: fixtureEnv, command: execute }), raw);
+  const merged = readState(input, fixtureEnv);
+  assert.strictEqual(merged.delivery.status, 'merged');
+  assert.strictEqual(merged.delivery.merged_pr_url, 'https://example.invalid/pr/9');
+  assert.strictEqual(merged.delivery.merged_head, head);
+  assert.ok(calls.includes('gh pr merge 9 --squash'));
+
+  // 取り込み済みPRでの再開は冪等: mergeを撃ち直さず、mergedのまま閉じる。
+  writeState(input, { delivery: { ...merged.delivery, status: 'draft-pr' } }, fixtureEnv);
+  calls = [];
+  assert.strictEqual(deliveryCompletion.run(raw, { cwd: fixture, env: fixtureEnv, command: execute }), raw);
+  assert.ok(!calls.some(call => call.startsWith('gh pr merge')));
+  assert.ok(!calls.some(call => call.startsWith('gh pr ready')));
+  assert.strictEqual(readState(input, fixtureEnv).delivery.status, 'merged');
+});
+
+test('a completion method that silently fell back to the default is recorded once', () => {
+  const fixture = createGitFixture('delivery-config-default-repo');
+  fs.writeFileSync(path.join(fixture, '.ecc', 'config.json'), '{ "profile": "standard",', 'utf8');
+  const fixtureEnv = {
+    ...env,
+    ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-config-default-state'),
+    ECC_DELIVERY_WORKFLOW: 'required'
+  };
+  const config = loadConfig(fixture, fixtureEnv);
+  assert.strictEqual(config.deliveryCompletion, 'draft-pr');
+  assert.strictEqual(config.deliveryCompletionSource, 'default');
+  assert.strictEqual(config.projectConfigFailure, 'invalid-json');
+
+  const input = { session_id: 'delivery-config-default', cwd: fixture };
+  writeState(input, { delivery: { status: 'pending', request_hash: 'fixture' } }, fixtureEnv);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const output = JSON.parse(deliveryCompletion.run(JSON.stringify(input), { cwd: fixture, env: fixtureEnv }));
+    assert.strictEqual(output.decision, 'block');
+  }
+  const events = readEvents(fixtureEnv).filter(event => event.type === 'delivery_completion_config_defaulted');
+  assert.strictEqual(events.length, 1);
+  assert.strictEqual(events[0].severity, 'minor');
+  assert.strictEqual(events[0].metadata.failure, 'invalid-json');
+  assert.strictEqual(events[0].metadata.completion, 'draft-pr');
+  assert.match(events[0].message, /defaulted to draft-pr/);
+
+  // 明示された完了方式は既定への転落ではない。環境変数で指定した場合は記録しない。
+  const explicit = loadConfig(fixture, { ...fixtureEnv, ECC_DELIVERY_COMPLETION: 'squash-merge' });
+  assert.strictEqual(explicit.deliveryCompletionSource, 'environment');
+  assert.strictEqual(deliveryCompletionDefaulted(explicit), false);
+  const readable = createGitFixture('delivery-config-readable-repo');
+  assert.strictEqual(deliveryCompletionDefaulted(loadConfig(readable, env)), false);
+});
+
 test('local merge policy blocks merge bypasses and direct success status publication', () => {
   assert.ok(PRE_BASH_HOOKS.some(hook => hook.id === 'pre:bash:local-merge-policy'));
   const fixture = createGitFixture('local-merge-policy-repo');
@@ -813,13 +953,33 @@ test('local merge policy blocks merge bypasses and direct success status publica
   for (const command of [
     'gh pr merge 12 --squash',
     'gh pr merge 12 --admin --squash',
+    'gh --repo acme/example pr merge 12 --squash',
+    'npm test && gh pr merge 12 --squash',
+    'echo "$(gh pr merge 12)"',
+    'bash -lc "gh pr merge 12"',
     'gh api repos/acme/example/statuses/abc -f state=success -f context="Local Merge Gate"'
   ]) {
     const denied = JSON.parse(localMergePolicy.run(bash(command), { cwd: fixture, env }));
     assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny', command);
   }
-  const ordinary = bash('gh pr view 12 --json state');
-  assert.strictEqual(localMergePolicy.run(ordinary, { cwd: fixture, env }), ordinary);
+  // 取り込み操作について書いた文書を作ることは、取り込み操作ではない。heredoc本文も
+  // quotedな `--body` も実行されるコマンド語ではないため、Policyの対象にしない。
+  for (const command of [
+    'gh pr view 12 --json state',
+    'gh issue create --title policy --body "PRのmergeはCompletion Gateだけが実行できます（gh pr merge は直接実行しません）"',
+    [
+      "cat > /tmp/issue-body.md <<'BODY'",
+      '## 症状',
+      'Local Merge Policy が `gh pr merge 12 --squash` の記述を拒否します。',
+      'commit statusは -f state=success で直接投稿されてはいけません。',
+      'BODY',
+      'gh issue create --title policy --body-file /tmp/issue-body.md'
+    ].join('\n'),
+    'echo "post /statuses/abc with state=success only from the merge gate" >> notes.md'
+  ]) {
+    const allowed = bash(command);
+    assert.strictEqual(localMergePolicy.run(allowed, { cwd: fixture, env }), allowed, command);
+  }
 
   const backgroundReview = JSON.stringify({
     cwd: fixture,

@@ -2,7 +2,7 @@
 'use strict';
 
 const { spawnSync } = require('child_process');
-const { loadConfig } = require('../codex/config');
+const { deliveryCompletionDefaulted, loadConfig } = require('../codex/config');
 const { readState, recordIncident, writeState } = require('../codex/runtime-state');
 
 function isTransientGitHubFailure(message) {
@@ -100,6 +100,34 @@ function completeBySquashMerge(execute, config, delivery, pr, head, cwd, env) {
   return { ok: true, pr: merged, status: gate.status };
 }
 
+// 完了方式が黙って既定へ落ちることは許さない。設定を読めなかった事実は、Deliveryの
+// 状態を変えうるこのGateで一度だけ記録する。記録に失敗してもStop判定は続行する。
+function reportCompletionDefault(input, config, delivery, cwd, env) {
+  if (!deliveryCompletionDefaulted(config) || delivery.completion_default_reported_at) return delivery;
+  const updated = { ...delivery, completion_default_reported_at: new Date().toISOString() };
+  try {
+    recordIncident(
+      {
+        type: 'delivery_completion_config_defaulted',
+        severity: 'minor',
+        target: 'ecc',
+        hook_id: 'delivery-completion',
+        message: `The project config could not be read (${config.projectConfigFailure}), so the delivery completion method defaulted to ${config.deliveryCompletion}.`,
+        metadata: {
+          config_path: config.projectConfigPath,
+          failure: config.projectConfigFailure,
+          completion: config.deliveryCompletion
+        }
+      },
+      { cwd, env }
+    );
+    writeState(input, { delivery: updated }, env);
+  } catch {
+    return delivery;
+  }
+  return updated;
+}
+
 function run(rawInput, options = {}) {
   let input;
   try {
@@ -113,8 +141,8 @@ function run(rawInput, options = {}) {
   if (config.deliveryWorkflow !== 'required') return rawInput;
 
   const state = readState(input, env);
-  const delivery = state.delivery;
-  if (!delivery) return rawInput;
+  if (!state.delivery) return rawInput;
+  const delivery = reportCompletionDefault(input, config, state.delivery, cwd, env);
   if (delivery.status === 'deferred') {
     const permissionMode = String(input.permission_mode || input.permissionMode || '').toLowerCase();
     if (permissionMode === 'plan') return rawInput;
@@ -130,7 +158,10 @@ function run(rawInput, options = {}) {
         `Run \`${handoff.command || `git switch ${delivery.branch}`}\` once no verification is running, then run \`/ecc:delivery-prepare\` again.`
     );
   }
-  if (delivery.status !== 'ready') return rawInput;
+  // squash-merge指定のプロジェクトでは、過去に書かれた `draft-pr` も同じ完了経路へ戻す。
+  // 取り込みが済んでいればPRは既にMERGEDで、completeBySquashMergeがそのまま合格させる。
+  const resumesSquashMerge = config.deliveryCompletion === 'squash-merge' && delivery.status === 'draft-pr';
+  if (delivery.status !== 'ready' && !resumesSquashMerge) return rawInput;
 
   const execute = options.command || command;
 

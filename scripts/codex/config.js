@@ -22,15 +22,23 @@ function findProjectRoot(start = process.cwd()) {
   return path.resolve(start);
 }
 
+function readFailure(error) {
+  if (error && error.code === 'ENOENT') return 'missing';
+  if (error instanceof SyntaxError) return 'invalid-json';
+  return error && error.code ? String(error.code) : 'unreadable';
+}
+
 function readProjectConfig(cwd = process.cwd(), env = process.env) {
   const root = findProjectRoot(cwd);
   const file = env.ECC_PROJECT_CONFIG
     ? path.resolve(env.ECC_PROJECT_CONFIG)
     : path.join(root, '.ecc', 'config.json');
   try {
-    return { root, file, exists: true, value: JSON.parse(fs.readFileSync(file, 'utf8')) };
-  } catch {
-    return { root, file, exists: false, value: {} };
+    return { root, file, exists: true, failure: null, value: JSON.parse(fs.readFileSync(file, 'utf8')) };
+  } catch (error) {
+    // The failure reason travels with the config so callers can tell a silent
+    // fallback from a deliberate setting. It never carries file contents.
+    return { root, file, exists: false, failure: readFailure(error), value: {} };
   }
 }
 
@@ -39,10 +47,16 @@ function loadConfig(cwd = process.cwd(), env = process.env) {
   const codex = project.value.codex || {};
   const mergeGate = project.value.mergeGate || {};
   const incidentHandling = project.value.incidentHandling || {};
+  const deliveryCompletionSource = env.ECC_DELIVERY_COMPLETION
+    ? 'environment'
+    : project.value.deliveryCompletion
+      ? 'project-config'
+      : 'default';
   return {
     projectRoot: project.root,
     projectConfigPath: project.file,
     projectEnabled: project.exists,
+    projectConfigFailure: project.failure,
     enabled: project.exists && envEnabled(env.ECC_CODEX_ENABLED, codex.enabled !== false),
     hookProfile: env.ECC_HOOK_PROFILE || project.value.profile || 'standard',
     contextModel: env.ECC_CODEX_CONTEXT_MODEL || codex.contextModel || 'gpt-5.6-terra',
@@ -59,6 +73,7 @@ function loadConfig(cwd = process.cwd(), env = process.env) {
     deliveryWorkflow: env.ECC_DELIVERY_WORKFLOW || project.value.deliveryWorkflow || 'advisory',
     deliveryBaseBranch: env.ECC_DELIVERY_BASE_BRANCH || project.value.deliveryBaseBranch || 'main',
     deliveryCompletion: env.ECC_DELIVERY_COMPLETION || project.value.deliveryCompletion || 'draft-pr',
+    deliveryCompletionSource,
     mergeGate: {
       provider: env.ECC_MERGE_GATE_PROVIDER || mergeGate.provider || 'commit-status',
       command: env.ECC_MERGE_GATE_COMMAND || mergeGate.command || 'engineering-kit-merge-gate',
@@ -69,4 +84,13 @@ function loadConfig(cwd = process.cwd(), env = process.env) {
   };
 }
 
-module.exports = { envEnabled, findProjectRoot, loadConfig, readProjectConfig };
+/**
+ * True when the completion method fell back to the default *because* the
+ * project config could not be read. A project that names no method in a
+ * readable config, or that sets it through the environment, chose it.
+ */
+function deliveryCompletionDefaulted(config) {
+  return config.deliveryCompletionSource === 'default' && Boolean(config.projectConfigFailure);
+}
+
+module.exports = { deliveryCompletionDefaulted, envEnabled, findProjectRoot, loadConfig, readProjectConfig };
