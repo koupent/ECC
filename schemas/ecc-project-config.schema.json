@@ -5,6 +5,22 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["version", "profile", "rulePacks", "codexSandbox", "legacyHarness"],
+  "allOf": [
+    {
+      "$comment": "squash-merge completion runs in the Stop gate, which only exists when the delivery workflow is required and the standard or strict hook profile is active. Accepting the other combinations would forbid the manual merge without ever performing the automatic one.",
+      "if": {
+        "properties": { "deliveryCompletion": { "const": "squash-merge" } },
+        "required": ["deliveryCompletion"]
+      },
+      "then": {
+        "properties": {
+          "deliveryWorkflow": { "const": "required" },
+          "profile": { "enum": ["standard", "strict"] }
+        },
+        "required": ["deliveryWorkflow"]
+      }
+    }
+  ],
   "properties": {
     "$schema": { "type": "string" },
     "version": { "const": 1 },
@@ -18,6 +34,18 @@
     "legacyHarness": { "const": "replace" },
     "deliveryWorkflow": { "enum": ["advisory", "required"] },
     "deliveryBaseBranch": { "type": "string", "minLength": 1 },
+    "deliveryCompletion": { "enum": ["draft-pr", "squash-merge"] },
+    "mergeGate": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "const": "commit-status" },
+        "command": { "type": "string", "minLength": 1 },
+        "adapter": { "type": "string", "minLength": 1 },
+        "statusContext": { "type": "string", "minLength": 1 },
+        "strategy": { "const": "squash" }
+      }
+    },
     "legacyPreserve": {
       "type": "array",
       "uniqueItems": true,

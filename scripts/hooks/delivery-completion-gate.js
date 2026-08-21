@@ -2,7 +2,7 @@
 'use strict';
 
 const { spawnSync } = require('child_process');
-const { loadConfig } = require('../codex/config');
+const { deliveryCompletionDefaulted, deliveryWorkflowDefaulted, loadConfig, squashMergeCompletion } = require('../codex/config');
 const { readState, recordIncident, writeState } = require('../codex/runtime-state');
 
 function isTransientGitHubFailure(message) {
@@ -100,6 +100,73 @@ function completeBySquashMerge(execute, config, delivery, pr, head, cwd, env) {
   return { ok: true, pr: merged, status: gate.status };
 }
 
+// 完了方式が黙って既定へ落ちることは許さない。設定を読めなかった事実は、Deliveryの
+// 状態を変えうるこのGateで一度だけ記録する。記録に失敗してもStop判定は続行する。
+function reportCompletionDefault(input, config, delivery, cwd, env) {
+  if (!deliveryCompletionDefaulted(config) || delivery.completion_default_reported_at) return delivery;
+  const updated = { ...delivery, completion_default_reported_at: new Date().toISOString() };
+  try {
+    recordIncident(
+      {
+        type: 'delivery_completion_config_defaulted',
+        severity: 'minor',
+        target: 'ecc',
+        hook_id: 'delivery-completion',
+        message: `The project config could not be read (${config.projectConfigFailure}), so the delivery completion method defaulted to ${config.deliveryCompletion}.`,
+        metadata: {
+          config_path: config.projectConfigPath,
+          failure: config.projectConfigFailure,
+          completion: config.deliveryCompletion
+        }
+      },
+      { cwd, env }
+    );
+    writeState(input, { delivery: updated }, env);
+  } catch {
+    return delivery;
+  }
+  return updated;
+}
+
+// 読めない設定は「Deliveryが要求されていない」ことの証拠ではない。設定が読めないと
+// workflowはadvisoryへ落ち、このGate自体が消える。取り込みの済んでいないDeliveryが
+// 残っている間は、設定を直すまで閉じる側へ倒す。
+function blockUnreadableConfig(input, config, state, cwd, env) {
+  if (!deliveryWorkflowDefaulted(config)) return null;
+  const delivery = state.delivery;
+  if (!delivery || delivery.status === 'merged') return null;
+  // 計画中のturnは通常経路でも止めない。設定の破損は実装の前に直せばよい。
+  if (delivery.status === 'deferred' &&
+    String(input.permission_mode || input.permissionMode || '').toLowerCase() === 'plan') return null;
+  if (!delivery.config_failure_reported_at) {
+    try {
+      recordIncident(
+        {
+          type: 'delivery_config_unreadable',
+          severity: 'minor',
+          target: 'ecc',
+          hook_id: 'delivery-completion',
+          message: `The project config could not be read (${config.projectConfigFailure}), so a delivery recorded as ${delivery.status} could not be verified against the required workflow.`,
+          metadata: {
+            config_path: config.projectConfigPath,
+            failure: config.projectConfigFailure,
+            delivery_status: delivery.status
+          }
+        },
+        { cwd, env }
+      );
+      writeState(input, { delivery: { ...delivery, config_failure_reported_at: new Date().toISOString() } }, env);
+    } catch {
+      // 記録できないことを理由にStop判定を緩めない。
+    }
+  }
+  return block(
+    `The project config ${config.projectConfigPath} could not be read (${config.projectConfigFailure}), so the delivery workflow and completion method cannot be confirmed. ` +
+      `The recorded delivery${delivery.issue_number ? ` for Issue #${delivery.issue_number}` : ''} is still ${delivery.status}. ` +
+      'Restore the project config on the recorded branch and retry; do not finish the delivery while the configured completion method is unknown.'
+  );
+}
+
 function run(rawInput, options = {}) {
   let input;
   try {
@@ -110,11 +177,14 @@ function run(rawInput, options = {}) {
   const env = options.env || process.env;
   const cwd = options.cwd || input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const config = loadConfig(cwd, env);
-  if (config.deliveryWorkflow !== 'required') return rawInput;
-
+  // 状態はworkflow判定より先に読む。既存Deliveryの有無を知らないままreturnすると、
+  // 設定を読めなかっただけでrequiredなDeliveryが素通りする。
   const state = readState(input, env);
-  const delivery = state.delivery;
-  if (!delivery) return rawInput;
+  if (config.deliveryWorkflow !== 'required') {
+    return blockUnreadableConfig(input, config, state, cwd, env) || rawInput;
+  }
+  if (!state.delivery) return rawInput;
+  const delivery = reportCompletionDefault(input, config, state.delivery, cwd, env);
   if (delivery.status === 'deferred') {
     const permissionMode = String(input.permission_mode || input.permissionMode || '').toLowerCase();
     if (permissionMode === 'plan') return rawInput;
@@ -130,7 +200,11 @@ function run(rawInput, options = {}) {
         `Run \`${handoff.command || `git switch ${delivery.branch}`}\` once no verification is running, then run \`/ecc:delivery-prepare\` again.`
     );
   }
-  if (delivery.status !== 'ready') return rawInput;
+  // squash-merge指定のプロジェクトでは、過去に書かれた `draft-pr` も同じ完了経路へ戻す。
+  // 取り込みが済んでいればPRは既にMERGEDで、completeBySquashMergeがそのまま合格させる。
+  const squashMerge = squashMergeCompletion(config);
+  const resumesSquashMerge = squashMerge && delivery.status === 'draft-pr';
+  if (delivery.status !== 'ready' && !resumesSquashMerge) return rawInput;
 
   const execute = options.command || command;
 
@@ -161,7 +235,7 @@ function run(rawInput, options = {}) {
 
   const prs = execute('gh', [
     'pr', 'list', '--head', branch,
-    '--state', config.deliveryCompletion === 'squash-merge' ? 'all' : 'open',
+    '--state', squashMerge ? 'all' : 'open',
     '--json', 'url,isDraft,number,body,baseRefName,headRefOid,state'
   ], cwd, env);
   if (!prs.ok) {
@@ -177,13 +251,13 @@ function run(rawInput, options = {}) {
   }
   const matchingHead = entries.filter(pr =>
     pr.headRefOid === head.stdout &&
-    (config.deliveryCompletion !== 'squash-merge' || ['OPEN', 'MERGED'].includes(pr.state || 'OPEN'))
+    (!squashMerge || ['OPEN', 'MERGED'].includes(pr.state || 'OPEN'))
   );
-  const candidate = config.deliveryCompletion === 'squash-merge'
+  const candidate = squashMerge
     ? matchingHead.length === 1 && matchingHead[0]
     : matchingHead.find(pr => pr.isDraft === true);
   if (!candidate) {
-    const detail = config.deliveryCompletion === 'squash-merge' && matchingHead.length > 1
+    const detail = squashMerge && matchingHead.length > 1
       ? `Multiple open PRs exist for ${branch}; keep exactly one.`
       : `No open Draft PR exists for ${branch}. Push the branch and create one with \`gh pr create --draft --base ${delivery.base_branch}\`, linking Issue #${delivery.issue_number}.`;
     return block(detail);
@@ -196,7 +270,7 @@ function run(rawInput, options = {}) {
     return block(`Draft PR #${candidate.number} is not linked to Issue #${delivery.issue_number}. Add \`Closes #${delivery.issue_number}\` to the PR body.`);
   }
 
-  if (config.deliveryCompletion === 'squash-merge') {
+  if (squashMerge) {
     const completion = completeBySquashMerge(execute, config, delivery, candidate, head.stdout, cwd, env);
     if (!completion.ok) {
       recordIncident(
@@ -205,10 +279,13 @@ function run(rawInput, options = {}) {
       );
       return block(completion.reason);
     }
+    // 完了方式をDeliveryへ残す。後から設定を読めない監査でも、このDeliveryが
+    // 取り込みを要求されていた事実だけは動かない。
     writeState(input, {
       delivery: {
         ...delivery,
         status: 'merged',
+        completion_method: 'squash-merge',
         draft_pr_url: candidate.url,
         merged_pr_url: completion.pr.url || candidate.url,
         merged_head: head.stdout,
@@ -218,7 +295,15 @@ function run(rawInput, options = {}) {
     return rawInput;
   }
 
-  writeState(input, { delivery: { ...delivery, status: 'draft-pr', draft_pr_url: candidate.url, completed_at: new Date().toISOString() } }, env);
+  writeState(input, {
+    delivery: {
+      ...delivery,
+      status: 'draft-pr',
+      completion_method: 'draft-pr',
+      draft_pr_url: candidate.url,
+      completed_at: new Date().toISOString()
+    }
+  }, env);
   return rawInput;
 }
 
