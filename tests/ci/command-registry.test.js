@@ -11,8 +11,10 @@ const path = require('path');
 
 const {
   checkRegistry,
+  extractDeclaredType,
   formatRegistry,
   generateRegistry,
+  inferCommandType,
   parseArgs,
   run,
   writeRegistry,
@@ -91,6 +93,39 @@ function runTests() {
       assert.deepStrictEqual(registry.commands[1].skills, ['tdd-workflow']);
       assert.deepStrictEqual(registry.statistics.byType, { review: 1, testing: 1 });
       assert.deepStrictEqual(registry.statistics.topAgents[0], { agent: 'code-reviewer', count: 1 });
+    } finally {
+      cleanupTestDir(testDir);
+    }
+  })) passed++; else failed++;
+
+  if (test('frontmatter type declaration wins over body keyword inference', () => {
+    const testDir = createTestDir();
+    try {
+      writeFixture(testDir);
+      const body = `# Delivery preparation
+
+It never switches branches, so a long build or test run keeps its worktree.
+`;
+      fs.writeFileSync(
+        path.join(testDir, 'commands', 'delivery.md'),
+        `---\ndescription: Prepare the delivery\ntype: general\n---\n${body}`
+      );
+      fs.writeFileSync(
+        path.join(testDir, 'commands', 'unknown-type.md'),
+        `---\ndescription: Prepare the delivery\ntype: bogus\n---\n${body}`
+      );
+
+      // 本文だけなら "test" で testing と誤分類される組み合わせを使う。
+      assert.strictEqual(inferCommandType(body, 'delivery'), 'testing');
+      assert.strictEqual(extractDeclaredType(`---\ndescription: x\ntype: general\n---\n`), 'general');
+      assert.strictEqual(extractDeclaredType(`---\ndescription: x\ntype: bogus\n---\n`), '');
+      assert.strictEqual(extractDeclaredType('# No frontmatter\n'), '');
+
+      const registry = generateRegistry({ root: testDir });
+      const byName = Object.fromEntries(registry.commands.map(command => [command.command, command]));
+      assert.strictEqual(byName.delivery.type, 'general');
+      assert.strictEqual(byName.delivery.description, 'Prepare the delivery');
+      assert.strictEqual(byName['unknown-type'].type, 'testing');
     } finally {
       cleanupTestDir(testDir);
     }

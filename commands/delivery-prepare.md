@@ -1,5 +1,6 @@
 ---
 description: Prepare the required GitHub Issue and issue-linked branch before editing.
+type: general
 ---
 
 # ECC deterministic delivery preparation
@@ -24,3 +25,8 @@ delivery as `awaiting-branch` and reports the required switch in the
 same request on stderr. Finish or stop any running verification, run that exact
 command yourself, then run the preparer again to reach `ready`. The Delivery Gate
 allows that one switch command while the delivery waits for it.
+
+Both refs in that command must be shell-safe (letters, digits, `.`, `_`, `/`, `-`,
+no leading `-` and no `..`). Git also accepts refs containing `;`, `&` or `$()`,
+which a shell would read as several commands, so the preparer refuses them instead
+of handing back a command the Delivery Gate would reject.

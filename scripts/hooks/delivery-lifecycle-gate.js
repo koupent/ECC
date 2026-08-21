@@ -4,6 +4,7 @@
 const { spawnSync } = require('child_process');
 const path = require('path');
 const { loadConfig } = require('../codex/config');
+const { isSafeGitRef } = require('../codex/delivery-lifecycle');
 const { readState, recordIncident, resolveSessionId, writeState } = require('../codex/runtime-state');
 
 function deny(reason) {
@@ -69,6 +70,10 @@ function isExactBranchSwitchCommand(command, delivery) {
   const value = String(command || '').trim();
   const handoff = delivery && delivery.branch_switch;
   if (!value || !handoff || !handoff.to || hasExecutableShellControl(value)) return false;
+  // 記録済みhandoffでも、shellが複数commandへ分割しうるrefの切替は許可しない。
+  // prepareの検証を通らないstateが残っていても、ここが実行経路にはならない。
+  if (!isSafeGitRef(handoff.to)) return false;
+  if (handoff.create && !isSafeGitRef(handoff.base_branch)) return false;
   const expected = handoff.create
     ? ['git', 'switch', '-c', handoff.to, handoff.base_branch]
     : ['git', 'switch', handoff.to];

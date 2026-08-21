@@ -14,6 +14,10 @@ const DIAGNOSTIC_REQUEST = /(?:\b(?:investigate|review|analy[sz]e|diagnose|inspe
 const EXPLICIT_MUTATION_REQUEST = /(?:\b(?:implement|fix|add|remove|refactor|build|create|update)\b|(?:実装|修正|変更|追加|削除|作成|更新|直)(?:を)?(?:して|する|してください|してほしい|したい|せよ))/i;
 const ACTIVE_DELIVERY_STATUSES = new Set(['deferred', 'pending', 'awaiting-branch', 'ready']);
 const PREPARABLE_DELIVERY_STATUSES = new Set(['deferred', 'pending', 'awaiting-branch']);
+// Gitは `;` `&` `$()` を含むrefを有効と認めるが、そのrefを手渡しの切替コマンドへ
+// 埋めると複数のshell commandとして解釈されうる。この文字集合はshellのmetacharacterを
+// 一切含まないので、通過したrefは追加の引用なしでコマンド文字列へ入れて安全である。
+const SAFE_GIT_REF = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 
 function isActiveDelivery(delivery) {
   return Boolean(delivery && ACTIVE_DELIVERY_STATUSES.has(delivery.status));
@@ -59,6 +63,23 @@ function normalizeIssueTitle(value) {
     .normalize('NFKC')
     .toLowerCase()
     .replace(/[\s\u3000()[\]{}「」『』【】]/g, '');
+}
+
+function isSafeGitRef(value) {
+  const ref = String(value || '');
+  // 先頭ハイフンはgit自身へのoption injectionになるため、SAFE_GIT_REFの先頭文字で弾く。
+  return SAFE_GIT_REF.test(ref) && !ref.includes('..') && !ref.endsWith('.lock');
+}
+
+function assertSafeGitRef(value, label) {
+  const ref = String(value || '');
+  if (!isSafeGitRef(ref)) {
+    throw new Error(
+      `${label} "${ref}" is not shell-safe; Git accepts characters such as ; & | $() that would turn the handed-off switch command into several commands. ` +
+        "Use only letters, digits, '.', '_', '/' and '-' (no leading '-' and no '..'), then run this command again."
+    );
+  }
+  return ref;
 }
 
 function deliveryBranch(issueNumber, title, currentBranch = '') {
@@ -213,17 +234,21 @@ function findExistingDeliveryPr(delivery, currentBranch, options = {}) {
 
 function branchSwitchPlan(delivery, branch, currentBranch, options = {}) {
   const execute = options.runCommand || runCommand;
-  const exists = Boolean(execute('git', ['branch', '--list', branch], options));
+  // 検証はgitへ渡す前に行う。危険なrefは案内コマンドに現れないうえ、Gateも同じ判定で
+  // 拒否するため、実行できない切替を指示してawaiting-branchのまま詰むことがない。
+  const target = assertSafeGitRef(branch, 'Delivery branch');
+  const exists = Boolean(execute('git', ['branch', '--list', target], options));
   // 作成が必要なbranchは、要求を出す前にbaseの存在まで確かめる。切替をエージェントへ
   // 委ねても、解決できないbaseを指したまま手詰まりにならないようにする。
-  if (!exists) execute('git', ['rev-parse', '--verify', delivery.base_branch], options);
+  const base = exists ? null : assertSafeGitRef(delivery.base_branch, 'Delivery base branch');
+  if (!exists) execute('git', ['rev-parse', '--verify', base], options);
   return {
     required: true,
     from: currentBranch || '<detached>',
-    to: branch,
+    to: target,
     create: !exists,
-    base_branch: exists ? null : delivery.base_branch,
-    command: exists ? `git switch ${branch}` : `git switch -c ${branch} ${delivery.base_branch}`
+    base_branch: base,
+    command: exists ? `git switch ${target}` : `git switch -c ${target} ${base}`
   };
 }
 
@@ -348,6 +373,7 @@ module.exports = {
   initializeDelivery,
   isActiveDelivery,
   isDeliveryRequest,
+  isSafeGitRef,
   normalizeIssueTitle,
   parseIssueNumber,
   pendingSessionForProject,

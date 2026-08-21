@@ -47,6 +47,7 @@ const {
   findExistingDeliveryPr,
   initializeDelivery,
   isDeliveryRequest,
+  isSafeGitRef,
   normalizeIssueTitle,
   parseIssueNumber,
   pendingSessionForProject,
@@ -557,6 +558,59 @@ test('branch switch handoff reports an existing branch without creating or switc
     command: 'git switch codex/issue-68-existing'
   });
   assert.ok(executed.every(command => !command.includes('switch')));
+});
+
+test('branch switch handoff refuses Git refs that a shell would read as several commands', () => {
+  const executed = [];
+  const runCommand = (binary, args) => {
+    executed.push([binary, ...args].join(' '));
+    return '';
+  };
+
+  for (const ref of [
+    'codex/issue-68;git push --force',
+    'codex/issue-68&make',
+    'codex/issue-68$(make)',
+    'codex/issue-68|tee x',
+    'codex/issue 68',
+    '-codex/issue-68',
+    'codex/issue-68/../main'
+  ]) {
+    assert.throws(
+      () => branchSwitchPlan({ base_branch: 'main' }, ref, 'main', { runCommand }),
+      /not shell-safe/,
+      ref
+    );
+    assert.strictEqual(isSafeGitRef(ref), false, ref);
+  }
+  assert.throws(
+    () => branchSwitchPlan({ base_branch: 'main;make' }, 'codex/issue-68-safe-ref', 'main', { runCommand }),
+    /Delivery base branch .* not shell-safe/
+  );
+  // 危険なrefはgitへも渡らない。先頭ハイフンのrefで `git branch --list` がoptionとして
+  // 解釈されることも、切替が実行されることもない。
+  assert.ok(executed.every(command => !command.includes('switch') && !command.includes('-codex/issue-68')));
+
+  const plan = branchSwitchPlan({ base_branch: 'main' }, 'codex/issue-68-safe-ref', 'main', { runCommand });
+  assert.strictEqual(plan.command, 'git switch -c codex/issue-68-safe-ref main');
+
+  // stateへ危険なrefが残っていても、Gateは記録済みhandoffとして実行を許可しない。
+  const tampered = {
+    branch: 'codex/issue-68;make',
+    branch_switch: {
+      required: true,
+      from: 'main',
+      to: 'codex/issue-68;make',
+      create: false,
+      base_branch: null,
+      command: 'git switch codex/issue-68;make'
+    }
+  };
+  assert.strictEqual(deliveryGate.isExactBranchSwitchCommand(tampered.branch_switch.command, tampered), false);
+  assert.strictEqual(deliveryGate.isExactBranchSwitchCommand("git switch 'codex/issue-68;make'", tampered), false);
+  assert.strictEqual(deliveryGate.isExactBranchSwitchCommand('git switch codex/issue-68-safe-ref', {
+    branch_switch: { required: true, to: 'codex/issue-68-safe-ref', create: false, base_branch: null }
+  }), true);
 });
 
 test('delivery preparation resolves the unique pending project session without relying on Bash environment propagation', () => {
