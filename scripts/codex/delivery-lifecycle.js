@@ -154,10 +154,11 @@ function initializeDelivery(input, request, options = {}) {
     // Issue・branch・Draft PR参照はstateに退避し、記録から消さない。
     superseded = active;
   } else {
-    if (current.delivery && current.delivery.request_hash === requestHash) return current.delivery;
     // Claude Code の継続turnでは、ユーザーの追記文面が変わっても同じDeliveryである。
     // 進行中Deliveryを本文ハッシュだけで上書きすると、Context Builder、Issue、branchが
     // 二重に作られるため、マージ完了または明示的な新規Session/resetまでは既存Deliveryを維持する。
+    // 逆に完了済み(merged)のDeliveryは、同じ文面を再送されても再利用しない。再利用すると
+    // 全Gateがmerged扱いのまま素通りし、Issueもbranchも無い状態で次の変更が進んでしまう。
     if (active) return active;
   }
 
@@ -175,13 +176,12 @@ function initializeDelivery(input, request, options = {}) {
     branch: null,
     draft_pr_url: null
   };
-  writeState(
-    input,
-    superseded
-      ? { delivery, project: projectFingerprint(cwd), previous_delivery: superseded, ...CLEARED_REVIEW_EVIDENCE }
-      : { delivery, project: projectFingerprint(cwd) },
-    env
-  );
+  // 新しいDeliveryが前のDeliveryのreview証拠を引き継ぐと、1度もcommitしていない状態で
+  // Completion Gateを満たし得るため、置き換え時は常に証拠を初期化する。
+  const patch = { delivery, project: projectFingerprint(cwd), ...CLEARED_REVIEW_EVIDENCE };
+  // 別のIssue/PRのために脇へ退けた進行中Deliveryだけは、参照を消さずstateへ残す。
+  if (superseded) patch.previous_delivery = superseded;
+  writeState(input, patch, env);
   return delivery;
 }
 

@@ -87,12 +87,10 @@ function run(rawInput, options = {}) {
         additionalContext: [
           '[ECC Codex Context Builder cached packet]',
           'Reuse the existing task context below. Do not rerun broad exploration.',
-          delivery && ['deferred', 'pending'].includes(delivery.status)
-            ? prepareInstruction
-            : '',
+          delivery && ['deferred', 'pending'].includes(delivery.status) ? prepareInstruction : null,
           'This packet is bound to the active Delivery. Follow-up prompts reuse it until the Delivery completes.',
           JSON.stringify(existing.context)
-        ].join('\n')
+        ].filter(Boolean).join('\n')
       }
     });
   }
@@ -115,12 +113,10 @@ function run(rawInput, options = {}) {
     ? [
         '[ECC Codex Context Builder]',
         'Codex completed the initial repository investigation. Do not repeat broad exploration already covered below.',
-        delivery && ['deferred', 'pending'].includes(delivery.status)
-          ? prepareInstruction
-          : '',
+        delivery && ['deferred', 'pending'].includes(delivery.status) ? prepareInstruction : null,
         'If GateGuard requests first-touch facts, present the relevant facts from this packet and retry; do not re-read the same files merely to satisfy the gate.',
         JSON.stringify(output.result)
-      ].join('\n')
+      ].filter(Boolean).join('\n')
     : [
         '[ECC Codex Context Builder fallback]',
         `Codex was unavailable or invalid: ${output.error}`,

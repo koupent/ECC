@@ -526,6 +526,52 @@ test('a request naming another Issue starts a new pending delivery that keeps th
   assert.match(stopped.reason, /has not been prepared/);
 });
 
+test('a completed delivery is not reused when the same request text is sent again', () => {
+  const fixture = createGitFixture('delivery-merged-repeat-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-merged-repeat-state') };
+  const input = { session_id: 'delivery-merged-repeat', cwd: fixture };
+  const request = 'Issue #88 の配信不具合を修正してください';
+  const first = initializeDelivery(input, request, { cwd: fixture, env: fixtureEnv });
+  writeState(input, {
+    delivery: {
+      ...first,
+      status: 'merged',
+      issue_number: 88,
+      branch: 'codex/issue-88-task',
+      draft_pr_url: 'https://example.invalid/pull/89',
+      merged_pr_url: 'https://example.invalid/pull/89',
+      merged_head: 'deadbeef',
+      completed_at: '2026-08-20T14:29:52.372Z'
+    },
+    review_role: 'review',
+    review_status: 'ok',
+    review_complete: true,
+    review_head: 'deadbeef',
+    review_worktree_clean: true,
+    review_blocking_findings: 0
+  }, fixtureEnv);
+
+  // 完了済みDeliveryを本文ハッシュだけで再利用すると、mergedのまま全Gateが素通りする。
+  const repeated = initializeDelivery(input, request, { cwd: fixture, env: fixtureEnv });
+  assert.strictEqual(repeated.status, 'pending');
+  assert.strictEqual(repeated.requested_issue_number, 88);
+  assert.strictEqual(repeated.issue_number, null);
+  assert.strictEqual(repeated.draft_pr_url, null);
+  // 前のDeliveryのreview証拠も引き継がない。
+  const state = readState(input, fixtureEnv);
+  assert.strictEqual(state.review_status, null);
+  assert.strictEqual(state.review_head, null);
+  const edit = JSON.stringify({ ...input, tool_name: 'Edit', tool_input: { file_path: path.join(fixture, 'src', 'product.ts') } });
+  const denied = JSON.parse(deliveryGate.run(edit, { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(denied.hookSpecificOutput.permissionDecisionReason, /delivery-lifecycle\.js/);
+});
+
 test('Context Builder distinguishes unavailable evidence from verified absence and avoids delivery diagnostics', () => {
   const instructions = roleInstructions('context-builder', 'Issue #9を修正してください');
   assert.match(instructions, /unverified/i);
