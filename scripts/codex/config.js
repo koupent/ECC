@@ -22,9 +22,11 @@ function findProjectRoot(start = process.cwd()) {
   return path.resolve(start);
 }
 
-function readProjectConfig(cwd = process.cwd()) {
+function readProjectConfig(cwd = process.cwd(), env = process.env) {
   const root = findProjectRoot(cwd);
-  const file = path.join(root, '.ecc', 'config.json');
+  const file = env.ECC_PROJECT_CONFIG
+    ? path.resolve(env.ECC_PROJECT_CONFIG)
+    : path.join(root, '.ecc', 'config.json');
   try {
     return { root, file, exists: true, value: JSON.parse(fs.readFileSync(file, 'utf8')) };
   } catch {
@@ -33,9 +35,10 @@ function readProjectConfig(cwd = process.cwd()) {
 }
 
 function loadConfig(cwd = process.cwd(), env = process.env) {
-  const project = readProjectConfig(cwd);
+  const project = readProjectConfig(cwd, env);
   const codex = project.value.codex || {};
   const mergeGate = project.value.mergeGate || {};
+  const incidentHandling = project.value.incidentHandling || {};
   return {
     projectRoot: project.root,
     projectConfigPath: project.file,
@@ -47,9 +50,12 @@ function loadConfig(cwd = process.cwd(), env = process.env) {
     effort: env.ECC_CODEX_REASONING_EFFORT || codex.reasoningEffort || 'high',
     timeoutSeconds: Number(env.ECC_CODEX_TIMEOUT_SECONDS || codex.timeoutSeconds || 1800),
     externalSandbox: envEnabled(env.ECC_CODEX_EXTERNAL_SANDBOX, false),
-    centralIncidentRepo: env.ECC_INCIDENT_REPOSITORY || codex.incidentRepository || 'koupent/engineering-environment-kit',
+    centralIncidentRepo: env.ECC_INCIDENT_REPOSITORY || incidentHandling.repository || codex.incidentRepository || 'koupent/engineering-environment-kit',
     forkRepo: env.ECC_FORK_REPOSITORY || codex.forkRepository || 'koupent/ECC',
-    autoRemediation: envEnabled(env.ECC_INCIDENT_AUTO_REMEDIATE, codex.autoRemediation === true),
+    incidentHandling: {
+      mode: env.ECC_INCIDENT_HANDLING_MODE || incidentHandling.mode || 'report-only',
+      repository: env.ECC_INCIDENT_REPOSITORY || incidentHandling.repository || codex.incidentRepository || 'koupent/engineering-environment-kit'
+    },
     deliveryWorkflow: env.ECC_DELIVERY_WORKFLOW || project.value.deliveryWorkflow || 'advisory',
     deliveryBaseBranch: env.ECC_DELIVERY_BASE_BRANCH || project.value.deliveryBaseBranch || 'main',
     deliveryCompletion: env.ECC_DELIVERY_COMPLETION || project.value.deliveryCompletion || 'draft-pr',

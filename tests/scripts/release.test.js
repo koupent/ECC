@@ -126,15 +126,20 @@ function runTests() {
     );
   })) passed++; else failed++;
 
-  if (test('CI runs for release branches and version tags before release workflows execute', () => {
-    const pushBlockMatch = normalizedCiWorkflowSource.match(/on:\n\s+push:\n([\s\S]*?)\n\s+pull_request:/);
+  if (test('CI runs only for release branches and version tags before release workflows execute', () => {
+    const pushBlockMatch = normalizedCiWorkflowSource.match(/on:\n\s+push:\n([\s\S]*?)\n\s+workflow_dispatch:/);
     const pushBlock = pushBlockMatch ? pushBlockMatch[1] : '';
 
     assert.ok(pushBlock, 'ci.yml should define a push trigger block');
     assert.match(
       pushBlock,
-      /branches:\s*\[[^\]]*main[^\]]*['"]release\/\*\*['"][^\]]*\]/,
+      /branches:\s*\[[^\]]*['"]release\/\*\*['"][^\]]*\]/,
       'ci.yml push branches should include release/**'
+    );
+    assert.doesNotMatch(
+      pushBlock,
+      /branches:\s*\[[^\]]*main[^\]]*\]/,
+      'ci.yml must not spend Actions on routine main pushes'
     );
     assert.match(
       pushBlock,

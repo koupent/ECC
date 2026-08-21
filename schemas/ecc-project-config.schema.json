@@ -34,6 +34,15 @@
       "items": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" }
     },
     "legacyGitHooksPath": { "const": "remove" },
+    "incidentHandling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "repository"],
+      "properties": {
+        "mode": { "enum": ["report-only", "central-remediate"] },
+        "repository": { "const": "koupent/engineering-environment-kit" }
+      }
+    },
     "devcontainer": {
       "type": "object",
       "additionalProperties": false,
@@ -92,8 +101,7 @@
         "reasoningEffort": { "enum": ["low", "medium", "high", "xhigh"] },
         "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 7200 },
         "incidentRepository": { "type": "string", "pattern": "^[^/]+/[^/]+$" },
-        "forkRepository": { "const": "koupent/ECC" },
-        "autoRemediation": { "type": "boolean" }
+        "forkRepository": { "const": "koupent/ECC" }
       }
     }
   }

@@ -2,10 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, 'release/**']
+    branches: ['release/**']
     tags: ['v*']
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 # Prevent duplicate runs
 concurrency:

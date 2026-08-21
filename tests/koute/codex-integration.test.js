@@ -21,15 +21,19 @@ const {
   acquireLock,
   classifyTarget,
   eligible,
-  ensureForkTarget,
   publicIncident
 } = require('../../scripts/codex/incident-worker');
+const {
+  assertCentralRemediationAllowed,
+  readOperatorAttestation
+} = require('../../scripts/codex/incident-ownership');
 const { record } = require('../../scripts/codex/record-event');
 const contextGate = require('../../scripts/hooks/codex-context-gate');
 const contextBuilder = require('../../scripts/hooks/codex-context-builder');
 const deliveryGate = require('../../scripts/hooks/delivery-lifecycle-gate');
 const deliveryCompletion = require('../../scripts/hooks/delivery-completion-gate');
 const localMergePolicy = require('../../scripts/hooks/local-merge-policy-gate');
+const incidentOwnershipGate = require('../../scripts/hooks/incident-ownership-gate');
 const { PRE_BASH_HOOKS } = require('../../scripts/hooks/bash-hook-dispatcher');
 const deliveryProgress = require('../../scripts/hooks/delivery-progress');
 const deliveryFinalizer = require('../../scripts/hooks/delivery-session-finalizer');
@@ -180,6 +184,28 @@ test('project config opts into standard Codex integration', () => {
   assert.strictEqual(config.deliveryWorkflow, 'advisory');
   assert.strictEqual(config.deliveryCompletion, 'draft-pr');
   assert.strictEqual(config.mergeGate.statusContext, 'Local Merge Gate');
+  assert.deepStrictEqual(config.incidentHandling, {
+    mode: 'report-only',
+    repository: 'koupent/engineering-environment-kit'
+  });
+});
+
+test('operator may load an external central-remediate config without modifying the target clone', () => {
+  const configFile = path.join(temp, 'operator-config.json');
+  fs.writeFileSync(configFile, JSON.stringify({
+    version: 1,
+    profile: 'standard',
+    rulePacks: ['common'],
+    incidentHandling: {
+      mode: 'central-remediate',
+      repository: 'koupent/engineering-environment-kit'
+    },
+    codex: { enabled: true }
+  }), 'utf8');
+  const config = loadConfig(repo, { ...env, ECC_PROJECT_CONFIG: configFile });
+  assert.strictEqual(config.projectConfigPath, configFile);
+  assert.strictEqual(config.projectRoot, repo);
+  assert.strictEqual(config.incidentHandling.mode, 'central-remediate');
 });
 
 test('project config opts into commit-status backed squash merge completion', () => {
@@ -1314,8 +1340,10 @@ test('incident worker lock prevents concurrent reporting and releases cleanly', 
   reacquired();
 });
 
-test('background incident remediation is opt-in', () => {
-  assert.strictEqual(loadConfig(repo, env).autoRemediation, false);
+test('product incident handling is report-only and has no background remediation switch', () => {
+  const config = loadConfig(repo, { ...env, ECC_INCIDENT_AUTO_REMEDIATE: '1' });
+  assert.strictEqual(config.incidentHandling.mode, 'report-only');
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(config, 'autoRemediation'), false);
 });
 
 test('incident recorder increments identical fingerprints', () => {
@@ -1336,9 +1364,85 @@ test('project quality runners record evidence and incidents in external state', 
   assert.throws(() => record(['incident', 'ai_qa_abort', 'unsafe', 'x'], { cwd: repo, env }), /usage/);
 });
 
-test('public remediation is hard-locked to koupent/ECC', () => {
-  assert.doesNotThrow(() => ensureForkTarget('koupent/ECC'));
-  assert.throws(() => ensureForkTarget('affaan-m/ECC'), /exactly koupent\/ECC/);
+test('central remediation requires a private operator attestation and a permitted target', () => {
+  const operatorState = path.join(temp, 'operator-state');
+  fs.mkdirSync(operatorState, { recursive: true });
+  const attestation = path.join(operatorState, 'attestation.json');
+  fs.writeFileSync(attestation, JSON.stringify({
+    schemaVersion: 1,
+    owner: 'engineering-environment-kit-operator',
+    repositories: ['koupent/engineering-environment-kit', 'koupent/ECC']
+  }), { mode: 0o600 });
+  const operatorEnv = {
+    ...env,
+    ECC_OPERATOR_STATE_ROOT: operatorState,
+    ECC_OPERATOR_ATTESTATION: attestation
+  };
+
+  assert.strictEqual(readOperatorAttestation(operatorEnv).owner, 'engineering-environment-kit-operator');
+  assert.doesNotThrow(() => assertCentralRemediationAllowed({
+    mode: 'central-remediate',
+    targetRepository: 'koupent/ECC',
+    env: operatorEnv
+  }));
+  assert.throws(() => assertCentralRemediationAllowed({
+    mode: 'central-remediate',
+    targetRepository: 'koupent/av-cast-link',
+    env: operatorEnv
+  }), /許可されていません/);
+  assert.throws(() => assertCentralRemediationAllowed({
+    mode: 'central-remediate',
+    targetRepository: 'koupent/ECC',
+    env
+  }), /state root|attestation/);
+  assert.throws(() => assertCentralRemediationAllowed({
+    mode: 'report-only',
+    targetRepository: 'koupent/ECC',
+    env: operatorEnv
+  }), /report-only/);
+});
+
+test('incident ownership Hook rejects product-side remediation and accepts an attested operator', () => {
+  const raw = JSON.stringify({
+    tool_name: 'Bash',
+    cwd: repo,
+    tool_input: { command: 'engineering-kit-incident-operator run-once' }
+  });
+  const denied = JSON.parse(incidentOwnershipGate.run(raw, { cwd: repo, env }));
+  assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny');
+
+  const operatorState = path.join(temp, 'operator-hook-state');
+  fs.mkdirSync(operatorState, { recursive: true });
+  const attestation = path.join(operatorState, 'attestation.json');
+  const configFile = path.join(operatorState, 'config.json');
+  fs.writeFileSync(attestation, JSON.stringify({
+    schemaVersion: 1,
+    owner: 'engineering-environment-kit-operator',
+    repositories: ['koupent/engineering-environment-kit', 'koupent/ECC']
+  }), { mode: 0o600 });
+  fs.writeFileSync(configFile, JSON.stringify({
+    version: 1,
+    profile: 'standard',
+    rulePacks: ['common'],
+    incidentHandling: { mode: 'central-remediate', repository: 'koupent/engineering-environment-kit' }
+  }));
+  const operatorEnv = {
+    ...env,
+    ECC_OPERATOR_STATE_ROOT: operatorState,
+    ECC_PROJECT_CONFIG: configFile,
+    ECC_OPERATOR_ATTESTATION: attestation,
+    ECC_OPERATOR_TARGET_REPOSITORY: 'koupent/ECC'
+  };
+  assert.strictEqual(incidentOwnershipGate.run(raw, { cwd: repo, env: operatorEnv }), raw);
+  const productClone = JSON.stringify({
+    tool_name: 'Bash',
+    cwd: repo,
+    tool_input: { command: 'gh repo clone koupent/ECC /tmp/ecc-repair' }
+  });
+  const cloneDenied = JSON.parse(incidentOwnershipGate.run(productClone, { cwd: repo, env }));
+  assert.strictEqual(cloneDenied.hookSpecificOutput.permissionDecision, 'deny');
+  assert.strictEqual(incidentOwnershipGate.run(productClone, { cwd: repo, env: operatorEnv }), productClone);
+  assert.ok(PRE_BASH_HOOKS.some(hook => hook.id === 'pre:bash:incident-ownership'));
 });
 
 test('public incident payload redacts absolute paths and secrets', () => {
