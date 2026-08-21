@@ -39,6 +39,7 @@ const deliveryProgress = require('../../scripts/hooks/delivery-progress');
 const deliveryFinalizer = require('../../scripts/hooks/delivery-session-finalizer');
 const configProtection = require('../../scripts/hooks/config-protection');
 const {
+  branchSwitchPlan,
   explicitIssueNumber,
   explicitPrNumber,
   deliveryBranch,
@@ -49,6 +50,7 @@ const {
   normalizeIssueTitle,
   parseIssueNumber,
   pendingSessionForProject,
+  prepareDelivery,
   selectDeliveryBranch,
   slug,
   titleFromRequest
@@ -470,6 +472,88 @@ test('required delivery gate blocks edits until issue and branch evidence are re
   writeState(input, { delivery: { ...delivery, status: 'draft-pr', issue_number: 42, branch } }, fixtureEnv);
   assert.strictEqual(deliveryGate.run(bash, { cwd: fixture, env: fixtureEnv }), bash);
   assert.strictEqual(deliveryGate.run(raw, { cwd: fixture, env: fixtureEnv }), raw);
+});
+
+test('preparation hands the branch switch to the agent instead of moving a running verification', () => {
+  const fixture = createGitFixture('delivery-branch-handoff-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  assert.strictEqual(spawnSync('git', ['add', '.ecc/config.json'], { cwd: fixture }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'require delivery workflow'], { cwd: fixture }).status, 0);
+  const baseBranch = spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-branch-handoff-state') };
+  const input = { session_id: 'delivery-branch-handoff', cwd: fixture };
+  const branch = 'codex/issue-68-branch-handoff';
+  writeState(input, {
+    delivery: {
+      status: 'awaiting-branch',
+      request_hash: 'handoff-fixture',
+      title: 'preparation must not switch branches',
+      base_branch: baseBranch,
+      issue_number: 68,
+      issue_url: 'https://example.invalid/issues/68',
+      branch,
+      draft_pr_url: null
+    }
+  }, fixtureEnv);
+
+  const handoff = prepareDelivery(input, { cwd: fixture, env: fixtureEnv });
+  assert.strictEqual(handoff.status, 'awaiting-branch');
+  assert.strictEqual(handoff.branch_switch.create, true);
+  assert.strictEqual(handoff.branch_switch.command, `git switch -c ${branch} ${baseBranch}`);
+  assert.strictEqual(spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim(), baseBranch);
+  assert.strictEqual(spawnSync('git', ['branch', '--list', branch], { cwd: fixture, encoding: 'utf8' }).stdout.trim(), '');
+
+  const recorded = readState(input, fixtureEnv);
+  assert.strictEqual(deliveryGate.isExactBranchSwitchCommand(`git switch -c ${branch} ${baseBranch}`, recorded.delivery), true);
+  assert.strictEqual(deliveryGate.isExactBranchSwitchCommand(`git switch -c ${branch} ${baseBranch} && npm run build`, recorded.delivery), false);
+  assert.strictEqual(deliveryGate.isExactBranchSwitchCommand(`git switch ${branch}`, recorded.delivery), false);
+
+  const switchCommand = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: `git switch -c ${branch} ${baseBranch}` } });
+  assert.strictEqual(deliveryGate.run(switchCommand, { cwd: fixture, env: fixtureEnv }), switchCommand);
+  const otherBash = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: 'npm test' } });
+  assert.strictEqual(
+    JSON.parse(deliveryGate.run(otherBash, { cwd: fixture, env: fixtureEnv })).hookSpecificOutput.permissionDecision,
+    'deny'
+  );
+  const edit = JSON.stringify({ ...input, tool_name: 'Edit', tool_input: { file_path: path.join(fixture, 'src', 'product.ts') } });
+  const denied = JSON.parse(deliveryGate.run(edit, { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(denied.hookSpecificOutput.permissionDecisionReason, /no longer switches branches/);
+
+  const stop = JSON.parse(deliveryCompletion.run(JSON.stringify(input), { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(stop.decision, 'block');
+  assert.match(stop.reason, /waiting for the branch switch/);
+
+  assert.strictEqual(spawnSync('git', ['switch', '--quiet', '-c', branch, baseBranch], { cwd: fixture }).status, 0);
+  const ready = prepareDelivery(input, { cwd: fixture, env: fixtureEnv });
+  assert.strictEqual(ready.status, 'ready');
+  assert.strictEqual(ready.branch, branch);
+  assert.strictEqual(ready.issue_number, 68);
+  assert.strictEqual(ready.branch_switch, null);
+  assert.strictEqual(deliveryGate.run(edit, { cwd: fixture, env: fixtureEnv }), edit);
+});
+
+test('branch switch handoff reports an existing branch without creating or switching one', () => {
+  const executed = [];
+  const plan = branchSwitchPlan({ base_branch: 'main' }, 'codex/issue-68-existing', 'codex/issue-271-task', {
+    runCommand(binary, args) {
+      executed.push([binary, ...args].join(' '));
+      return args[0] === 'branch' ? '  codex/issue-68-existing' : '';
+    }
+  });
+  assert.deepStrictEqual(plan, {
+    required: true,
+    from: 'codex/issue-271-task',
+    to: 'codex/issue-68-existing',
+    create: false,
+    base_branch: null,
+    command: 'git switch codex/issue-68-existing'
+  });
+  assert.ok(executed.every(command => !command.includes('switch')));
 });
 
 test('delivery preparation resolves the unique pending project session without relying on Bash environment propagation', () => {

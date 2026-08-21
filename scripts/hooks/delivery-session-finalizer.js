@@ -13,7 +13,7 @@ const {
   writeState
 } = require('../codex/runtime-state');
 
-const ACTIVE = new Set(['pending', 'ready']);
+const ACTIVE = new Set(['pending', 'awaiting-branch', 'ready']);
 
 function reportIncomplete(input, state, options = {}) {
   const env = options.env || process.env;

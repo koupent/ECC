@@ -14,6 +14,12 @@ function shouldSkip(prompt) {
   return !value || /^\/(?:ecc:)?(?:codex-|help|clear|compact|status)/i.test(value);
 }
 
+// awaiting-branchは、Issueとbranchを記録済みでも手動切替とprepare再実行が残る状態である。
+// prepareの案内を外すと、その最後の一手が指示されないまま止まる。
+function needsPreparation(delivery) {
+  return Boolean(delivery && ['deferred', 'pending', 'awaiting-branch'].includes(delivery.status));
+}
+
 function isPlanMode(input) {
   const mode = input && (input.permission_mode || input.permissionMode);
   return String(mode || '').toLowerCase() === 'plan';
@@ -87,9 +93,7 @@ function run(rawInput, options = {}) {
         additionalContext: [
           '[ECC Codex Context Builder cached packet]',
           'Reuse the existing task context below. Do not rerun broad exploration.',
-          delivery && ['deferred', 'pending'].includes(delivery.status)
-            ? prepareInstruction
-            : '',
+          needsPreparation(delivery) ? prepareInstruction : '',
           'This packet is bound to the active Delivery. Follow-up prompts reuse it until the Delivery completes.',
           JSON.stringify(existing.context)
         ].join('\n')
@@ -115,9 +119,7 @@ function run(rawInput, options = {}) {
     ? [
         '[ECC Codex Context Builder]',
         'Codex completed the initial repository investigation. Do not repeat broad exploration already covered below.',
-        delivery && ['deferred', 'pending'].includes(delivery.status)
-          ? prepareInstruction
-          : '',
+        needsPreparation(delivery) ? prepareInstruction : '',
         'If GateGuard requests first-touch facts, present the relevant facts from this packet and retry; do not re-read the same files merely to satisfy the gate.',
         JSON.stringify(output.result)
       ].join('\n')
@@ -144,4 +146,4 @@ if (require.main === module) {
   process.stdin.on('end', () => process.stdout.write(run(raw)));
 }
 
-module.exports = { isPlanMode, requestWithExplicitIssueSnapshot, run, shouldSkip };
+module.exports = { isPlanMode, needsPreparation, requestWithExplicitIssueSnapshot, run, shouldSkip };

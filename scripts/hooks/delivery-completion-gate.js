@@ -123,6 +123,13 @@ function run(rawInput, options = {}) {
   if (delivery.status === 'pending') {
     return block('The required delivery has not been prepared. Run `/ecc:delivery-prepare` so Issue deduplication and the issue-linked branch are recorded before continuing.');
   }
+  if (delivery.status === 'awaiting-branch') {
+    const handoff = delivery.branch_switch || {};
+    return block(
+      `Issue #${delivery.issue_number} is recorded, but the delivery is still waiting for the branch switch that preparation deliberately leaves to you. ` +
+        `Run \`${handoff.command || `git switch ${delivery.branch}`}\` once no verification is running, then run \`/ecc:delivery-prepare\` again.`
+    );
+  }
   if (delivery.status !== 'ready') return rawInput;
 
   const execute = options.command || command;

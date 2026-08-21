@@ -12,7 +12,8 @@ const DELIVERY_COMPLETION_REQUEST = /(?:\b(?:complete|finish|finalize|deliver)\b
 const NEGATED_DELIVERY_REQUEST = /(?:\b(?:do\s+not|don't|without)\s+(?:implement(?:ing)?|fix(?:ing)?|chang(?:e|ing)|add(?:ing)?|remov(?:e|ing)|refactor(?:ing)?|build(?:ing)?|creat(?:e|ing)|updat(?:e|ing))\b|(?:実装|修正|変更|追加|削除|作成|更新)(?:は)?(?:しないで|しない|しなくてよい|せず|不要)|直さない)/gi;
 const DIAGNOSTIC_REQUEST = /(?:\b(?:investigate|review|analy[sz]e|diagnose|inspect|check)\b|調査|確認|レビュー|分析|診断|調べて|教えて)/i;
 const EXPLICIT_MUTATION_REQUEST = /(?:\b(?:implement|fix|add|remove|refactor|build|create|update)\b|(?:実装|修正|変更|追加|削除|作成|更新|直)(?:を)?(?:して|する|してください|してほしい|したい|せよ))/i;
-const ACTIVE_DELIVERY_STATUSES = new Set(['deferred', 'pending', 'ready']);
+const ACTIVE_DELIVERY_STATUSES = new Set(['deferred', 'pending', 'awaiting-branch', 'ready']);
+const PREPARABLE_DELIVERY_STATUSES = new Set(['deferred', 'pending', 'awaiting-branch']);
 
 function isActiveDelivery(delivery) {
   return Boolean(delivery && ACTIVE_DELIVERY_STATUSES.has(delivery.status));
@@ -128,7 +129,7 @@ function pendingSessionForProject(cwd, env = process.env) {
       .filter(file => file.endsWith('.json'))
       .map(file => readJson(path.join(sessionsDir, file)))
       .filter(state => state && state.project === project && state.delivery &&
-        ['deferred', 'pending'].includes(state.delivery.status))
+        PREPARABLE_DELIVERY_STATUSES.has(state.delivery.status))
       .sort((left, right) => String(right.updated_at || '').localeCompare(String(left.updated_at || '')));
   } catch {
     return '';
@@ -210,12 +211,28 @@ function findExistingDeliveryPr(delivery, currentBranch, options = {}) {
   return candidates[0] || null;
 }
 
+function branchSwitchPlan(delivery, branch, currentBranch, options = {}) {
+  const execute = options.runCommand || runCommand;
+  const exists = Boolean(execute('git', ['branch', '--list', branch], options));
+  // 作成が必要なbranchは、要求を出す前にbaseの存在まで確かめる。切替をエージェントへ
+  // 委ねても、解決できないbaseを指したまま手詰まりにならないようにする。
+  if (!exists) execute('git', ['rev-parse', '--verify', delivery.base_branch], options);
+  return {
+    required: true,
+    from: currentBranch || '<detached>',
+    to: branch,
+    create: !exists,
+    base_branch: exists ? null : delivery.base_branch,
+    command: exists ? `git switch ${branch}` : `git switch -c ${branch} ${delivery.base_branch}`
+  };
+}
+
 function prepareDelivery(input = {}, options = {}) {
   const env = options.env || process.env;
   const cwd = options.cwd || input.cwd || process.cwd();
   const state = readState(input, env);
   const delivery = state.delivery;
-  if (!delivery || !['deferred', 'pending'].includes(delivery.status)) {
+  if (!delivery || !PREPARABLE_DELIVERY_STATUSES.has(delivery.status)) {
     throw new Error('No pending required delivery task. Submit the implementation request first.');
   }
 
@@ -224,53 +241,64 @@ function prepareDelivery(input = {}, options = {}) {
     if (dirty) throw new Error('Delivery preparation requires a clean working tree; preserve or commit existing changes first.');
 
     const currentBranch = runCommand('git', ['branch', '--show-current'], { cwd, env });
-    const existingPr = findExistingDeliveryPr(delivery, currentBranch, { cwd, env });
-    let issue = findDuplicateIssue(delivery, {
-      cwd,
-      env,
-      allowClosedReferencedIssue: Boolean(existingPr)
-    });
-    if (!issue) {
-      const body = [
-        'ECC deterministic delivery workflow がユーザー要求から自動作成しました。',
-        '',
-        `Request fingerprint: \`${delivery.request_hash}\``,
-        '',
-        'このIssueに紐づくDraft PRが作成されるまで自動クローズしません。'
-      ].join('\n');
-      const url = runCommand('gh', ['issue', 'create', '--title', delivery.title, '--body', body], { cwd, env });
-      issue = { number: parseIssueNumber(url), title: delivery.title, url };
-    }
+    // 手動切替を待っているDeliveryはIssueとbranchを確定済みである。再実行のたびに
+    // GitHubへ問い合わせ直すと、切替待ちの間だけ重複探索とIssue作成の副作用が増える。
+    const resumed = delivery.status === 'awaiting-branch' && Boolean(delivery.issue_number) && Boolean(delivery.branch);
+    let issue = { number: delivery.issue_number, url: delivery.issue_url };
+    let branch = delivery.branch;
+    let draftPrUrl = delivery.draft_pr_url;
 
-    const existingIssueBranches = runCommand(
-      'git',
-      ['branch', '--list', `codex/issue-${issue.number}-*`, '--format=%(refname:short)'],
-      { cwd, env }
-    ).split(/\r?\n/).filter(Boolean);
-    // 再開時にタイトルやslugが変わっても、同じIssueの現在branchを優先する。
-    // これにより同一Issueへ複数branchを作ることを防ぐ。
-    const branch = existingPr
-      ? currentBranch
-      : selectDeliveryBranch(issue.number, delivery.title, currentBranch, existingIssueBranches);
-    if (currentBranch !== branch) {
-      const existing = runCommand('git', ['branch', '--list', branch], { cwd, env });
-      if (existing) {
-        runCommand('git', ['switch', branch], { cwd, env });
-      } else {
-        runCommand('git', ['rev-parse', '--verify', delivery.base_branch], { cwd, env });
-        runCommand('git', ['switch', '-c', branch, delivery.base_branch], { cwd, env });
+    if (!resumed) {
+      const existingPr = findExistingDeliveryPr(delivery, currentBranch, { cwd, env });
+      issue = findDuplicateIssue(delivery, {
+        cwd,
+        env,
+        allowClosedReferencedIssue: Boolean(existingPr)
+      });
+      if (!issue) {
+        const body = [
+          'ECC deterministic delivery workflow がユーザー要求から自動作成しました。',
+          '',
+          `Request fingerprint: \`${delivery.request_hash}\``,
+          '',
+          'このIssueに紐づくDraft PRが作成されるまで自動クローズしません。'
+        ].join('\n');
+        const url = runCommand('gh', ['issue', 'create', '--title', delivery.title, '--body', body], { cwd, env });
+        issue = { number: parseIssueNumber(url), title: delivery.title, url };
       }
+
+      const existingIssueBranches = runCommand(
+        'git',
+        ['branch', '--list', `codex/issue-${issue.number}-*`, '--format=%(refname:short)'],
+        { cwd, env }
+      ).split(/\r?\n/).filter(Boolean);
+      // 再開時にタイトルやslugが変わっても、同じIssueの現在branchを優先する。
+      // これにより同一Issueへ複数branchを作ることを防ぐ。
+      branch = existingPr
+        ? currentBranch
+        : selectDeliveryBranch(issue.number, delivery.title, currentBranch, existingIssueBranches);
+      draftPrUrl = existingPr ? existingPr.url : delivery.draft_pr_url;
     }
 
-    const next = {
+    const prepared = {
       ...delivery,
-      status: 'ready',
       issue_number: Number(issue.number),
       issue_url: issue.url,
       branch,
-      draft_pr_url: existingPr ? existingPr.url : delivery.draft_pr_url,
+      draft_pr_url: draftPrUrl,
       prepared_at: new Date().toISOString()
     };
+    // prepareはbranchを切り替えない。生成物が無視される限り `git status --porcelain` は
+    // 実行中のビルドやテストを検出できず、ここで切り替えるとその検証だけが別コミットの
+    // 作業ツリーを読み続ける。切替はエージェントが走っている作業を畳んでから実行し、
+    // このコマンドの再実行でreadyへ進む。
+    const next = currentBranch === branch
+      ? { ...prepared, status: 'ready', branch_switch: null }
+      : {
+          ...prepared,
+          status: 'awaiting-branch',
+          branch_switch: branchSwitchPlan(delivery, branch, currentBranch, { cwd, env })
+        };
     writeState(input, { delivery: next }, env);
     return next;
   } catch (error) {
@@ -289,7 +317,16 @@ function main() {
   const sessionId = explicitSession || pendingSessionForProject(process.cwd(), process.env);
   if (command !== 'prepare') throw new Error('usage: delivery-lifecycle.js prepare --session <id>');
   if (!sessionId) throw new Error('No unique pending delivery session for this project; retry the exact session-bound command from the Delivery Gate.');
-  process.stdout.write(`${JSON.stringify(prepareDelivery({ session_id: sessionId, cwd: process.cwd() }), null, 2)}\n`);
+  const delivery = prepareDelivery({ session_id: sessionId, cwd: process.cwd() });
+  // stdoutのJSONは機械可読の契約なので、切替要求という人間向けの指示はstderrへ出す。
+  if (delivery.status === 'awaiting-branch' && delivery.branch_switch) {
+    process.stderr.write(
+      `[ECC Delivery] Branch switch required: ${delivery.branch_switch.from} -> ${delivery.branch_switch.to}. ` +
+        'This command no longer switches branches, so a build or test that is still running is never moved onto another commit. ' +
+        `Finish or stop that work, run \`${delivery.branch_switch.command}\` yourself, then run this command again to record the Delivery as ready.\n`
+    );
+  }
+  process.stdout.write(`${JSON.stringify(delivery, null, 2)}\n`);
 }
 
 if (require.main === module) {
@@ -302,6 +339,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  branchSwitchPlan,
   explicitIssueNumber,
   explicitPrNumber,
   deliveryBranch,
