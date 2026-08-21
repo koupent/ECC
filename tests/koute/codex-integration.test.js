@@ -428,6 +428,9 @@ test('required delivery gate blocks edits until issue and branch evidence are re
   assert.doesNotMatch(denied.hookSpecificOutput.permissionDecisionReason, /CLAUDE_PLUGIN_ROOT/);
   assert.match(denied.hookSpecificOutput.permissionDecisionReason, /delivery-lifecycle\.js/);
   assert.match(denied.hookSpecificOutput.permissionDecisionReason, /reset\.js/);
+  // pending時の案内も「prepareがbranchを切り替える」と読めてはいけない。切替は
+  // 実行中の検証を畳んだエージェントが行う契約である。
+  assert.match(denied.hookSpecificOutput.permissionDecisionReason, /records that branch without switching to it/);
   assert.doesNotMatch(
     fs.readFileSync(path.join(__dirname, '..', '..', 'commands', 'codex-task-reset.md'), 'utf8'),
     /\$CLAUDE_PLUGIN_ROOT/

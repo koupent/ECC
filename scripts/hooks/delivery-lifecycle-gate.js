@@ -120,7 +120,8 @@ function run(rawInput, options = {}) {
       );
     }
     return deny(
-      '[ECC Delivery Gate] Repository tools are blocked until duplicate Issue search, Issue selection/creation, and issue-linked branch creation complete. ' +
+      '[ECC Delivery Gate] Repository tools are blocked until duplicate Issue search, Issue selection/creation, and the issue-linked branch are recorded. ' +
+        'Preparation records that branch without switching to it; if the current branch differs, it will ask you to run one exact switch command yourself. ' +
         `Run node "${prepareScript}" prepare --session "${sessionId}" first, then retry the tool call. ` +
         `If the recorded Delivery is stale or unrecoverable, explicitly reset it with node "${resetScript}" "${sessionId}".`
     );
