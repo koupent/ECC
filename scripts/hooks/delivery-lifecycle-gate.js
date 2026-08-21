@@ -4,6 +4,7 @@
 const { spawnSync } = require('child_process');
 const path = require('path');
 const { loadConfig } = require('../codex/config');
+const { isSafeGitRef } = require('../codex/delivery-lifecycle');
 const { readState, recordIncident, resolveSessionId, writeState } = require('../codex/runtime-state');
 
 function deny(reason) {
@@ -59,6 +60,28 @@ function isExactLifecycleCommand(command, action) {
   return new RegExp(String.raw`^${node}\s+${script}\s+${tail}\s*$`, 'i').test(value);
 }
 
+function unquoteToken(value) {
+  const token = String(value || '');
+  const quoted = token.match(/^"([^"]*)"$/) || token.match(/^'([^']*)'$/);
+  return quoted ? quoted[1] : token;
+}
+
+function isExactBranchSwitchCommand(command, delivery) {
+  const value = String(command || '').trim();
+  const handoff = delivery && delivery.branch_switch;
+  if (!value || !handoff || !handoff.to || hasExecutableShellControl(value)) return false;
+  // 記録済みhandoffでも、shellが複数commandへ分割しうるrefの切替は許可しない。
+  // prepareの検証を通らないstateが残っていても、ここが実行経路にはならない。
+  if (!isSafeGitRef(handoff.to)) return false;
+  if (handoff.create && !isSafeGitRef(handoff.base_branch)) return false;
+  const expected = handoff.create
+    ? ['git', 'switch', '-c', handoff.to, handoff.base_branch]
+    : ['git', 'switch', handoff.to];
+  if (!expected.every(Boolean)) return false;
+  const tokens = value.split(/\s+/).map(unquoteToken);
+  return tokens.length === expected.length && tokens.every((token, index) => token === expected[index]);
+}
+
 function run(rawInput, options = {}) {
   let input;
   try {
@@ -83,12 +106,27 @@ function run(rawInput, options = {}) {
     if (state.delivery.status === 'deferred' && permissionMode === 'plan') return rawInput;
     const isPrepareCommand = toolName === 'Bash' && isExactLifecycleCommand(command, 'prepare');
     const isResetCommand = toolName === 'Bash' && isExactLifecycleCommand(command, 'reset');
-    if (isPrepareCommand || isResetCommand) return rawInput;
+    // prepareが自動切替をやめた分、記録したbranchへの切替だけはエージェントに許可する。
+    // ここを拒否すると、awaiting-branchのDeliveryはreadyへ進めないまま手詰まりになる。
+    const isRecordedBranchSwitch = toolName === 'Bash' && isExactBranchSwitchCommand(command, state.delivery);
+    if (isPrepareCommand || isResetCommand || isRecordedBranchSwitch) return rawInput;
     const sessionId = resolveSessionId(input, env);
     const prepareScript = path.resolve(__dirname, '../codex/delivery-lifecycle.js');
     const resetScript = path.resolve(__dirname, '../codex/reset.js');
+    if (state.delivery.status === 'awaiting-branch' && state.delivery.branch_switch) {
+      const actualBranch = branchAt(cwd, env);
+      return deny(
+        `[ECC Delivery Gate] Issue #${state.delivery.issue_number} and branch ${state.delivery.branch} are recorded, but this delivery is not ready yet. ` +
+          (actualBranch === state.delivery.branch
+            ? `The current branch already matches, so run node "${prepareScript}" prepare --session "${sessionId}" once more to record it as ready, then retry the tool call.`
+            : 'Preparation no longer switches branches on its own, so a build or test that is still running is never moved onto another commit. ' +
+              `The current branch is ${actualBranch || '<none>'}. Finish or stop any running verification, run \`${state.delivery.branch_switch.command}\` yourself, ` +
+              `then run node "${prepareScript}" prepare --session "${sessionId}" again.`)
+      );
+    }
     return deny(
-      '[ECC Delivery Gate] Repository tools are blocked until duplicate Issue search, Issue selection/creation, and issue-linked branch creation complete. ' +
+      '[ECC Delivery Gate] Repository tools are blocked until duplicate Issue search, Issue selection/creation, and the issue-linked branch are recorded. ' +
+        'Preparation records that branch without switching to it; if the current branch differs, it will ask you to run one exact switch command yourself. ' +
         `Run node "${prepareScript}" prepare --session "${sessionId}" first, then retry the tool call. ` +
         `If the recorded Delivery is stale or unrecoverable, explicitly reset it with node "${resetScript}" "${sessionId}".`
     );
@@ -163,4 +201,4 @@ if (require.main === module) {
   process.stdin.on('end', () => process.stdout.write(run(raw)));
 }
 
-module.exports = { branchAt, gitValue, isExactLifecycleCommand, run };
+module.exports = { branchAt, gitValue, isExactBranchSwitchCommand, isExactLifecycleCommand, run };

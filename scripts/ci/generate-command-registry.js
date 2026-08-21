@@ -16,6 +16,15 @@ const path = require('path');
 
 const ROOT = path.join(__dirname, '../..');
 const DEFAULT_OUTPUT_PATH = path.join(ROOT, 'docs', 'COMMAND-REGISTRY.json');
+const COMMAND_TYPES = new Set([
+  'orchestration',
+  'testing',
+  'review',
+  'planning',
+  'refactoring',
+  'build',
+  'general',
+]);
 
 function normalizePath(relativePath) {
   return relativePath.split(path.sep).join('/');
@@ -111,6 +120,21 @@ function extractReferences(content, knownAgents, knownSkills) {
   };
 }
 
+function extractDeclaredType(content) {
+  const frontmatter = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!frontmatter) {
+    return '';
+  }
+
+  const declared = frontmatter[1].match(/^type:\s*(.+)$/m);
+  if (!declared) {
+    return '';
+  }
+
+  const value = cleanYamlScalar(declared[1]).toLowerCase();
+  return COMMAND_TYPES.has(value) ? value : '';
+}
+
 function inferCommandType(content, commandName) {
   const lower = `${commandName}\n${content}`.toLowerCase();
 
@@ -145,7 +169,9 @@ function processCommandFile(root, filename, knownAgents, knownSkills) {
   return {
     command: commandName,
     description: extractDescription(content),
-    type: inferCommandType(content, commandName),
+    // 本文の語彙だけで推定すると、手順の説明に出てくる build/test などで種別が揺れる。
+    // frontmatter で宣言されていればそれを正とし、なければ従来どおり推定する。
+    type: extractDeclaredType(content) || inferCommandType(content, commandName),
     primaryAgents: references.agents.slice(0, 3),
     allAgents: references.agents,
     skills: references.skills,
@@ -307,6 +333,7 @@ if (require.main === module) {
 
 module.exports = {
   checkRegistry,
+  extractDeclaredType,
   extractDescription,
   extractReferences,
   formatRegistry,
