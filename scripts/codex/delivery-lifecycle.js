@@ -12,7 +12,9 @@ const DELIVERY_COMPLETION_REQUEST = /(?:\b(?:complete|finish|finalize|deliver)\b
 const NEGATED_DELIVERY_REQUEST = /(?:\b(?:do\s+not|don't|without)\s+(?:implement(?:ing)?|fix(?:ing)?|chang(?:e|ing)|add(?:ing)?|remov(?:e|ing)|refactor(?:ing)?|build(?:ing)?|creat(?:e|ing)|updat(?:e|ing))\b|(?:実装|修正|変更|追加|削除|作成|更新)(?:は)?(?:しないで|しない|しなくてよい|せず|不要)|直さない)/gi;
 const DIAGNOSTIC_REQUEST = /(?:\b(?:investigate|review|analy[sz]e|diagnose|inspect|check)\b|調査|確認|レビュー|分析|診断|調べて|教えて)/i;
 const EXPLICIT_MUTATION_REQUEST = /(?:\b(?:implement|fix|add|remove|refactor|build|create|update)\b|(?:実装|修正|変更|追加|削除|作成|更新|直)(?:を)?(?:して|する|してください|してほしい|したい|せよ))/i;
-const ACTIVE_DELIVERY_STATUSES = new Set(['deferred', 'pending', 'ready']);
+// draft-pr はreadyより先へ進んだ進行中Deliveryであり、Draft PR・Issue・branchの参照を
+// 保持し続ける必要がある。mergedだけは完了済みとして次の要求に新規Deliveryを許す。
+const ACTIVE_DELIVERY_STATUSES = new Set(['deferred', 'pending', 'ready', 'draft-pr']);
 
 function isActiveDelivery(delivery) {
   return Boolean(delivery && ACTIVE_DELIVERY_STATUSES.has(delivery.status));
@@ -98,7 +100,8 @@ function initializeDelivery(input, request, options = {}) {
   if (current.delivery && current.delivery.request_hash === requestHash) return current.delivery;
   // Claude Code の継続turnでは、ユーザーの追記文面が変わっても同じDeliveryである。
   // 進行中Deliveryを本文ハッシュだけで上書きすると、Context Builder、Issue、branchが
-  // 二重に作られるため、完了または明示的な新規Sessionまでは既存Deliveryを維持する。
+  // 二重に作られるため、Draft PR到達後も含め、マージ完了または明示的な新規Session/resetまでは
+  // 既存Deliveryを維持する。
   if (isActiveDelivery(current.delivery)) return current.delivery;
 
   const delivery = {

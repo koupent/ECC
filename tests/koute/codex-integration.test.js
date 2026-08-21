@@ -49,6 +49,7 @@ const {
   normalizeIssueTitle,
   parseIssueNumber,
   pendingSessionForProject,
+  prepareDelivery,
   selectDeliveryBranch,
   slug,
   titleFromRequest
@@ -354,6 +355,59 @@ test('follow-up prompts preserve the active delivery and reuse its Context Build
   assert.strictEqual(reran, false);
   assert.match(output.hookSpecificOutput.additionalContext, /cached packet/);
   assert.match(output.hookSpecificOutput.additionalContext, /active Delivery/);
+});
+
+test('a draft-pr delivery survives a differently worded follow-up without creating a new Issue or branch', () => {
+  const fixture = createGitFixture('delivery-draft-pr-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-draft-pr-state') };
+  const input = { session_id: 'delivery-draft-pr', cwd: fixture };
+  const first = initializeDelivery(input, 'Issue #271 の配信不具合を修正してください', { cwd: fixture, env: fixtureEnv });
+  writeState(input, {
+    delivery: {
+      ...first,
+      status: 'draft-pr',
+      issue_number: 271,
+      branch: 'codex/issue-271-task',
+      draft_pr_url: 'https://example.invalid/pull/274',
+      completed_at: '2026-08-20T14:29:52.372Z'
+    },
+    context_status: 'ready',
+    context_request_hash: first.request_hash,
+    context: { status: 'ok', summary: 'draft pr packet', files: [], constraints: [], risks: [], verification: [] }
+  }, fixtureEnv);
+
+  const followUp = 'そのDraft PRをマージまで進めてください';
+  const preserved = initializeDelivery(input, followUp, { cwd: fixture, env: fixtureEnv });
+  assert.strictEqual(preserved.status, 'draft-pr');
+  assert.strictEqual(preserved.request_hash, first.request_hash);
+  assert.strictEqual(preserved.issue_number, 271);
+  assert.strictEqual(preserved.branch, 'codex/issue-271-task');
+  assert.strictEqual(preserved.draft_pr_url, 'https://example.invalid/pull/274');
+  // prepareはpending/deferredのDeliveryだけを扱うため、維持されたDeliveryでは
+  // Issue作成もbranch切替も起こらない。
+  assert.throws(
+    () => prepareDelivery(input, { cwd: fixture, env: fixtureEnv }),
+    /No pending required delivery task/
+  );
+  assert.strictEqual(
+    spawnSync('git', ['branch', '--list', 'codex/*'], { cwd: fixture, encoding: 'utf8' }).stdout.trim(),
+    ''
+  );
+
+  const output = JSON.parse(contextBuilder.run(JSON.stringify({ ...input, prompt: followUp }), {
+    cwd: fixture,
+    env: fixtureEnv,
+    runRole() {
+      throw new Error('Context Builder must not rerun while the draft-pr Delivery is active');
+    }
+  }));
+  assert.match(output.hookSpecificOutput.additionalContext, /draft pr packet/);
+  assert.doesNotMatch(output.hookSpecificOutput.additionalContext, /delivery-lifecycle\.js/);
 });
 
 test('Context Builder distinguishes unavailable evidence from verified absence and avoids delivery diagnostics', () => {
