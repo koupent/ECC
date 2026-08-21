@@ -504,9 +504,14 @@ function candidates(words) {
   return found;
 }
 
+// Short options combine in any order, so `-lc`, `-cx` and `-exc` all read the
+// next word as the script. Requiring `c` last saw only some of the spellings of
+// the same command, which is the direction that lets one through.
+const SHELL_COMMAND_OPTION = /^-[A-Za-z]*c[A-Za-z]*$/;
+
 function shellScript(invocation) {
   if (!SHELLS.has(invocation.command)) return null;
-  const index = invocation.args.findIndex(arg => /^-[a-z]*c$/i.test(arg));
+  const index = invocation.args.findIndex(arg => SHELL_COMMAND_OPTION.test(arg));
   return index >= 0 ? invocation.args[index + 1] || null : null;
 }
 

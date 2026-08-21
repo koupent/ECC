@@ -35,6 +35,7 @@ The project opts in by committing `.ecc/config.json`:
 {
   "profile": "standard",
   "rules": ["common", "typescript", "react", "nextjs"],
+  "deliveryWorkflow": "required",
   "deliveryCompletion": "squash-merge",
   "mergeGate": {
     "provider": "commit-status",
@@ -52,6 +53,22 @@ The project opts in by committing `.ecc/config.json`:
   }
 }
 ```
+
+`deliveryCompletion: "squash-merge"` is one contract with two halves: the Stop
+Completion Gate merges the reviewed PR, and the Local Merge Policy keeps any
+other actor from merging it first. Both halves live in the required delivery
+workflow and in the `standard` or `strict` hook profile, so the three settings
+above are only valid together — a project that names the completion method
+alone would have its manual merges refused without ever getting an automatic
+one. While the method is active, Bash may not merge a pull request through any
+route — `gh pr merge`, the REST merge endpoint, or the GraphQL mutation — may
+not publish a commit status, and may not write through the raw GitHub API at
+all; reads and the ordinary `gh` subcommands stay available, and a document that
+merely quotes such a call is not one.
+
+`.ecc/config.json` must also stay readable on the delivery branch: when it
+cannot be read, the Completion Gate refuses to finish a delivery whose intended
+completion method it can no longer confirm.
 
 The `rules` array is consumed by the private environment-kit installer; ECC
 itself only uses this file to enable the fork-specific runtime. Runtime state

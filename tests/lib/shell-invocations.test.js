@@ -170,6 +170,21 @@ test('a wrapper option value does not shadow the command the wrapper runs', () =
   }
 });
 
+test('a shell runs the script of every `-c` spelling, not just the ones ending in c', () => {
+  for (const command of [
+    'bash -c "gh pr merge 12"',
+    'bash -cx "gh pr merge 12"',
+    'bash -xc "gh pr merge 12"',
+    'sh -exc "gh pr merge 12"',
+    'zsh -icl "gh pr merge 12"',
+    'sudo -u ci bash -cex "gh pr merge 12"'
+  ]) {
+    assert.strictEqual(runsPrMerge(command), true, command);
+  }
+  // `-C` は noclobber であってスクリプトを取らない。
+  assert.deepStrictEqual(commands('bash -C script.sh'), ['bash']);
+});
+
 test('input the parser cannot enumerate fails closed instead of reporting no commands', () => {
   assert.deepStrictEqual(extractInvocations(''), []);
   assert.deepStrictEqual(extractInvocations('   '), []);

@@ -52,6 +52,11 @@ function loadConfig(cwd = process.cwd(), env = process.env) {
     : project.value.deliveryCompletion
       ? 'project-config'
       : 'default';
+  const deliveryWorkflowSource = env.ECC_DELIVERY_WORKFLOW
+    ? 'environment'
+    : project.value.deliveryWorkflow
+      ? 'project-config'
+      : 'default';
   return {
     projectRoot: project.root,
     projectConfigPath: project.file,
@@ -71,6 +76,7 @@ function loadConfig(cwd = process.cwd(), env = process.env) {
       repository: env.ECC_INCIDENT_REPOSITORY || incidentHandling.repository || codex.incidentRepository || 'koupent/engineering-environment-kit'
     },
     deliveryWorkflow: env.ECC_DELIVERY_WORKFLOW || project.value.deliveryWorkflow || 'advisory',
+    deliveryWorkflowSource,
     deliveryBaseBranch: env.ECC_DELIVERY_BASE_BRANCH || project.value.deliveryBaseBranch || 'main',
     deliveryCompletion: env.ECC_DELIVERY_COMPLETION || project.value.deliveryCompletion || 'draft-pr',
     deliveryCompletionSource,
@@ -93,4 +99,33 @@ function deliveryCompletionDefaulted(config) {
   return config.deliveryCompletionSource === 'default' && Boolean(config.projectConfigFailure);
 }
 
-module.exports = { deliveryCompletionDefaulted, envEnabled, findProjectRoot, loadConfig, readProjectConfig };
+/**
+ * True when the delivery workflow fell back to `advisory` only because the
+ * project config could not be read. A readable config that names no workflow
+ * chose the default; an unreadable one said nothing at all, so callers that
+ * would disable a required gate must not read this as "no delivery required".
+ */
+function deliveryWorkflowDefaulted(config) {
+  return config.deliveryWorkflowSource === 'default' && Boolean(config.projectConfigFailure);
+}
+
+/**
+ * squash-merge completion is one contract with two halves: the Completion Gate
+ * merges the reviewed PR, and the Local Merge Policy keeps every other actor
+ * from merging it first. A project that enables one half only would forbid the
+ * manual merge without ever performing the automatic one, so every hook decides
+ * that the method is active through this single predicate.
+ */
+function squashMergeCompletion(config) {
+  return config.deliveryCompletion === 'squash-merge' && config.deliveryWorkflow === 'required';
+}
+
+module.exports = {
+  deliveryCompletionDefaulted,
+  deliveryWorkflowDefaulted,
+  envEnabled,
+  findProjectRoot,
+  loadConfig,
+  readProjectConfig,
+  squashMergeCompletion
+};

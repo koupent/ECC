@@ -4,7 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
-const { loadConfig } = require('./config');
+const { loadConfig, squashMergeCompletion } = require('./config');
 const { projectFingerprint, readJson, stateRoot } = require('./runtime-state');
 
 function command(binary, args, cwd, env) {
@@ -64,7 +64,8 @@ function audit(options = {}, dependencies = {}) {
   const config = dependencies.config || loadConfig(cwd, env);
   // squash-merge指定のプロジェクトでは `draft-pr` は完了ではない。取り込み証拠を
   // 要求する側へ倒すことで、未統合のDeliveryが監査上「完了」に見えないようにする。
-  const requiresMerge = config.deliveryCompletion === 'squash-merge';
+  // 設定を読めない監査でも、Deliveryへ記録された完了方式は動かない。
+  const requiresMerge = squashMergeCompletion(config) || delivery.completion_method === 'squash-merge';
   const expectsMerge = requiresMerge || delivery.status === 'merged';
   const gitStatus = execute('git', ['status', '--porcelain'], cwd, env);
   const branch = execute('git', ['branch', '--show-current'], cwd, env);
@@ -87,6 +88,9 @@ function audit(options = {}, dependencies = {}) {
     : null;
 
   const checks = [
+    // 完了方式を決める設定を読めないまま出したPASSは、何を検査したか言えない。
+    check('project-config', !config.projectConfigFailure, 'readable project config',
+      config.projectConfigFailure ? `${config.projectConfigPath}: ${config.projectConfigFailure}` : 'readable'),
     check('context-builder', state.context_status === 'ready', 'ready', state.context_status),
     check('explicit-issue-reused', !issueNumber ||
       (delivery.requested_issue_number === issueNumber && delivery.issue_number === issueNumber),

@@ -5,6 +5,22 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["version", "profile", "rulePacks", "codexSandbox", "legacyHarness"],
+  "allOf": [
+    {
+      "$comment": "squash-merge completion runs in the Stop gate, which only exists when the delivery workflow is required and the standard or strict hook profile is active. Accepting the other combinations would forbid the manual merge without ever performing the automatic one.",
+      "if": {
+        "properties": { "deliveryCompletion": { "const": "squash-merge" } },
+        "required": ["deliveryCompletion"]
+      },
+      "then": {
+        "properties": {
+          "deliveryWorkflow": { "const": "required" },
+          "profile": { "enum": ["standard", "strict"] }
+        },
+        "required": ["deliveryWorkflow"]
+      }
+    }
+  ],
   "properties": {
     "$schema": { "type": "string" },
     "version": { "const": 1 },
