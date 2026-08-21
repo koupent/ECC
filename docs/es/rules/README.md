@@ -33,7 +33,7 @@ Reglas específicas para proyectos TypeScript y JavaScript:
 Reglas específicas para proyectos Python:
 
 - **coding-style.md** - PEP 8, anotaciones de tipos, inmutabilidad, herramientas de formateo
-- **hooks.md** - Formateo con black/ruff, verificación de tipos con mypy/pyright
+- **hooks.md** - Formateo con el formateador del proyecto, verificación de tipos con mypy/pyright
 - **patterns.md** - Protocol (duck typing), dataclasses, context managers
 - **security.md** - Gestión de secretos, escaneo de seguridad con bandit
 - **testing.md** - Framework pytest, cobertura, organización de pruebas

@@ -33,9 +33,23 @@ class Point(NamedTuple):
 
 ## Formatlama
 
-- Kod formatlama için **black**
-- Import sıralama için **isort**
-- Linting için **ruff**
+Projenin halihazırda yapılandırdığı formatlayıcıyı kullanın. Asla ikinci bir
+formatlayıcı eklemeyin ve projenin bağımlılıklarında olmayan bir aracı
+çalıştırmayın. Şu sırayla belirleyin:
+
+1. `pyproject.toml` içinde `[tool.ruff.format]` varsa ya da `ruff` bağımlılıkta
+   olup `black` yoksa — formatlama için `ruff format`, import sıralama için
+   `ruff check --select I --fix` kullanın.
+2. `black` ve/veya `isort` bağımlılıkta ise — formatlama için `black`, import
+   sıralama için `isort` kullanın.
+3. Hiçbiri yapılandırılmamışsa — ECC'nin kendi quality gate'i ile uyumlu olacak
+   şekilde `ruff format` ve `ruff check --select I` varsayılan olsun.
+
+Linting için her durumda **ruff** kullanın.
+
+Buradaki bir kural projenin kendi formatlayıcı yapılandırmasıyla çelişirse proje
+yapılandırması kazanır: ruff ile formatlanmış bir kod tabanını `black` ile (ya da
+tersi) yeniden formatlamak ilgisiz diff gürültüsü üretir.
 
 ## Referans
 

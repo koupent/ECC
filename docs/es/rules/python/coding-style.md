@@ -33,9 +33,23 @@ class Point(NamedTuple):
 
 ## Formateo
 
-- **black** para formateo de código
-- **isort** para ordenamiento de imports
-- **ruff** para linting
+Usa el formateador que el proyecto ya tiene configurado. Nunca introduzcas un
+segundo formateador ni ejecutes una herramienta que no esté en las dependencias
+del proyecto. Resuélvelo en este orden:
+
+1. `pyproject.toml` declara `[tool.ruff.format]`, o `ruff` es una dependencia y
+   `black` no lo es — usa `ruff format` para formatear y
+   `ruff check --select I --fix` para ordenar imports.
+2. `black` y/o `isort` son dependencias — usa `black` para formatear e `isort`
+   para ordenar imports.
+3. Ninguno está configurado — por defecto usa `ruff format` y
+   `ruff check --select I`, igual que el quality gate del propio ECC.
+
+Usa **ruff** para linting en todos los casos.
+
+Cuando una regla de aquí contradiga la configuración de formateo del proyecto,
+gana la configuración del proyecto: reformatear con `black` un código formateado
+con ruff (o al revés) produce ruido de diff sin relación con el cambio.
 
 ## Referencia
 

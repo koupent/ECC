@@ -11,7 +11,9 @@ paths:
 
 `~/.claude/settings.json` içinde yapılandır:
 
-- **black/ruff**: Edit'ten sonra `.py` dosyalarını otomatik formatla
+- **Formatlayıcı**: Edit'ten sonra `.py` dosyalarını projenin yapılandırdığı
+  formatlayıcı ile otomatik formatla — `ruff format` ve `black` arasındaki seçim
+  için [coding-style.md](./coding-style.md#formatlama) dosyasına bakın
 - **mypy/pyright**: `.py` dosyalarını düzenledikten sonra tip kontrolü çalıştır
 
 ## Uyarılar
