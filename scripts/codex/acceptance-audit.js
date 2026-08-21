@@ -4,7 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
-const { projectFingerprint, readJson, stateRoot } = require('./runtime-state');
+const { deliveryWorkspace, projectFingerprint, readJson, stateRoot } = require('./runtime-state');
 
 function command(binary, args, cwd, env) {
   const result = spawnSync(binary, args, {
@@ -61,9 +61,11 @@ function audit(options = {}, dependencies = {}) {
   const state = entry.state;
   const delivery = state.delivery || {};
   const squashMerged = delivery.status === 'merged';
-  const gitStatus = execute('git', ['status', '--porcelain'], cwd, env);
-  const branch = execute('git', ['branch', '--show-current'], cwd, env);
-  const head = execute('git', ['rev-parse', 'HEAD'], cwd, env);
+  // Deliveryが払い出したworktreeを持つなら、Git側の証拠はそのツリーで確認する。
+  const workspace = deliveryWorkspace(state, cwd);
+  const gitStatus = execute('git', ['status', '--porcelain'], workspace, env);
+  const branch = execute('git', ['branch', '--show-current'], workspace, env);
+  const head = execute('git', ['rev-parse', 'HEAD'], workspace, env);
   const issue = delivery.issue_number
     ? execute('gh', ['issue', 'view', String(delivery.issue_number), '--json', 'number,state,url'], cwd, env)
     : { ok: false, stdout: '', stderr: 'delivery issue is missing' };

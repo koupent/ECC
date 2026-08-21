@@ -59,6 +59,7 @@ function loadConfig(cwd = process.cwd(), env = process.env) {
     deliveryWorkflow: env.ECC_DELIVERY_WORKFLOW || project.value.deliveryWorkflow || 'advisory',
     deliveryBaseBranch: env.ECC_DELIVERY_BASE_BRANCH || project.value.deliveryBaseBranch || 'main',
     deliveryCompletion: env.ECC_DELIVERY_COMPLETION || project.value.deliveryCompletion || 'draft-pr',
+    deliveryWorktreeRoot: env.ECC_DELIVERY_WORKTREE_ROOT || project.value.deliveryWorktreeRoot || '',
     mergeGate: {
       provider: env.ECC_MERGE_GATE_PROVIDER || mergeGate.provider || 'commit-status',
       command: env.ECC_MERGE_GATE_COMMAND || mergeGate.command || 'engineering-kit-merge-gate',

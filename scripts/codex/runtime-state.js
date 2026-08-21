@@ -5,8 +5,10 @@ const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { spawnSync } = require('child_process');
 
 const MAX_LOG_BYTES = 8 * 1024 * 1024;
+const REPOSITORY_IDENTITY_CACHE = new Map();
 
 function hash(value, length = 24) {
   return crypto.createHash('sha256').update(String(value || '')).digest('hex').slice(0, length);
@@ -96,8 +98,55 @@ function contextReady(input = {}, env = process.env) {
   return state.context_status === 'ready' && state.context && typeof state.context === 'object';
 }
 
+// git common-dirは主作業ツリーと全てのlinked worktreeで同一である。これを識別子に
+// 使うと、worktreeで記録したDelivery、レビュー証拠、イベントを主作業ツリーからも
+// 同じprojectとして参照できる。Git配下でない場所は従来どおり絶対パスで識別する。
+function repositoryIdentity(root) {
+  let result;
+  try {
+    result = spawnSync('git', ['rev-parse', '--git-common-dir'], {
+      cwd: root,
+      encoding: 'utf8',
+      timeout: 5000,
+      windowsHide: true
+    });
+  } catch {
+    return '';
+  }
+  if (!result || result.error || result.status !== 0) return '';
+  const common = String(result.stdout || '').trim();
+  if (!common) return '';
+  const absolute = path.resolve(root, common);
+  try {
+    return fs.realpathSync(absolute);
+  } catch {
+    return absolute;
+  }
+}
+
 function projectFingerprint(cwd = process.cwd()) {
-  return hash(path.resolve(cwd));
+  const root = path.resolve(cwd || process.cwd());
+  if (!REPOSITORY_IDENTITY_CACHE.has(root)) {
+    REPOSITORY_IDENTITY_CACHE.set(root, hash(repositoryIdentity(root) || root));
+  }
+  return REPOSITORY_IDENTITY_CACHE.get(root);
+}
+
+// 進行中のDeliveryが払い出されたworktreeを持つ場合、branch・HEAD・作業ツリーの
+// 検証はそのworktreeで行う。記録が消えている、あるいは別リポジトリを指している
+// stateでは共有ツリーへ戻し、無関係なツリーを操作対象にしない。
+function deliveryWorkspace(state, cwd = process.cwd()) {
+  const fallback = path.resolve(cwd || process.cwd());
+  const recorded = state && state.delivery && state.delivery.worktree_path;
+  if (!recorded) return fallback;
+  const target = path.resolve(recorded);
+  if (target === fallback) return fallback;
+  try {
+    if (!fs.statSync(target).isDirectory()) return fallback;
+  } catch {
+    return fallback;
+  }
+  return projectFingerprint(target) === projectFingerprint(fallback) ? target : fallback;
 }
 
 function redactText(value) {
@@ -178,6 +227,7 @@ module.exports = {
   appendEvent,
   atomicWrite,
   contextReady,
+  deliveryWorkspace,
   hash,
   incidentFingerprint,
   logPath,
@@ -187,6 +237,7 @@ module.exports = {
   readState,
   recordIncident,
   redactText,
+  repositoryIdentity,
   resetState,
   resolveSessionId,
   sanitizeSessionId,

@@ -8,6 +8,7 @@ const { spawnSync } = require('child_process');
 const { loadConfig } = require('./config');
 const {
   appendEvent,
+  deliveryWorkspace,
   hash,
   projectFingerprint,
   readEvents,
@@ -272,10 +273,12 @@ function runRole(options) {
   const role = String(options.role || '');
   const def = ROLE_DEFS[role];
   if (!def) throw new Error(`Unknown Codex role: ${role}`);
-  const cwd = path.resolve(options.cwd || process.cwd());
   const env = options.env || process.env;
-  const config = loadConfig(cwd, env);
   const input = { session_id: options.sessionId || resolveSessionId({}, env) };
+  // 明示的なcwdがなければ、進行中Deliveryのworktreeで実行する。共有ツリーでレビュー
+  // すると、証拠が実装コミットではないHEADに結び付き、完了Gateを通せない。
+  const cwd = path.resolve(options.cwd || deliveryWorkspace(readState(input, env), process.cwd()));
+  const config = loadConfig(cwd, env);
   if (!config.enabled && !options.force) throw new Error(`Codex integration is not enabled by ${config.projectConfigPath}`);
 
   const before = workingTreePaths(cwd);
@@ -450,7 +453,8 @@ function runRole(options) {
 }
 
 function parseArgs(argv) {
-  const options = { role: argv[2], request: '', cwd: process.cwd() };
+  // cwdは既定値を持たない。指定がないときだけrunRoleがDelivery worktreeへ解決する。
+  const options = { role: argv[2], request: '' };
   for (let i = 3; i < argv.length; i += 1) {
     if (argv[i] === '--request') options.request = argv[++i] || '';
     else if (argv[i] === '--request-file') options.request = fs.readFileSync(argv[++i], 'utf8');

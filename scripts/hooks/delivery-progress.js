@@ -3,7 +3,7 @@
 
 const { spawnSync } = require('child_process');
 const { loadConfig } = require('../codex/config');
-const { readState, writeState } = require('../codex/runtime-state');
+const { deliveryWorkspace, readState, writeState } = require('../codex/runtime-state');
 
 function gitValue(cwd, env, args) {
   const result = spawnSync('git', args, {
@@ -45,9 +45,12 @@ function run(rawInput, options = {}) {
   const state = readState(input, env);
   if (!state.delivery || state.delivery.status !== 'ready') return rawInput;
 
-  const branch = gitValue(cwd, env, ['branch', '--show-current']);
-  const head = gitValue(cwd, env, ['rev-parse', 'HEAD']);
-  const dirty = gitValue(cwd, env, ['status', '--porcelain']);
+  // コミットは払い出したworktreeで行われる。共有ツリーのHEADを読むと、Deliveryの
+  // コミットを取り逃してレビュー要求が出ないまま進む。
+  const workspace = deliveryWorkspace(state, cwd);
+  const branch = gitValue(workspace, env, ['branch', '--show-current']);
+  const head = gitValue(workspace, env, ['rev-parse', 'HEAD']);
+  const dirty = gitValue(workspace, env, ['status', '--porcelain']);
   if (!head || dirty || branch !== state.delivery.branch || head === state.delivery.committed_head) return rawInput;
 
   writeState(input, {

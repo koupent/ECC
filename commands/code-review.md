@@ -48,6 +48,10 @@ the current session state before the delivery can continue.
 node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --request "Review the complete current delivery. Use the diff to identify scope, then read every changed file in full and trace relevant callers, consumers, tests, configuration, and ordered operational procedures for correctness, security, regressions, and release blockers." --session "$CLAUDE_SESSION_ID"
 ```
 
+Without an explicit `--cwd`, the reviewer runs in the worktree recorded for the
+active delivery, so the review evidence binds to the commit that will be merged
+rather than to whatever the shared working tree currently holds.
+
 Use its findings as independent evidence in the ECC review. If Codex reports a
 fallback, continue with the native review. ECC retains control of review count,
 severity policy, and final judgment.

@@ -137,7 +137,7 @@
     },
     {
       "command": "delivery-prepare",
-      "description": "Prepare the required GitHub Issue and issue-linked branch before editing.",
+      "description": "Prepare the required GitHub Issue and issue-linked worktree before editing.",
       "type": "general",
       "primaryAgents": [],
       "allAgents": [],

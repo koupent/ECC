@@ -4,8 +4,11 @@
 const { spawnSync } = require('child_process');
 const path = require('path');
 const { loadConfig } = require('../codex/config');
-const { isSafeGitRef } = require('../codex/delivery-lifecycle');
-const { readState, recordIncident, resolveSessionId, writeState } = require('../codex/runtime-state');
+const { deliveryWorkspace, readState, recordIncident, resolveSessionId, writeState } = require('../codex/runtime-state');
+
+// worktreeの外で走らせるとDeliveryのbranchではなく共有ツリーを変更してしまうGit操作。
+// 読み取りだけのsubcommandは対象にせず、誤検知で調査を止めない。
+const GIT_WRITE_COMMAND = /(?:^|[;&|]\s*)git\s+(?:-[^\s]+\s+|--[^\s]+(?:\s+|=[^\s]+\s+))*(?:add|am|apply|checkout|cherry-pick|clean|commit|merge|rebase|reset|restore|revert|rm|stash|switch|push|worktree)\b/i;
 
 function deny(reason) {
   return JSON.stringify({
@@ -60,26 +63,16 @@ function isExactLifecycleCommand(command, action) {
   return new RegExp(String.raw`^${node}\s+${script}\s+${tail}\s*$`, 'i').test(value);
 }
 
-function unquoteToken(value) {
-  const token = String(value || '');
-  const quoted = token.match(/^"([^"]*)"$/) || token.match(/^'([^']*)'$/);
-  return quoted ? quoted[1] : token;
+function isInside(root, target) {
+  const relative = path.relative(root, target);
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
 }
 
-function isExactBranchSwitchCommand(command, delivery) {
-  const value = String(command || '').trim();
-  const handoff = delivery && delivery.branch_switch;
-  if (!value || !handoff || !handoff.to || hasExecutableShellControl(value)) return false;
-  // 記録済みhandoffでも、shellが複数commandへ分割しうるrefの切替は許可しない。
-  // prepareの検証を通らないstateが残っていても、ここが実行経路にはならない。
-  if (!isSafeGitRef(handoff.to)) return false;
-  if (handoff.create && !isSafeGitRef(handoff.base_branch)) return false;
-  const expected = handoff.create
-    ? ['git', 'switch', '-c', handoff.to, handoff.base_branch]
-    : ['git', 'switch', handoff.to];
-  if (!expected.every(Boolean)) return false;
-  const tokens = value.split(/\s+/).map(unquoteToken);
-  return tokens.length === expected.length && tokens.every((token, index) => token === expected[index]);
+// worktreeを払い出しても、親CLIのcwdは共有ツリーのままである。書き込み系のGit操作が
+// worktree pathを名指ししていなければ、その操作は共有ツリーに当たる。
+function targetsWorkspace(command, workspace) {
+  const value = String(command || '');
+  return value.includes(workspace) || !GIT_WRITE_COMMAND.test(value);
 }
 
 function run(rawInput, options = {}) {
@@ -106,33 +99,20 @@ function run(rawInput, options = {}) {
     if (state.delivery.status === 'deferred' && permissionMode === 'plan') return rawInput;
     const isPrepareCommand = toolName === 'Bash' && isExactLifecycleCommand(command, 'prepare');
     const isResetCommand = toolName === 'Bash' && isExactLifecycleCommand(command, 'reset');
-    // prepareが自動切替をやめた分、記録したbranchへの切替だけはエージェントに許可する。
-    // ここを拒否すると、awaiting-branchのDeliveryはreadyへ進めないまま手詰まりになる。
-    const isRecordedBranchSwitch = toolName === 'Bash' && isExactBranchSwitchCommand(command, state.delivery);
-    if (isPrepareCommand || isResetCommand || isRecordedBranchSwitch) return rawInput;
+    if (isPrepareCommand || isResetCommand) return rawInput;
     const sessionId = resolveSessionId(input, env);
     const prepareScript = path.resolve(__dirname, '../codex/delivery-lifecycle.js');
     const resetScript = path.resolve(__dirname, '../codex/reset.js');
-    if (state.delivery.status === 'awaiting-branch' && state.delivery.branch_switch) {
-      const actualBranch = branchAt(cwd, env);
-      return deny(
-        `[ECC Delivery Gate] Issue #${state.delivery.issue_number} and branch ${state.delivery.branch} are recorded, but this delivery is not ready yet. ` +
-          (actualBranch === state.delivery.branch
-            ? `The current branch already matches, so run node "${prepareScript}" prepare --session "${sessionId}" once more to record it as ready, then retry the tool call.`
-            : 'Preparation no longer switches branches on its own, so a build or test that is still running is never moved onto another commit. ' +
-              `The current branch is ${actualBranch || '<none>'}. Finish or stop any running verification, run \`${state.delivery.branch_switch.command}\` yourself, ` +
-              `then run node "${prepareScript}" prepare --session "${sessionId}" again.`)
-      );
-    }
     return deny(
-      '[ECC Delivery Gate] Repository tools are blocked until duplicate Issue search, Issue selection/creation, and the issue-linked branch are recorded. ' +
-        'Preparation records that branch without switching to it; if the current branch differs, it will ask you to run one exact switch command yourself. ' +
-        `Run node "${prepareScript}" prepare --session "${sessionId}" first, then retry the tool call. ` +
+      '[ECC Delivery Gate] Repository tools are blocked until duplicate Issue search, Issue selection/creation, and the issue-linked worktree are recorded. ' +
+        'Preparation never switches the shared working tree; it checks the issue-linked branch out in a separate worktree and reports that path. ' +
+        `Run node "${prepareScript}" prepare --session "${sessionId}" first, then continue this delivery inside the reported worktree path. ` +
         `If the recorded Delivery is stale or unrecoverable, explicitly reset it with node "${resetScript}" "${sessionId}".`
     );
   }
 
-  const actualBranch = branchAt(cwd, env);
+  const workspace = deliveryWorkspace(state, cwd);
+  const actualBranch = branchAt(workspace, env);
   if (!actualBranch || actualBranch !== state.delivery.branch) {
     // Gateがfail-closeしている復旧可能な不一致は、即criticalではない。同じDeliveryで
     // 同じ不一致を繰り返し記録せず、複数回の独立発生だけを中央昇格の対象にする。
@@ -156,7 +136,10 @@ function run(rawInput, options = {}) {
         }
       }, env);
     }
-    return deny(`[ECC Delivery Gate] Expected issue-linked branch ${state.delivery.branch}, but current branch is ${actualBranch || '<none>'}. Restore the recorded branch before editing.`);
+    return deny(
+      `[ECC Delivery Gate] Expected issue-linked branch ${state.delivery.branch} in ${workspace}, but its current branch is ${actualBranch || '<none>'}. ` +
+        'Restore the recorded branch in the delivery worktree before editing.'
+    );
   }
 
   if (state.delivery.branch_mismatch_actual) {
@@ -171,7 +154,25 @@ function run(rawInput, options = {}) {
 
   const toolName = String(input.tool_name || '');
   const isEdit = ['Edit', 'Write', 'MultiEdit'].includes(toolName);
-  const head = gitValue(cwd, env, ['rev-parse', 'HEAD']);
+  const isolated = workspace !== path.resolve(cwd);
+  if (isolated) {
+    // 払い出したworktreeの外へ書くと、隔離したはずの共有ツリーを再び変更してしまう。
+    // 共有ツリー配下だけを拒否し、リポジトリ外のファイルは従来どおり素通しする。
+    const filePath = String(input.tool_input && input.tool_input.file_path || '');
+    if (isEdit && filePath && isInside(path.resolve(cwd), path.resolve(filePath)) && !isInside(workspace, path.resolve(filePath))) {
+      return deny(
+        `[ECC Delivery Gate] Issue #${state.delivery.issue_number} is checked out in the delivery worktree ${workspace}. ` +
+          `Edit ${path.join(workspace, path.relative(path.resolve(cwd), path.resolve(filePath)))} instead; the shared working tree keeps its own branch and uncommitted changes.`
+      );
+    }
+    if (toolName === 'Bash' && !targetsWorkspace(input.tool_input && input.tool_input.command, workspace)) {
+      return deny(
+        `[ECC Delivery Gate] This delivery is isolated in the worktree ${workspace}, but the command would run against the shared working tree. ` +
+          `Run it inside that path, for example \`cd "${workspace}" && ...\` or \`git -C "${workspace}" ...\`.`
+      );
+    }
+  }
+  const head = gitValue(workspace, env, ['rev-parse', 'HEAD']);
   if (
     isEdit &&
     state.delivery.committed_head &&
@@ -201,4 +202,4 @@ if (require.main === module) {
   process.stdin.on('end', () => process.stdout.write(run(raw)));
 }
 
-module.exports = { branchAt, gitValue, isExactBranchSwitchCommand, isExactLifecycleCommand, run };
+module.exports = { branchAt, gitValue, isExactLifecycleCommand, isInside, run, targetsWorkspace };

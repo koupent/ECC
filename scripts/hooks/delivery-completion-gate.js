@@ -3,7 +3,7 @@
 
 const { spawnSync } = require('child_process');
 const { loadConfig } = require('../codex/config');
-const { readState, recordIncident, writeState } = require('../codex/runtime-state');
+const { deliveryWorkspace, readState, recordIncident, writeState } = require('../codex/runtime-state');
 
 function isTransientGitHubFailure(message) {
   return /(?:HTTP 5\d\d|timed?\s*out|timeout|ECONNRESET|ENOTFOUND|temporar(?:y|ily)|server is currently unavailable)/i.test(String(message || ''));
@@ -124,28 +124,30 @@ function run(rawInput, options = {}) {
     return block('The required delivery has not been prepared. Run `/ecc:delivery-prepare` so Issue deduplication and the issue-linked branch are recorded before continuing.');
   }
   if (delivery.status === 'awaiting-branch') {
-    const handoff = delivery.branch_switch || {};
     return block(
-      `Issue #${delivery.issue_number} is recorded, but the delivery is still waiting for the branch switch that preparation deliberately leaves to you. ` +
-        `Run \`${handoff.command || `git switch ${delivery.branch}`}\` once no verification is running, then run \`/ecc:delivery-prepare\` again.`
+      `Issue #${delivery.issue_number} is recorded, but no delivery worktree is bound to it yet. ` +
+        'Run `/ecc:delivery-prepare` again; preparation now checks the issue-linked branch out in its own worktree instead of asking you to switch the shared working tree.'
     );
   }
   if (delivery.status !== 'ready') return rawInput;
 
   const execute = options.command || command;
+  // 検証は記録済みのDelivery worktreeで行う。共有ツリーを見ると、別branchのcleanな
+  // HEADを根拠に完了させたり、worktreeの正しいコミットを未完了と誤判定したりする。
+  const workspace = deliveryWorkspace(state, cwd);
 
-  const status = execute('git', ['status', '--porcelain'], cwd, env);
-  if (!status.ok) return block(`Could not inspect the worktree: ${status.stderr || 'git status failed'}`);
+  const status = execute('git', ['status', '--porcelain'], workspace, env);
+  if (!status.ok) return block(`Could not inspect the delivery worktree ${workspace}: ${status.stderr || 'git status failed'}`);
   if (status.stdout) {
-    return block('The worktree still has uncommitted changes. Complete the ECC checks, commit the reviewed implementation on the issue-linked branch, push it, and create a Draft PR linked to the recorded Issue.');
+    return block(`The delivery worktree ${workspace} still has uncommitted changes. Complete the ECC checks, commit the reviewed implementation on the issue-linked branch, push it, and create a Draft PR linked to the recorded Issue.`);
   }
 
-  const branch = execute('git', ['branch', '--show-current'], cwd, env).stdout;
+  const branch = execute('git', ['branch', '--show-current'], workspace, env).stdout;
   if (branch !== delivery.branch) {
-    return block(`Current branch ${branch || '<none>'} does not match recorded branch ${delivery.branch}.`);
+    return block(`Current branch ${branch || '<none>'} in ${workspace} does not match recorded branch ${delivery.branch}.`);
   }
 
-  const head = execute('git', ['rev-parse', 'HEAD'], cwd, env);
+  const head = execute('git', ['rev-parse', 'HEAD'], workspace, env);
   if (!head.ok) return block(`Could not inspect the current commit: ${head.stderr || 'git rev-parse failed'}`);
   if (
     !['review', 'security-review'].includes(state.review_role) ||
@@ -163,7 +165,7 @@ function run(rawInput, options = {}) {
     'pr', 'list', '--head', branch,
     '--state', config.deliveryCompletion === 'squash-merge' ? 'all' : 'open',
     '--json', 'url,isDraft,number,body,baseRefName,headRefOid,state'
-  ], cwd, env);
+  ], workspace, env);
   if (!prs.ok) {
     recordIncident({ type: 'delivery_pr_lookup_failure', severity: 'minor', message: prs.stderr || 'gh pr list failed' }, { cwd, env });
     return block('Draft PR status could not be verified. Confirm GitHub authentication, push the branch, and create a Draft PR; do not bypass this gate.');
@@ -197,7 +199,7 @@ function run(rawInput, options = {}) {
   }
 
   if (config.deliveryCompletion === 'squash-merge') {
-    const completion = completeBySquashMerge(execute, config, delivery, candidate, head.stdout, cwd, env);
+    const completion = completeBySquashMerge(execute, config, delivery, candidate, head.stdout, workspace, env);
     if (!completion.ok) {
       recordIncident(
         { type: 'delivery_squash_merge_blocked', severity: 'minor', message: completion.reason, hook_id: 'delivery-completion' },

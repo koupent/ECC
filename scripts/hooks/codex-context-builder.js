@@ -14,8 +14,8 @@ function shouldSkip(prompt) {
   return !value || /^\/(?:ecc:)?(?:codex-|help|clear|compact|status)/i.test(value);
 }
 
-// awaiting-branchは、Issueとbranchを記録済みでも手動切替とprepare再実行が残る状態である。
-// prepareの案内を外すと、その最後の一手が指示されないまま止まる。
+// awaiting-branchは、worktree払い出し以前のstateにIssueとbranchだけが記録された状態である。
+// prepareの案内を外すと、worktreeを持たないまま止まる。
 function needsPreparation(delivery) {
   return Boolean(delivery && ['deferred', 'pending', 'awaiting-branch'].includes(delivery.status));
 }
@@ -66,7 +66,7 @@ function run(rawInput, options = {}) {
   const cwd = options.cwd || input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const config = loadConfig(cwd, options.env || process.env);
   const sessionId = resolveSessionId(input, options.env || process.env);
-  const prepareInstruction = `Before the first edit, run node "$CLAUDE_PLUGIN_ROOT/scripts/codex/delivery-lifecycle.js" prepare --session "${sessionId}". The Delivery Gate will fail closed until Issue deduplication and the issue-linked branch are recorded.`;
+  const prepareInstruction = `Before the first edit, run node "$CLAUDE_PLUGIN_ROOT/scripts/codex/delivery-lifecycle.js" prepare --session "${sessionId}". The Delivery Gate will fail closed until Issue deduplication and the issue-linked branch are recorded. Preparation checks that branch out in its own worktree and reports the path in worktree_path; continue the normal CLI workflow - edits, tests, commits, review, and push - inside that path, and leave the shared working tree on its own branch.`;
   const prompt = input.prompt || input.user_prompt || '';
   if (!config.enabled || shouldSkip(prompt)) return rawInput;
 

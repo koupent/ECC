@@ -8,7 +8,9 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 const { loadConfig } = require('../../scripts/codex/config');
 const {
+  deliveryWorkspace,
   hash,
+  projectFingerprint,
   readState,
   readEvents,
   recordIncident,
@@ -39,7 +41,8 @@ const deliveryProgress = require('../../scripts/hooks/delivery-progress');
 const deliveryFinalizer = require('../../scripts/hooks/delivery-session-finalizer');
 const configProtection = require('../../scripts/hooks/config-protection');
 const {
-  branchSwitchPlan,
+  deliveryWorktreePath,
+  ensureDeliveryWorktree,
   explicitIssueNumber,
   explicitPrNumber,
   deliveryBranch,
@@ -48,6 +51,7 @@ const {
   initializeDelivery,
   isDeliveryRequest,
   isSafeGitRef,
+  listWorktrees,
   normalizeIssueTitle,
   parseIssueNumber,
   pendingSessionForProject,
@@ -429,9 +433,10 @@ test('required delivery gate blocks edits until issue and branch evidence are re
   assert.doesNotMatch(denied.hookSpecificOutput.permissionDecisionReason, /CLAUDE_PLUGIN_ROOT/);
   assert.match(denied.hookSpecificOutput.permissionDecisionReason, /delivery-lifecycle\.js/);
   assert.match(denied.hookSpecificOutput.permissionDecisionReason, /reset\.js/);
-  // pending時の案内も「prepareがbranchを切り替える」と読めてはいけない。切替は
-  // 実行中の検証を畳んだエージェントが行う契約である。
-  assert.match(denied.hookSpecificOutput.permissionDecisionReason, /records that branch without switching to it/);
+  // pending時の案内も「prepareが共有ツリーのbranchを切り替える」と読めてはいけない。
+  // 実装はIssueごとのworktreeで行う契約である。
+  assert.match(denied.hookSpecificOutput.permissionDecisionReason, /never switches the shared working tree/);
+  assert.match(denied.hookSpecificOutput.permissionDecisionReason, /separate worktree/);
   assert.doesNotMatch(
     fs.readFileSync(path.join(__dirname, '..', '..', 'commands', 'codex-task-reset.md'), 'utf8'),
     /\$CLAUDE_PLUGIN_ROOT/
@@ -478,8 +483,8 @@ test('required delivery gate blocks edits until issue and branch evidence are re
   assert.strictEqual(deliveryGate.run(raw, { cwd: fixture, env: fixtureEnv }), raw);
 });
 
-test('preparation hands the branch switch to the agent instead of moving a running verification', () => {
-  const fixture = createGitFixture('delivery-branch-handoff-repo');
+test('preparation issues an Issue worktree instead of switching the shared working tree', () => {
+  const fixture = createGitFixture('delivery-worktree-repo');
   fs.writeFileSync(
     path.join(fixture, '.ecc', 'config.json'),
     JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
@@ -488,82 +493,130 @@ test('preparation hands the branch switch to the agent instead of moving a runni
   assert.strictEqual(spawnSync('git', ['add', '.ecc/config.json'], { cwd: fixture }).status, 0);
   assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'require delivery workflow'], { cwd: fixture }).status, 0);
   const baseBranch = spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
-  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-branch-handoff-state') };
-  const input = { session_id: 'delivery-branch-handoff', cwd: fixture };
-  const branch = 'codex/issue-68-branch-handoff';
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-worktree-state') };
+  const input = { session_id: 'delivery-worktree', cwd: fixture };
+  const branch = 'codex/issue-79-worktree-isolation';
   writeState(input, {
     delivery: {
-      status: 'awaiting-branch',
-      request_hash: 'handoff-fixture',
-      title: 'preparation must not switch branches',
+      status: 'pending',
+      request_hash: 'worktree-fixture',
+      title: 'preparation must not touch the shared tree',
       base_branch: baseBranch,
-      issue_number: 68,
-      issue_url: 'https://example.invalid/issues/68',
+      issue_number: 79,
+      issue_url: 'https://example.invalid/issues/79',
       branch,
       draft_pr_url: null
     }
   }, fixtureEnv);
 
-  const handoff = prepareDelivery(input, { cwd: fixture, env: fixtureEnv });
-  assert.strictEqual(handoff.status, 'awaiting-branch');
-  assert.strictEqual(handoff.branch_switch.create, true);
-  assert.strictEqual(handoff.branch_switch.command, `git switch -c ${branch} ${baseBranch}`);
-  assert.strictEqual(spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim(), baseBranch);
-  assert.strictEqual(spawnSync('git', ['branch', '--list', branch], { cwd: fixture, encoding: 'utf8' }).stdout.trim(), '');
+  // 共有ツリーは未コミットの別作業を抱えたままでよい。隔離が必要な状況こそ
+  // prepareが通らなければならない。
+  fs.writeFileSync(path.join(fixture, 'src', 'other-tool.ts'), 'export const other = true;\n', 'utf8');
 
-  const recorded = readState(input, fixtureEnv);
-  assert.strictEqual(deliveryGate.isExactBranchSwitchCommand(`git switch -c ${branch} ${baseBranch}`, recorded.delivery), true);
-  assert.strictEqual(deliveryGate.isExactBranchSwitchCommand(`git switch -c ${branch} ${baseBranch} && npm run build`, recorded.delivery), false);
-  assert.strictEqual(deliveryGate.isExactBranchSwitchCommand(`git switch ${branch}`, recorded.delivery), false);
-
-  const switchCommand = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: `git switch -c ${branch} ${baseBranch}` } });
-  assert.strictEqual(deliveryGate.run(switchCommand, { cwd: fixture, env: fixtureEnv }), switchCommand);
-  const otherBash = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: 'npm test' } });
-  assert.strictEqual(
-    JSON.parse(deliveryGate.run(otherBash, { cwd: fixture, env: fixtureEnv })).hookSpecificOutput.permissionDecision,
-    'deny'
-  );
-  const edit = JSON.stringify({ ...input, tool_name: 'Edit', tool_input: { file_path: path.join(fixture, 'src', 'product.ts') } });
-  const denied = JSON.parse(deliveryGate.run(edit, { cwd: fixture, env: fixtureEnv }));
-  assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny');
-  assert.match(denied.hookSpecificOutput.permissionDecisionReason, /no longer switches branches/);
-
-  const stop = JSON.parse(deliveryCompletion.run(JSON.stringify(input), { cwd: fixture, env: fixtureEnv }));
-  assert.strictEqual(stop.decision, 'block');
-  assert.match(stop.reason, /waiting for the branch switch/);
-
-  assert.strictEqual(spawnSync('git', ['switch', '--quiet', '-c', branch, baseBranch], { cwd: fixture }).status, 0);
   const ready = prepareDelivery(input, { cwd: fixture, env: fixtureEnv });
   assert.strictEqual(ready.status, 'ready');
   assert.strictEqual(ready.branch, branch);
-  assert.strictEqual(ready.issue_number, 68);
+  assert.strictEqual(ready.worktree_created, true);
+  assert.strictEqual(ready.worktree_shared, false);
   assert.strictEqual(ready.branch_switch, null);
-  assert.strictEqual(deliveryGate.run(edit, { cwd: fixture, env: fixtureEnv }), edit);
+  assert.strictEqual(ready.worktree_path, deliveryWorktreePath(fs.realpathSync(fixture), branch));
+  assert.ok(fs.existsSync(path.join(ready.worktree_path, 'src', 'product.ts')));
+  // 共有ツリーのbranchも未コミットの変更もそのまま残る。
+  assert.strictEqual(spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim(), baseBranch);
+  assert.ok(fs.existsSync(path.join(fixture, 'src', 'other-tool.ts')));
+  assert.strictEqual(
+    spawnSync('git', ['branch', '--show-current'], { cwd: ready.worktree_path, encoding: 'utf8' }).stdout.trim(),
+    branch
+  );
+  // worktreeはリポジトリの外に置かれ、共有ツリーの `git status` を汚さない。
+  assert.ok(!path.resolve(ready.worktree_path).startsWith(`${path.resolve(fixture)}${path.sep}`));
+
+  // 中断後の再prepareや同じIssueの再開は、同じworktreeを再利用し、二本目のbranchも
+  // directoryも作らない。
+  writeState(input, { delivery: { ...ready, status: 'pending' } }, fixtureEnv);
+  const reprepared = prepareDelivery(input, { cwd: fixture, env: fixtureEnv });
+  assert.strictEqual(reprepared.worktree_path, ready.worktree_path);
+  assert.strictEqual(reprepared.worktree_created, false);
+  assert.strictEqual(listWorktrees({ cwd: fixture, env: fixtureEnv }).length, 2);
+
+  // Gateはcwdではなく記録済みworktreeのbranchで判定する。
+  const worktreeEdit = JSON.stringify({
+    ...input,
+    tool_name: 'Edit',
+    tool_input: { file_path: path.join(ready.worktree_path, 'src', 'product.ts') }
+  });
+  assert.strictEqual(deliveryGate.run(worktreeEdit, { cwd: fixture, env: fixtureEnv }), worktreeEdit);
+
+  const sharedEdit = JSON.stringify({
+    ...input,
+    tool_name: 'Edit',
+    tool_input: { file_path: path.join(fixture, 'src', 'product.ts') }
+  });
+  const deniedEdit = JSON.parse(deliveryGate.run(sharedEdit, { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(deniedEdit.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(
+    deniedEdit.hookSpecificOutput.permissionDecisionReason,
+    new RegExp(path.join(ready.worktree_path, 'src', 'product.ts').replace(/[\\^$*+?.()|[\]{}]/g, '\\$&'))
+  );
+
+  const sharedCommit = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: 'git commit -am "fix"' } });
+  const deniedCommit = JSON.parse(deliveryGate.run(sharedCommit, { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(deniedCommit.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(deniedCommit.hookSpecificOutput.permissionDecisionReason, /isolated in the worktree/);
+  const worktreeCommit = JSON.stringify({
+    ...input,
+    tool_name: 'Bash',
+    tool_input: { command: `git -C "${ready.worktree_path}" commit -am "fix"` }
+  });
+  assert.strictEqual(deliveryGate.run(worktreeCommit, { cwd: fixture, env: fixtureEnv }), worktreeCommit);
+  const readOnly = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: 'git status --porcelain' } });
+  assert.strictEqual(deliveryGate.run(readOnly, { cwd: fixture, env: fixtureEnv }), readOnly);
 });
 
-test('branch switch handoff reports an existing branch without creating or switching one', () => {
-  const executed = [];
-  const plan = branchSwitchPlan({ base_branch: 'main' }, 'codex/issue-68-existing', 'codex/issue-271-task', {
-    runCommand(binary, args) {
-      executed.push([binary, ...args].join(' '));
-      return args[0] === 'branch' ? '  codex/issue-68-existing' : '';
-    }
-  });
-  assert.deepStrictEqual(plan, {
-    required: true,
-    from: 'codex/issue-271-task',
-    to: 'codex/issue-68-existing',
-    create: false,
-    base_branch: null,
-    command: 'git switch codex/issue-68-existing'
-  });
-  assert.ok(executed.every(command => !command.includes('switch')));
-});
-
-test('branch switch handoff refuses Git refs that a shell would read as several commands', () => {
+test('an existing worktree for the delivery branch is reused and never deleted', () => {
   const executed = [];
   const runCommand = (binary, args) => {
     executed.push([binary, ...args].join(' '));
+    if (args[0] === 'worktree' && args[1] === 'list') {
+      return [
+        `worktree ${path.join(temp, 'reuse-main')}`,
+        'branch refs/heads/main',
+        '',
+        `worktree ${path.join(temp, 'reuse-main-worktrees', 'codex-issue-68-existing')}`,
+        'branch refs/heads/codex/issue-68-existing',
+        ''
+      ].join('\n');
+    }
+    return '';
+  };
+  fs.mkdirSync(path.join(temp, 'reuse-main'), { recursive: true });
+  fs.mkdirSync(path.join(temp, 'reuse-main-worktrees', 'codex-issue-68-existing'), { recursive: true });
+
+  const worktree = ensureDeliveryWorktree({ base_branch: 'main' }, 'codex/issue-68-existing', {
+    cwd: path.join(temp, 'reuse-main'),
+    runCommand
+  });
+  assert.strictEqual(worktree.created, false);
+  assert.strictEqual(worktree.shared, false);
+  assert.strictEqual(worktree.path, path.join(temp, 'reuse-main-worktrees', 'codex-issue-68-existing'));
+  assert.ok(executed.every(command => !/worktree (add|remove|prune)/.test(command)));
+
+  // 共有ツリーが既にそのbranchをcheckoutしているときは、そのツリーが作業場所になる。
+  const shared = ensureDeliveryWorktree({ base_branch: 'main' }, 'main', {
+    cwd: path.join(temp, 'reuse-main'),
+    runCommand
+  });
+  assert.strictEqual(shared.shared, true);
+  assert.strictEqual(shared.path, path.join(temp, 'reuse-main'));
+});
+
+test('worktree issuance fails closed on unverified paths and shell-unsafe refs', () => {
+  const executed = [];
+  const runCommand = (binary, args) => {
+    executed.push([binary, ...args].join(' '));
+    if (args[0] === 'worktree' && args[1] === 'list') {
+      return `worktree ${path.join(temp, 'failclose-main')}\nbranch refs/heads/main\n`;
+    }
     return '';
   };
 
@@ -577,40 +630,34 @@ test('branch switch handoff refuses Git refs that a shell would read as several 
     'codex/issue-68/../main'
   ]) {
     assert.throws(
-      () => branchSwitchPlan({ base_branch: 'main' }, ref, 'main', { runCommand }),
+      () => ensureDeliveryWorktree({ base_branch: 'main' }, ref, { cwd: path.join(temp, 'failclose-main'), runCommand }),
       /not shell-safe/,
       ref
     );
     assert.strictEqual(isSafeGitRef(ref), false, ref);
   }
   assert.throws(
-    () => branchSwitchPlan({ base_branch: 'main;make' }, 'codex/issue-68-safe-ref', 'main', { runCommand }),
+    () => ensureDeliveryWorktree({ base_branch: 'main;make' }, 'codex/issue-68-safe-ref', {
+      cwd: path.join(temp, 'failclose-main'),
+      runCommand
+    }),
     /Delivery base branch .* not shell-safe/
   );
-  // 危険なrefはgitへも渡らない。先頭ハイフンのrefで `git branch --list` がoptionとして
-  // 解釈されることも、切替が実行されることもない。
-  assert.ok(executed.every(command => !command.includes('switch') && !command.includes('-codex/issue-68')));
+  // 危険なrefはgitへも渡らず、worktreeも作られない。
+  assert.ok(executed.every(command => !command.includes('worktree add') && !command.includes('-codex/issue-68')));
 
-  const plan = branchSwitchPlan({ base_branch: 'main' }, 'codex/issue-68-safe-ref', 'main', { runCommand });
-  assert.strictEqual(plan.command, 'git switch -c codex/issue-68-safe-ref main');
-
-  // stateへ危険なrefが残っていても、Gateは記録済みhandoffとして実行を許可しない。
-  const tampered = {
-    branch: 'codex/issue-68;make',
-    branch_switch: {
-      required: true,
-      from: 'main',
-      to: 'codex/issue-68;make',
-      create: false,
-      base_branch: null,
-      command: 'git switch codex/issue-68;make'
-    }
-  };
-  assert.strictEqual(deliveryGate.isExactBranchSwitchCommand(tampered.branch_switch.command, tampered), false);
-  assert.strictEqual(deliveryGate.isExactBranchSwitchCommand("git switch 'codex/issue-68;make'", tampered), false);
-  assert.strictEqual(deliveryGate.isExactBranchSwitchCommand('git switch codex/issue-68-safe-ref', {
-    branch_switch: { required: true, to: 'codex/issue-68-safe-ref', create: false, base_branch: null }
-  }), true);
+  // 素性の分からない既存directoryは上書きも削除もせず、そこで停止する。
+  const occupied = deliveryWorktreePath(path.join(temp, 'failclose-main'), 'codex/issue-68-occupied');
+  fs.mkdirSync(occupied, { recursive: true });
+  fs.writeFileSync(path.join(occupied, 'unrelated.txt'), 'keep me\n', 'utf8');
+  assert.throws(
+    () => ensureDeliveryWorktree({ base_branch: 'main' }, 'codex/issue-68-occupied', {
+      cwd: path.join(temp, 'failclose-main'),
+      runCommand
+    }),
+    /already exists but is not registered/
+  );
+  assert.strictEqual(fs.readFileSync(path.join(occupied, 'unrelated.txt'), 'utf8'), 'keep me\n');
 });
 
 test('delivery preparation resolves the unique pending project session without relying on Bash environment propagation', () => {
@@ -627,6 +674,93 @@ test('delivery preparation resolves the unique pending project session without r
     { cwd: fixture, env: fixtureEnv }
   );
   assert.strictEqual(pendingSessionForProject(fixture, fixtureEnv), 'session-from-hook');
+});
+
+test('a linked worktree shares the project identity of its main working tree', () => {
+  const fixture = createGitFixture('project-identity-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  const worktreePath = path.join(temp, 'project-identity-worktree');
+  assert.strictEqual(
+    spawnSync('git', ['worktree', 'add', '--quiet', '-b', 'codex/issue-79-identity', worktreePath], { cwd: fixture }).status,
+    0
+  );
+  // 同じリポジトリなら、共有ツリーでもworktreeでも同じprojectとして証拠を突き合わせられる。
+  assert.strictEqual(projectFingerprint(worktreePath), projectFingerprint(fixture));
+  assert.notStrictEqual(projectFingerprint(worktreePath), hash(path.resolve(worktreePath)));
+  // Git配下でない場所は従来どおり絶対パスで識別する。
+  const nonGit = path.join(temp, 'project-identity-non-git');
+  fs.mkdirSync(nonGit, { recursive: true });
+  assert.strictEqual(projectFingerprint(nonGit), hash(path.resolve(nonGit)));
+
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'project-identity-state') };
+  initializeDelivery(
+    { session_id: 'identity-session', cwd: fixture },
+    'worktree隔離を修正してください',
+    { cwd: fixture, env: fixtureEnv }
+  );
+  // 共有ツリーで記録した pending Delivery は worktree からも同じSessionとして見つかる。
+  assert.strictEqual(pendingSessionForProject(worktreePath, fixtureEnv), 'identity-session');
+});
+
+test('completion accepts review evidence bound to the delivery worktree, not the shared tree', () => {
+  const fixture = createGitFixture('delivery-worktree-completion-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  assert.strictEqual(spawnSync('git', ['add', '.ecc/config.json'], { cwd: fixture }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'require delivery workflow'], { cwd: fixture }).status, 0);
+  const baseBranch = spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  const branch = 'codex/issue-79-worktree-completion';
+  const worktreePath = path.join(temp, 'delivery-worktree-completion-tree');
+  assert.strictEqual(
+    spawnSync('git', ['worktree', 'add', '--quiet', '-b', branch, worktreePath], { cwd: fixture }).status,
+    0
+  );
+  fs.writeFileSync(path.join(worktreePath, 'src', 'product.ts'), 'export const product = false;\n', 'utf8');
+  assert.strictEqual(spawnSync('git', ['add', 'src/product.ts'], { cwd: worktreePath }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'implement in worktree'], { cwd: worktreePath }).status, 0);
+  const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: worktreePath, encoding: 'utf8' }).stdout.trim();
+  // 共有ツリーは別branchのまま、未コミットの変更を抱えていてよい。
+  fs.writeFileSync(path.join(fixture, 'src', 'other-tool.ts'), 'export const other = true;\n', 'utf8');
+
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-worktree-completion-state') };
+  const input = { session_id: 'delivery-worktree-completion', cwd: fixture };
+  writeState(input, {
+    delivery: { status: 'ready', issue_number: 79, branch, base_branch: baseBranch, worktree_path: worktreePath },
+    review_role: 'review',
+    review_status: 'ok',
+    review_complete: true,
+    review_head: head,
+    review_worktree_clean: true,
+    review_blocking_findings: 0
+  }, fixtureEnv);
+  assert.strictEqual(deliveryWorkspace(readState(input, fixtureEnv), fixture), worktreePath);
+
+  const inspected = [];
+  const raw = JSON.stringify(input);
+  assert.strictEqual(deliveryCompletion.run(raw, {
+    cwd: fixture,
+    env: fixtureEnv,
+    command(binary, args, commandCwd, commandEnv) {
+      inspected.push([binary, args[0], commandCwd]);
+      if (binary === 'gh') {
+        return {
+          ok: true,
+          stdout: JSON.stringify([{ url: 'https://example.invalid/pr/9', isDraft: true, number: 9, body: 'Closes #79', baseRefName: baseBranch, headRefOid: head }]),
+          stderr: ''
+        };
+      }
+      return deliveryCompletion.command(binary, args, commandCwd, commandEnv);
+    }
+  }), raw);
+  assert.ok(inspected.every(([binary, , commandCwd]) => binary !== 'git' || commandCwd === worktreePath));
+  assert.strictEqual(readState(input, fixtureEnv).delivery.status, 'draft-pr');
 });
 
 test('delivery completion gate rejects a review that is not bound to the current clean commit', () => {
@@ -938,7 +1072,7 @@ test('an incomplete delivery session records exactly one promotable incident', (
   const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-finalizer-state') };
   const input = { session_id: 'delivery-finalizer', cwd: fixture };
   writeState(input, {
-    project: hash(path.resolve(fixture)),
+    project: projectFingerprint(fixture),
     delivery: {
       status: 'ready',
       issue_number: 44,

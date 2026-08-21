@@ -12,12 +12,15 @@ const DELIVERY_COMPLETION_REQUEST = /(?:\b(?:complete|finish|finalize|deliver)\b
 const NEGATED_DELIVERY_REQUEST = /(?:\b(?:do\s+not|don't|without)\s+(?:implement(?:ing)?|fix(?:ing)?|chang(?:e|ing)|add(?:ing)?|remov(?:e|ing)|refactor(?:ing)?|build(?:ing)?|creat(?:e|ing)|updat(?:e|ing))\b|(?:実装|修正|変更|追加|削除|作成|更新)(?:は)?(?:しないで|しない|しなくてよい|せず|不要)|直さない)/gi;
 const DIAGNOSTIC_REQUEST = /(?:\b(?:investigate|review|analy[sz]e|diagnose|inspect|check)\b|調査|確認|レビュー|分析|診断|調べて|教えて)/i;
 const EXPLICIT_MUTATION_REQUEST = /(?:\b(?:implement|fix|add|remove|refactor|build|create|update)\b|(?:実装|修正|変更|追加|削除|作成|更新|直)(?:を)?(?:して|する|してください|してほしい|したい|せよ))/i;
+// `awaiting-branch` はworktree払い出し以前のstateにしか現れないが、そのSessionを
+// 再度prepareできるよう受理し続ける。
 const ACTIVE_DELIVERY_STATUSES = new Set(['deferred', 'pending', 'awaiting-branch', 'ready']);
 const PREPARABLE_DELIVERY_STATUSES = new Set(['deferred', 'pending', 'awaiting-branch']);
-// Gitは `;` `&` `$()` を含むrefを有効と認めるが、そのrefを手渡しの切替コマンドへ
-// 埋めると複数のshell commandとして解釈されうる。この文字集合はshellのmetacharacterを
-// 一切含まないので、通過したrefは追加の引用なしでコマンド文字列へ入れて安全である。
+// Gitは `;` `&` `$()` を含むrefを有効と認めるが、そのrefを指示コマンドや
+// worktreeのdirectory名へ埋めると複数のshell commandとして解釈されうる。この文字集合は
+// shellのmetacharacterを一切含まないので、通過したrefは追加の引用なしで安全に扱える。
 const SAFE_GIT_REF = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+const WORKTREE_ADD_TIMEOUT_MS = 120000;
 
 function isActiveDelivery(delivery) {
   return Boolean(delivery && ACTIVE_DELIVERY_STATUSES.has(delivery.status));
@@ -232,24 +235,74 @@ function findExistingDeliveryPr(delivery, currentBranch, options = {}) {
   return candidates[0] || null;
 }
 
-function branchSwitchPlan(delivery, branch, currentBranch, options = {}) {
+function listWorktrees(options = {}) {
   const execute = options.runCommand || runCommand;
-  // 検証はgitへ渡す前に行う。危険なrefは案内コマンドに現れないうえ、Gateも同じ判定で
-  // 拒否するため、実行できない切替を指示してawaiting-branchのまま詰むことがない。
+  const raw = execute('git', ['worktree', 'list', '--porcelain'], options);
+  const entries = [];
+  for (const line of String(raw || '').split(/\r?\n/)) {
+    if (line.startsWith('worktree ')) {
+      entries.push({ path: line.slice('worktree '.length).trim(), branch: '', detached: false });
+      continue;
+    }
+    const current = entries[entries.length - 1];
+    if (!current) continue;
+    if (line.startsWith('branch ')) current.branch = line.slice('branch '.length).trim().replace(/^refs\/heads\//, '');
+    else if (line === 'detached') current.detached = true;
+  }
+  return entries;
+}
+
+function deliveryWorktreePath(mainWorktree, branch, options = {}) {
+  const configured = (options.config && options.config.deliveryWorktreeRoot) || '';
+  const main = path.resolve(mainWorktree);
+  // 既定の払い出し先はリポジトリの外側に置く。worktreeを作業ツリーの中へ作ると、
+  // 共有ツリーの `git status` が汚れ、cleanなHEADを要求する検証を自分で壊す。
+  const root = configured
+    ? path.resolve(configured)
+    : path.join(path.dirname(main), `${path.basename(main)}-worktrees`);
+  return path.join(root, assertSafeGitRef(branch, 'Delivery branch').replace(/\//g, '-'));
+}
+
+function ensureDeliveryWorktree(delivery, branch, options = {}) {
+  const execute = options.runCommand || runCommand;
   const target = assertSafeGitRef(branch, 'Delivery branch');
-  const exists = Boolean(execute('git', ['branch', '--list', target], options));
-  // 作成が必要なbranchは、要求を出す前にbaseの存在まで確かめる。切替をエージェントへ
-  // 委ねても、解決できないbaseを指したまま手詰まりにならないようにする。
-  const base = exists ? null : assertSafeGitRef(delivery.base_branch, 'Delivery base branch');
-  if (!exists) execute('git', ['rev-parse', '--verify', base], options);
-  return {
-    required: true,
-    from: currentBranch || '<detached>',
-    to: target,
-    create: !exists,
-    base_branch: base,
-    command: exists ? `git switch ${target}` : `git switch -c ${target} ${base}`
-  };
+  const worktrees = listWorktrees(options);
+  const main = worktrees[0] ? path.resolve(worktrees[0].path) : path.resolve(options.cwd || process.cwd());
+  const existing = worktrees.find(entry => entry.branch === target);
+  if (existing) {
+    const existingPath = path.resolve(existing.path);
+    // 既存のworktreeは削除も上書きもしない。共有ツリーが既にこのbranchをcheckout
+    // している場合も、そのツリーをそのままDeliveryの作業場所として受け入れる。
+    if (!fs.existsSync(existingPath)) {
+      throw new Error(
+        `Branch ${target} is registered to worktree ${existingPath}, but that directory is missing. ` +
+          'Restore it or run `git worktree prune` yourself, then run this command again.'
+      );
+    }
+    return { path: existingPath, branch: target, created: false, shared: existingPath === main, base_branch: null };
+  }
+
+  const worktreePath = deliveryWorktreePath(main, target, options);
+  if (fs.existsSync(worktreePath)) {
+    throw new Error(
+      `Delivery worktree path ${worktreePath} already exists but is not registered for branch ${target}. ` +
+        'Inspect it and move or remove it yourself; preparation never deletes an unverified directory.'
+    );
+  }
+  const branchExists = Boolean(execute('git', ['branch', '--list', target], options));
+  // 作成が必要なbranchは、worktreeを作る前にbaseの解決まで確かめる。解決できない
+  // baseで `git worktree add` を走らせ、中途半端な登録を残さない。
+  const base = branchExists ? null : assertSafeGitRef(delivery.base_branch, 'Delivery base branch');
+  if (base) execute('git', ['rev-parse', '--verify', base], options);
+  fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+  execute(
+    'git',
+    branchExists
+      ? ['worktree', 'add', worktreePath, target]
+      : ['worktree', 'add', '-b', target, worktreePath, base],
+    { ...options, timeout: WORKTREE_ADD_TIMEOUT_MS }
+  );
+  return { path: worktreePath, branch: target, created: true, shared: false, base_branch: base };
 }
 
 function prepareDelivery(input = {}, options = {}) {
@@ -262,13 +315,13 @@ function prepareDelivery(input = {}, options = {}) {
   }
 
   try {
-    const dirty = runCommand('git', ['status', '--porcelain'], { cwd, env });
-    if (dirty) throw new Error('Delivery preparation requires a clean working tree; preserve or commit existing changes first.');
-
+    const config = loadConfig(cwd, env);
+    // 共有ツリーのcleanさは要求しない。未コミットの作業と衝突しないことこそがIssueごとの
+    // worktreeを払い出す目的であり、ここでcleanを求めると隔離が必要な状況ほど止まる。
     const currentBranch = runCommand('git', ['branch', '--show-current'], { cwd, env });
-    // 手動切替を待っているDeliveryはIssueとbranchを確定済みである。再実行のたびに
-    // GitHubへ問い合わせ直すと、切替待ちの間だけ重複探索とIssue作成の副作用が増える。
-    const resumed = delivery.status === 'awaiting-branch' && Boolean(delivery.issue_number) && Boolean(delivery.branch);
+    // Issueとbranchを記録済みのDeliveryは確定している。再実行のたびにGitHubへ問い合わせ
+    // 直すと、worktree払い出しをやり直す間だけ重複探索とIssue作成の副作用が増える。
+    const resumed = Boolean(delivery.issue_number) && Boolean(delivery.branch);
     let issue = { number: delivery.issue_number, url: delivery.issue_url };
     let branch = delivery.branch;
     let draftPrUrl = delivery.draft_pr_url;
@@ -313,17 +366,22 @@ function prepareDelivery(input = {}, options = {}) {
       draft_pr_url: draftPrUrl,
       prepared_at: new Date().toISOString()
     };
-    // prepareはbranchを切り替えない。生成物が無視される限り `git status --porcelain` は
-    // 実行中のビルドやテストを検出できず、ここで切り替えるとその検証だけが別コミットの
-    // 作業ツリーを読み続ける。切替はエージェントが走っている作業を畳んでから実行し、
-    // このコマンドの再実行でreadyへ進む。
-    const next = currentBranch === branch
-      ? { ...prepared, status: 'ready', branch_switch: null }
-      : {
-          ...prepared,
-          status: 'awaiting-branch',
-          branch_switch: branchSwitchPlan(delivery, branch, currentBranch, { cwd, env })
-        };
+    // worktreeを払い出す前にIssueとbranchを記録する。払い出しが失敗しても、再実行が
+    // GitHubを引き直して重複Issueを作ることはない。
+    writeState(input, { delivery: prepared }, env);
+
+    // prepareは共有ツリーのbranchを切り替えず、Issueごとのworktreeを払い出す。以降の
+    // 編集、コミット、レビュー、完了判定はこのpathで行われ、共有ツリーで走っている
+    // 別の作業と衝突しない。
+    const worktree = ensureDeliveryWorktree(prepared, branch, { cwd, env, config });
+    const next = {
+      ...prepared,
+      status: 'ready',
+      worktree_path: worktree.path,
+      worktree_created: worktree.created,
+      worktree_shared: worktree.shared,
+      branch_switch: null
+    };
     writeState(input, { delivery: next }, env);
     return next;
   } catch (error) {
@@ -343,12 +401,14 @@ function main() {
   if (command !== 'prepare') throw new Error('usage: delivery-lifecycle.js prepare --session <id>');
   if (!sessionId) throw new Error('No unique pending delivery session for this project; retry the exact session-bound command from the Delivery Gate.');
   const delivery = prepareDelivery({ session_id: sessionId, cwd: process.cwd() });
-  // stdoutのJSONは機械可読の契約なので、切替要求という人間向けの指示はstderrへ出す。
-  if (delivery.status === 'awaiting-branch' && delivery.branch_switch) {
+  // stdoutのJSONは機械可読の契約なので、作業場所の受け渡しという人間向けの指示はstderrへ出す。
+  if (!delivery.worktree_shared) {
     process.stderr.write(
-      `[ECC Delivery] Branch switch required: ${delivery.branch_switch.from} -> ${delivery.branch_switch.to}. ` +
-        'This command no longer switches branches, so a build or test that is still running is never moved onto another commit. ' +
-        `Finish or stop that work, run \`${delivery.branch_switch.command}\` yourself, then run this command again to record the Delivery as ready.\n`
+      `[ECC Delivery] Issue #${delivery.issue_number} is checked out at ${delivery.worktree_path} ` +
+        `(${delivery.worktree_created ? 'created' : 'reused'} worktree on ${delivery.branch}). ` +
+        'The shared working tree keeps its own branch and uncommitted changes. ' +
+        'Run every edit, test, commit, review, and push for this delivery inside that path ' +
+        `(for example \`cd "${delivery.worktree_path}"\` or \`git -C "${delivery.worktree_path}" ...\`).\n`
     );
   }
   process.stdout.write(`${JSON.stringify(delivery, null, 2)}\n`);
@@ -364,7 +424,8 @@ if (require.main === module) {
 }
 
 module.exports = {
-  branchSwitchPlan,
+  deliveryWorktreePath,
+  ensureDeliveryWorktree,
   explicitIssueNumber,
   explicitPrNumber,
   deliveryBranch,
@@ -374,6 +435,7 @@ module.exports = {
   isActiveDelivery,
   isDeliveryRequest,
   isSafeGitRef,
+  listWorktrees,
   normalizeIssueTitle,
   parseIssueNumber,
   pendingSessionForProject,
