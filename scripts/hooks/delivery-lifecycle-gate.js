@@ -46,6 +46,61 @@ function hasExecutableShellControl(command) {
   return quote !== null;
 }
 
+// draft-prのDeliveryで通してよいのは、状態を変えない参照だけである。read-onlyと断定できない
+// binaryやsubcommandは拒否する（fail-close）。ここを広くすると、Edit/Writeを止めても
+// shell経由のファイル変更・branch切替・commitでGateを迂回できてしまう。
+const READ_ONLY_GIT_SUBCOMMANDS = new Set([
+  'blame', 'cat-file', 'describe', 'diff', 'log', 'ls-files', 'ls-tree',
+  'name-rev', 'rev-list', 'rev-parse', 'shortlog', 'show', 'status', 'whatchanged'
+]);
+const READ_ONLY_GH_SUBCOMMANDS = new Map([
+  ['pr', new Set(['view', 'list', 'status', 'diff', 'checks'])],
+  ['issue', new Set(['view', 'list', 'status'])],
+  ['repo', new Set(['view'])],
+  ['run', new Set(['view', 'list'])],
+  ['auth', new Set(['status'])]
+]);
+const READ_ONLY_BINARIES = new Set(['cat', 'date', 'echo', 'file', 'grep', 'head', 'ls', 'pwd', 'rg', 'stat', 'tail', 'wc']);
+const GH_WRITE_FLAG = /^(?:-X|--method|-f|-F|--field|--raw-field|--input)(?:=|$)/i;
+const OUTPUT_FLAG = /^(?:-o|--output)(?:=|$)/i;
+
+function commandTokens(command) {
+  return String(command || '')
+    .trim()
+    .split(/\s+/)
+    .map(token => token.replace(/^["']|["']$/g, ''))
+    .filter(Boolean);
+}
+
+function isReadOnlyGitCommand(args) {
+  const rest = args[0] === '--no-pager' ? args.slice(1) : args;
+  const subcommand = String(rest[0] || '').toLowerCase();
+  if (READ_ONLY_GIT_SUBCOMMANDS.has(subcommand)) return true;
+  // `git branch` は列挙flagだけなら参照だが、位置引数が付くと作成・削除・改名になる。
+  if (subcommand !== 'branch') return false;
+  return rest.slice(1).every(argument => /^(?:-a|-r|-v|-vv|--all|--list|--show-current|--verbose|--(?:no-)?color|--format=.*|--sort=.*)$/i.test(argument));
+}
+
+function isReadOnlyGhCommand(args) {
+  const group = String(args[0] || '').toLowerCase();
+  // `gh api` は既定でGETだが、method指定やfield付与は書き込みになり得る。
+  if (group === 'api') return !args.slice(1).some(argument => GH_WRITE_FLAG.test(argument));
+  const subcommands = READ_ONLY_GH_SUBCOMMANDS.get(group);
+  return Boolean(subcommands && subcommands.has(String(args[1] || '').toLowerCase()));
+}
+
+function isReadOnlyBashCommand(command) {
+  const value = String(command || '').trim();
+  if (!value || hasExecutableShellControl(value)) return false;
+  const tokens = commandTokens(value);
+  const binary = String(tokens[0] || '').replace(/\.(?:exe|cmd|bat)$/i, '').split(/[\\/]/).pop().toLowerCase();
+  const args = tokens.slice(1);
+  if (args.some(argument => OUTPUT_FLAG.test(argument))) return false;
+  if (binary === 'git') return isReadOnlyGitCommand(args);
+  if (binary === 'gh') return isReadOnlyGhCommand(args);
+  return READ_ONLY_BINARIES.has(binary);
+}
+
 function isExactLifecycleCommand(command, action) {
   const value = String(command || '').trim();
   if (!value || hasExecutableShellControl(value)) return false;
@@ -75,13 +130,19 @@ function run(rawInput, options = {}) {
   if (!state.delivery) return rawInput;
   if (state.delivery.status === 'merged') return rawInput;
   if (state.delivery.status === 'draft-pr') {
-    // Draft PRまで到達したDeliveryの参照は保持するが、その状態のまま編集を続けると
+    // Draft PRまで到達したDeliveryの参照は保持するが、その状態のまま変更を続けると
     // commit記録もfresh reviewもStop Gateも適用されない。次の変更要求で
-    // initializeDelivery()が同じIssue/branchのままreadyへ戻すため、編集はそこまで待たせる。
-    if (!['Edit', 'Write', 'MultiEdit'].includes(String(input.tool_name || ''))) return rawInput;
+    // initializeDelivery()が同じIssue/branchのままreadyへ戻すため、変更はそこまで待たせる。
+    // Edit/Writeだけを止めてもshell経由で同じことができるため、Bashもread-only参照と
+    // 記録済みresetコマンドだけに絞る。
+    const toolName = String(input.tool_name || '');
+    const command = String(input.tool_input && input.tool_input.command || '');
+    if (toolName === 'Bash' && (isExactLifecycleCommand(command, 'reset') || isReadOnlyBashCommand(command))) return rawInput;
+    if (!['Bash', 'Edit', 'Write', 'MultiEdit'].includes(toolName)) return rawInput;
     return deny(
       `[ECC Delivery Gate] The delivery for Issue #${state.delivery.issue_number || '<unknown>'} already reached its Draft PR ` +
-        `(${state.delivery.draft_pr_url || 'recorded in ECC state'}). Ask for the follow-up change explicitly so the delivery resumes on ${state.delivery.branch || 'the recorded branch'} ` +
+        `(${state.delivery.draft_pr_url || 'recorded in ECC state'}). Only read-only inspection is allowed until it resumes. ` +
+        `Ask for the follow-up change explicitly so the delivery resumes on ${state.delivery.branch || 'the recorded branch'} ` +
         `with a fresh review, or reset it with node "${path.resolve(__dirname, '../codex/reset.js')}" "${resolveSessionId(input, env)}".`
     );
   }
@@ -174,4 +235,4 @@ if (require.main === module) {
   process.stdin.on('end', () => process.stdout.write(run(raw)));
 }
 
-module.exports = { branchAt, gitValue, isExactLifecycleCommand, run };
+module.exports = { branchAt, gitValue, isExactLifecycleCommand, isReadOnlyBashCommand, run };

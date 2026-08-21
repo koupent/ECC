@@ -2,8 +2,9 @@
 'use strict';
 
 const { spawnSync } = require('child_process');
+const path = require('path');
 const { loadConfig } = require('../codex/config');
-const { readState, recordIncident, writeState } = require('../codex/runtime-state');
+const { readState, recordIncident, resolveSessionId, writeState } = require('../codex/runtime-state');
 
 function isTransientGitHubFailure(message) {
   return /(?:HTTP 5\d\d|timed?\s*out|timeout|ECONNRESET|ENOTFOUND|temporar(?:y|ily)|server is currently unavailable)/i.test(String(message || ''));
@@ -67,6 +68,20 @@ function verifyCommitStatus(execute, config, head, cwd, env) {
   return { ok: true, status };
 }
 
+// Draft PR到達後のDeliveryは、Delivery Gateが変更を止めている限り worktree も HEAD も動かない。
+// それでも動いていれば、記録の外で差分が積み上がったということなので fail-close する。
+function draftPrDrift(execute, delivery, cwd, env) {
+  const status = execute('git', ['status', '--porcelain'], cwd, env);
+  if (!status.ok) return `The worktree could not be inspected: ${status.stderr || 'git status failed'}.`;
+  if (status.stdout) return 'The worktree has uncommitted changes made after the Draft PR.';
+  const recorded = delivery.draft_pr_head || delivery.committed_head || '';
+  if (!recorded) return '';
+  const head = execute('git', ['rev-parse', 'HEAD'], cwd, env);
+  if (!head.ok) return `The current commit could not be inspected: ${head.stderr || 'git rev-parse failed'}.`;
+  if (head.stdout !== recorded) return `HEAD moved from the reviewed Draft PR commit ${recorded} to ${head.stdout || '<unknown>'}.`;
+  return '';
+}
+
 function completeBySquashMerge(execute, config, delivery, pr, head, cwd, env) {
   if (config.mergeGate.provider !== 'commit-status' || config.mergeGate.strategy !== 'squash') {
     return { ok: false, reason: 'squash-merge completion requires mergeGate provider=commit-status and strategy=squash.' };
@@ -123,9 +138,19 @@ function run(rawInput, options = {}) {
   if (delivery.status === 'pending') {
     return block('The required delivery has not been prepared. Run `/ecc:delivery-prepare` so Issue deduplication and the issue-linked branch are recorded before continuing.');
   }
-  if (delivery.status !== 'ready') return rawInput;
-
   const execute = options.command || command;
+
+  if (delivery.status === 'draft-pr') {
+    const drift = draftPrDrift(execute, delivery, cwd, env);
+    if (!drift) return rawInput;
+    return block(
+      `${drift} The delivery for Issue #${delivery.issue_number || '<unknown>'} is recorded as finished at its Draft PR ` +
+        `(${delivery.draft_pr_url || 'recorded in ECC state'}), so this change has no commit record and no fresh review. ` +
+        `Ask for the follow-up change explicitly so the delivery resumes on ${delivery.branch || 'the recorded branch'} and every gate applies again, ` +
+        `or reset it with node "${path.resolve(__dirname, '../codex/reset.js')}" "${resolveSessionId(input, env)}".`
+    );
+  }
+  if (delivery.status !== 'ready') return rawInput;
 
   const status = execute('git', ['status', '--porcelain'], cwd, env);
   if (!status.ok) return block(`Could not inspect the worktree: ${status.stderr || 'git status failed'}`);
@@ -211,7 +236,16 @@ function run(rawInput, options = {}) {
     return rawInput;
   }
 
-  writeState(input, { delivery: { ...delivery, status: 'draft-pr', draft_pr_url: candidate.url, completed_at: new Date().toISOString() } }, env);
+  writeState(input, {
+    delivery: {
+      ...delivery,
+      status: 'draft-pr',
+      draft_pr_url: candidate.url,
+      // 以後のStop Gateは、このcommitからHEADが動いていないことを確認する。
+      draft_pr_head: head.stdout,
+      completed_at: new Date().toISOString()
+    }
+  }, env);
   return rawInput;
 }
 
@@ -222,4 +256,4 @@ if (require.main === module) {
   process.stdin.on('end', () => process.stdout.write(run(raw)));
 }
 
-module.exports = { block, command, completeBySquashMerge, isTransientGitHubFailure, parseJson, run, verifyCommitStatus };
+module.exports = { block, command, completeBySquashMerge, draftPrDrift, isTransientGitHubFailure, parseJson, run, verifyCommitStatus };

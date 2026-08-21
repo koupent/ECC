@@ -60,14 +60,37 @@ function slug(value) {
   return ascii || 'task';
 }
 
+// Issue / PR の指定は `Issue #300` のような短い表記だけでなく、GitHubのcanonical URL
+// （`https://<host>/<owner>/<repo>/issues|pull/<n>`）や `Pull Request #300` でも届く。
+// どれか一つでも取りこぼすと、別Deliveryへの要求を進行中Deliveryの続きとして扱ってしまう。
+const HOST = String.raw`(?:https?:\/\/)?(?:[\w-]+\.)+[a-z]{2,}(?::\d+)?`;
+const DELIVERY_REFERENCES = {
+  issueNumber: [
+    new RegExp(String.raw`${HOST}\/[^\s/]+\/[^\s/]+\/issues\/(\d+)\b`, 'i'),
+    /\bissue\s*#?\s*(\d+)\b/i
+  ],
+  prNumber: [
+    new RegExp(String.raw`${HOST}\/[^\s/]+\/[^\s/]+\/pull\/(\d+)\b`, 'i'),
+    /\b(?:pull[\s-]*request|pr)\s*#?\s*(\d+)\b/i
+  ]
+};
+
+function parseDeliveryReferences(request) {
+  const value = String(request || '');
+  const parsed = {};
+  for (const [key, patterns] of Object.entries(DELIVERY_REFERENCES)) {
+    const match = patterns.map(pattern => value.match(pattern)).find(Boolean);
+    parsed[key] = match ? Number(match[1]) : null;
+  }
+  return parsed;
+}
+
 function explicitIssueNumber(request) {
-  const match = String(request || '').match(/\bissue\s*#?\s*(\d+)\b/i);
-  return match ? Number(match[1]) : null;
+  return parseDeliveryReferences(request).issueNumber;
 }
 
 function explicitPrNumber(request) {
-  const match = String(request || '').match(/\bpr\s*#?\s*(\d+)\b/i);
-  return match ? Number(match[1]) : null;
+  return parseDeliveryReferences(request).prNumber;
 }
 
 function deliveryPrNumber(delivery) {
@@ -76,9 +99,8 @@ function deliveryPrNumber(delivery) {
 }
 
 function referencesOtherDelivery(delivery, request) {
-  const issueNumber = explicitIssueNumber(request);
+  const { issueNumber, prNumber } = parseDeliveryReferences(request);
   if (issueNumber && delivery.issue_number && issueNumber !== Number(delivery.issue_number)) return true;
-  const prNumber = explicitPrNumber(request);
   const recordedPr = deliveryPrNumber(delivery);
   return Boolean(prNumber && recordedPr && prNumber !== recordedPr);
 }
@@ -88,6 +110,7 @@ function resumeDeliveryAfterDraftPr(input, delivery, env) {
     ...delivery,
     status: 'ready',
     completed_at: null,
+    draft_pr_head: null,
     committed_head: null,
     committed_at: null,
     completion_stage: null,
@@ -380,6 +403,7 @@ module.exports = {
   isActiveDelivery,
   isDeliveryRequest,
   normalizeIssueTitle,
+  parseDeliveryReferences,
   parseIssueNumber,
   pendingSessionForProject,
   prepareDelivery,

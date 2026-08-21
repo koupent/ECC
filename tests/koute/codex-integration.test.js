@@ -526,6 +526,119 @@ test('a request naming another Issue starts a new pending delivery that keeps th
   assert.match(stopped.reason, /has not been prepared/);
 });
 
+test('a draft-pr delivery allows only read-only Bash and fails closed when the worktree or HEAD moves', () => {
+  const { fixture, fixtureEnv, input, head } =
+    createDraftPrFixture('delivery-draft-pr-bash-repo', 'delivery-draft-pr-bash', 'delivery-draft-pr-bash-state');
+  const bash = command => JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command } });
+
+  // 参照だけのBashと、記録済みresetコマンドは通す。
+  for (const allowed of [
+    'git status --porcelain',
+    'git log --oneline -5',
+    'git diff HEAD~1',
+    'git branch --show-current',
+    'gh pr view 274',
+    'gh api repos/acme/repo/pulls/274',
+    'node "/plugin/scripts/codex/reset.js" "delivery-draft-pr-bash"'
+  ]) {
+    assert.strictEqual(deliveryGate.run(bash(allowed), { cwd: fixture, env: fixtureEnv }), bash(allowed), allowed);
+  }
+  // shell経由の書き込み、branch切替、commitはEditと同じくfail-closeする。
+  for (const denied of [
+    'git commit -m "bypass"',
+    'git switch main',
+    'git checkout -b codex/issue-999-bypass',
+    'git branch -D codex/issue-271-task',
+    'git add -A',
+    'git stash',
+    'npm test',
+    'rm -rf src',
+    'sed -i "s/true/false/" src/product.ts',
+    'echo bypass > src/product.ts',
+    'cat src/product.ts | tee src/product.ts',
+    'gh pr merge 274 --squash',
+    'gh api -X POST repos/acme/repo/issues',
+    'node "/plugin/scripts/codex/delivery-lifecycle.js" prepare --session "delivery-draft-pr-bash"'
+  ]) {
+    const output = JSON.parse(deliveryGate.run(bash(denied), { cwd: fixture, env: fixtureEnv }));
+    assert.strictEqual(output.hookSpecificOutput.permissionDecision, 'deny', denied);
+    assert.match(output.hookSpecificOutput.permissionDecisionReason, /Only read-only inspection is allowed/);
+  }
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git show --stat'), true);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git status; git commit -m x'), false);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git log --output=/tmp/log'), false);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git branch codex/issue-999-bypass'), false);
+
+  // Stop: 変更が無ければ完了状態のまま停止できる。
+  const stop = JSON.stringify(input);
+  assert.strictEqual(deliveryCompletion.run(stop, { cwd: fixture, env: fixtureEnv }), stop);
+  // Gateの外で差分が積み上がっていれば、記録もreviewも無いまま停止させない。
+  fs.writeFileSync(path.join(fixture, 'src', 'product.ts'), 'export const product = false;\n', 'utf8');
+  const dirty = JSON.parse(deliveryCompletion.run(stop, { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(dirty.decision, 'block');
+  assert.match(dirty.reason, /uncommitted changes made after the Draft PR/);
+  assert.strictEqual(spawnSync('git', ['add', '-A'], { cwd: fixture }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'bypass'], { cwd: fixture }).status, 0);
+  const moved = JSON.parse(deliveryCompletion.run(stop, { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(moved.decision, 'block');
+  assert.match(moved.reason, new RegExp(`HEAD moved from the reviewed Draft PR commit ${head}`));
+  assert.match(moved.reason, /reset\.js/);
+});
+
+test('a GitHub URL naming another Issue or PR starts a new delivery while the recorded PR URL resumes', () => {
+  const same = createDraftPrFixture('delivery-draft-pr-url-same-repo', 'delivery-draft-pr-url-same', 'delivery-draft-pr-url-same-state');
+  // 記録済みPRと同じ番号のURLは、同じDeliveryの続きとして再開する。
+  const resumed = initializeDelivery(
+    same.input,
+    'https://github.com/koupent/ECC/pull/274 のレビュー指摘を修正してください',
+    { cwd: same.fixture, env: same.fixtureEnv }
+  );
+  assert.strictEqual(resumed.status, 'ready');
+  assert.strictEqual(resumed.issue_number, 271);
+  assert.strictEqual(resumed.branch, same.branch);
+  assert.strictEqual(resumed.draft_pr_url, 'https://example.invalid/pull/274');
+
+  // canonical URLで別Issue / 別PRを指した要求は、旧Deliveryを退避して新規Deliveryを始める。
+  for (const [name, request, expected] of [
+    [
+      'delivery-draft-pr-url-issue',
+      'https://github.com/acme/repo/issues/300 を修正してください',
+      { requested_issue_number: 300, requested_pr_number: null }
+    ],
+    [
+      'delivery-draft-pr-url-pull',
+      'https://github.com/acme/repo/pull/300 の指摘を修正してください',
+      { requested_issue_number: null, requested_pr_number: 300 }
+    ]
+  ]) {
+    const other = createDraftPrFixture(`${name}-repo`, name, `${name}-state`);
+    const started = initializeDelivery(other.input, request, { cwd: other.fixture, env: other.fixtureEnv });
+    assert.strictEqual(started.status, 'pending', request);
+    assert.strictEqual(started.requested_issue_number, expected.requested_issue_number, request);
+    assert.strictEqual(started.requested_pr_number, expected.requested_pr_number, request);
+    assert.strictEqual(started.issue_number, null, request);
+    assert.strictEqual(started.draft_pr_url, null, request);
+    const state = readState(other.input, other.fixtureEnv);
+    assert.strictEqual(state.previous_delivery.status, 'draft-pr', request);
+    assert.strictEqual(state.previous_delivery.issue_number, 271, request);
+    assert.strictEqual(state.previous_delivery.branch, other.branch, request);
+    assert.strictEqual(state.previous_delivery.draft_pr_url, 'https://example.invalid/pull/274', request);
+    // 新しいDeliveryはprepare前なので、prepareを促してfail-closeする。
+    const edit = JSON.stringify({ ...other.input, tool_name: 'Edit', tool_input: { file_path: path.join(other.fixture, 'src', 'product.ts') } });
+    const denied = JSON.parse(deliveryGate.run(edit, { cwd: other.fixture, env: other.fixtureEnv }));
+    assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny', request);
+    assert.match(denied.hookSpecificOutput.permissionDecisionReason, /delivery-lifecycle\.js/);
+  }
+
+  // 共有パーサーはURLと一般的なPull Request表記の両方を認識する。
+  assert.strictEqual(explicitIssueNumber('https://github.com/acme/repo/issues/300 を修正してください'), 300);
+  assert.strictEqual(explicitPrNumber('https://github.com/acme/repo/pull/300 を仕上げてください'), 300);
+  assert.strictEqual(explicitPrNumber('Pull Request #300 をマージしてください'), 300);
+  assert.strictEqual(explicitPrNumber('pull-request 300 を確認してください'), 300);
+  assert.strictEqual(explicitIssueNumber('https://github.com/acme/repo/pull/300 を修正してください'), null);
+  assert.strictEqual(explicitPrNumber('https://github.com/acme/repo/issues/300 を修正してください'), null);
+});
+
 test('a completed delivery is not reused when the same request text is sent again', () => {
   const fixture = createGitFixture('delivery-merged-repeat-repo');
   fs.writeFileSync(
@@ -686,8 +799,13 @@ test('required delivery gate blocks edits until issue and branch evidence are re
   writeState(input, {
     delivery: { ...delivery, status: 'draft-pr', issue_number: 42, branch, draft_pr_url: 'https://example.invalid/pull/43' }
   }, fixtureEnv);
-  // Draft PR到達後もPR確認などの読み取りは通すが、Gateの外で差分を積み上げる編集は止める。
-  assert.strictEqual(deliveryGate.run(bash, { cwd: fixture, env: fixtureEnv }), bash);
+  // Draft PR到達後もPR確認などの読み取りは通すが、Gateの外で差分を積み上げる操作は止める。
+  const inspect = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: 'gh pr view 43' } });
+  assert.strictEqual(deliveryGate.run(inspect, { cwd: fixture, env: fixtureEnv }), inspect);
+  // read-onlyと断定できないBashは、Editと同じくfail-closeする。
+  const deniedNpm = JSON.parse(deliveryGate.run(bash, { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(deniedNpm.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(deniedNpm.hookSpecificOutput.permissionDecisionReason, /Only read-only inspection is allowed/);
   const afterDraftPr = JSON.parse(deliveryGate.run(raw, { cwd: fixture, env: fixtureEnv }));
   assert.strictEqual(afterDraftPr.hookSpecificOutput.permissionDecision, 'deny');
   assert.match(afterDraftPr.hookSpecificOutput.permissionDecisionReason, /already reached its Draft PR/);
@@ -797,6 +915,8 @@ test('delivery completion gate rejects a review that is not bound to the current
   const completed = readState(input, fixtureEnv);
   assert.strictEqual(completed.delivery.status, 'draft-pr');
   assert.strictEqual(completed.delivery.draft_pr_url, 'https://example.invalid/pr/2');
+  // Draft PR到達時のcommitを記録し、以後のStop GateがHEADの変化を検出できるようにする。
+  assert.strictEqual(completed.delivery.draft_pr_head, head);
 });
 
 test('squash completion requires a current Local Merge Gate status and confirms the merged PR', () => {

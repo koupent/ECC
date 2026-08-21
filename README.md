@@ -43,7 +43,7 @@ bound to the following Hook-enforced lifecycle:
 2. `/ecc:delivery-prepare` searches open Issues, selects or creates one, and creates its `codex/issue-*` branch.
 3. Repository edits fail closed until that external-state evidence and branch agree.
 4. A fresh Codex review, clean commit, push, and open Draft PR are required before the task can stop.
-5. An explicit follow-up change request after the Draft PR keeps the same Issue, branch, and PR, but reopens the delivery: the recorded completion, commit, and review evidence are dropped so steps 3 and 4 apply again. A question or review-only follow-up does not reopen it, and edits stay blocked until the change is requested explicitly. Only a request naming a different Issue or PR starts a new delivery, and the previous record is retained in external state.
+5. An explicit follow-up change request after the Draft PR keeps the same Issue, branch, and PR, but reopens the delivery: the recorded completion, commit, and review evidence are dropped so steps 3 and 4 apply again. A question or review-only follow-up does not reopen it. Until the delivery reopens, only read-only inspection and the recorded reset command are allowed: edits, shell mutations, branch switches, and commits fail closed, and the task cannot stop if the worktree or `HEAD` moved anyway. Only a request naming a different Issue or PR — as `Issue #300` / `PR #300`, as `Pull Request #300`, or as a canonical GitHub `/issues/300` or `/pull/300` URL — starts a new delivery, and the previous record is retained in external state.
 
 The Draft PR gate never marks a PR ready and never merges it.
 
