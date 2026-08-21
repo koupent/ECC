@@ -813,13 +813,27 @@ test('local merge policy blocks merge bypasses and direct success status publica
   for (const command of [
     'gh pr merge 12 --squash',
     'gh pr merge 12 --admin --squash',
-    'gh api repos/acme/example/statuses/abc -f state=success -f context="Local Merge Gate"'
+    'gh api repos/acme/example/statuses/abc -f state=success -f context="Local Merge Gate"',
+    'env gh pr merge 12 --squash',
+    'git status --porcelain\ngh pr merge 12 --squash',
+    'echo "$(gh pr merge 12 --squash)"',
+    'cat <<EOF\n$(gh pr merge 12 --squash)\nEOF',
+    'bash -lc "gh pr merge 12 --squash"',
+    'curl -X POST https://api.github.com/repos/acme/example/statuses/abc -d \'{"state":"success"}\''
   ]) {
     const denied = JSON.parse(localMergePolicy.run(bash(command), { cwd: fixture, env }));
     assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny', command);
   }
-  const ordinary = bash('gh pr view 12 --json state');
-  assert.strictEqual(localMergePolicy.run(ordinary, { cwd: fixture, env }), ordinary);
+  for (const command of [
+    'gh pr view 12 --json state',
+    'git commit -m "gh pr merge stays with the completion gate"',
+    'bash -lc "echo \'gh pr merge stays with the completion gate\'"',
+    "python3 - <<'PY'\nnote = \"gh pr merge and -f state=success are blocked locally\"\nopen('memory.md', 'w').write(note)\nPY",
+    "cat > notes.md <<'EOF'\ngh api repos/acme/example/statuses/abc -f state=success\nEOF"
+  ]) {
+    const allowed = bash(command);
+    assert.strictEqual(localMergePolicy.run(allowed, { cwd: fixture, env }), allowed, command);
+  }
 
   const backgroundReview = JSON.stringify({
     cwd: fixture,
