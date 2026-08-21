@@ -2,15 +2,12 @@
 'use strict';
 
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const { loadConfig } = require('./config');
 const { atomicWrite, hash, readEvents, readJson, recordIncident, redactText, stateRoot } = require('./runtime-state');
-const { runRole } = require('./run-role');
 
 const INCIDENT_TARGETS = new Set(['ecc', 'kit', 'product']);
-const STATUS_LABELS = new Set(['status:queued', 'status:needs-human', 'status:draft-pr']);
 const LOCK_STALE_MS = 35 * 60 * 1000;
 const LABELS = {
   'harness-incident': { color: 'B60205', description: 'ECC共通ハーネスが自動報告したインシデント' },
@@ -111,10 +108,6 @@ function publicIncident(event) {
   };
 }
 
-function ensureForkTarget(repo) {
-  if (repo !== 'koupent/ECC') throw new Error(`Automatic remediation target must be exactly koupent/ECC, got ${repo}`);
-}
-
 function ensureLabels(repo, labels, env) {
   for (const name of labels) {
     const spec = LABELS[name];
@@ -177,7 +170,7 @@ function createCentralIssue(event, config, env) {
     '',
     redactText(event.message || ''),
     '',
-    'Follow-up must use the normal Claude Code CLI workflow. Background remediation never merges changes.',
+    'Follow-up is owned by the dedicated central Operator. Product sessions report only and return to product work.',
     'No source prompt, secret, absolute path, or product repository name is included.'
   ].join('\n');
   const args = ['issue', 'create', '--repo', config.centralIncidentRepo, '--title', title, '--body', body];
@@ -188,80 +181,6 @@ function createCentralIssue(event, config, env) {
   const canonical = matches[0] || created;
   reconcileDuplicates(canonical, matches, config, env);
   return { ...canonical, target, created: canonical.number === created.number };
-}
-
-function updateIssueStatus(issue, status, message, config, env) {
-  ensureLabels(config.centralIncidentRepo, [status], env);
-  const view = assertSuccess(
-    exec('gh', ['issue', 'view', String(issue.number), '--repo', config.centralIncidentRepo, '--json', 'labels'], { env }),
-    `view issue #${issue.number}`
-  );
-  const current = new Set((JSON.parse(view || '{}').labels || []).map(label => label.name));
-  const args = ['issue', 'edit', String(issue.number), '--repo', config.centralIncidentRepo, '--add-label', status];
-  for (const label of current) {
-    if (STATUS_LABELS.has(label) && label !== status) args.push('--remove-label', label);
-  }
-  assertSuccess(exec('gh', args, { env }), `update issue #${issue.number}`);
-  if (message) {
-    assertSuccess(
-      exec('gh', ['issue', 'comment', String(issue.number), '--repo', config.centralIncidentRepo, '--body', redactText(message)], { env }),
-      `comment issue #${issue.number}`
-    );
-  }
-}
-
-function remediate(event, config, env) {
-  ensureForkTarget(config.forkRepo);
-  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-remediation-'));
-  const checkout = path.join(temp, 'ECC');
-  const branch = `codex/incident-${event.fingerprint.slice(0, 12)}`;
-  try {
-    assertSuccess(exec('gh', ['repo', 'clone', config.forkRepo, checkout], { env, timeout: 180000 }), 'fork clone');
-    assertSuccess(exec('git', ['switch', '-c', branch], { cwd: checkout, env }), 'branch creation');
-    const request = [
-      'Fix this sanitized ECC harness incident without changing ECC standard workflow semantics.',
-      JSON.stringify(publicIncident(event)),
-      'A regression test must fail before the fix and pass afterward. Keep the change generic and public-safe.'
-    ].join('\n');
-    const role = runRole({ role: 'harness-remediation', request, cwd: checkout, env, force: true });
-    if (!role.ok) throw new Error(`Codex remediation failed: ${role.error}`);
-    const changed = String(assertSuccess(exec('git', ['status', '--porcelain'], { cwd: checkout, env }), 'status'));
-    if (!changed.trim()) throw new Error('Codex remediation produced no changes');
-    assertSuccess(exec('npm', ['test'], { cwd: checkout, env, timeout: 20 * 60 * 1000 }), 'ECC test suite');
-    assertSuccess(exec('git', ['add', '--all'], { cwd: checkout, env }), 'staging');
-    assertSuccess(
-      exec('git', ['-c', 'user.name=Koupent ECC Worker', '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com', 'commit', '-m', `fix: インシデント ${event.fingerprint.slice(0, 10)} を修正`], {
-        cwd: checkout,
-        env
-      }),
-      'commit'
-    );
-    assertSuccess(exec('git', ['push', '--set-upstream', 'origin', branch], { cwd: checkout, env, timeout: 180000 }), 'push');
-    const prBody = [
-      '## 変更内容',
-      '',
-      `匿名化された共通ハーネスインシデント \`${event.fingerprint}\` の回帰テストと修正です。`,
-      '',
-      '## 検証',
-      '',
-      '- `npm test`',
-      '',
-      'このPRは自動マージされません。本家ECCへのPRも自動作成されません。'
-    ].join('\n');
-    return assertSuccess(
-      exec('gh', ['pr', 'create', '--repo', config.forkRepo, '--base', 'main', '--head', branch, '--draft', '--title', `fix: 共通ハーネスインシデント ${event.fingerprint.slice(0, 10)}`, '--body', prBody], {
-        cwd: checkout,
-        env
-      }),
-      'draft PR creation'
-    );
-  } finally {
-    try {
-      fs.rmSync(temp, { recursive: true, force: true });
-    } catch {
-      // The worker's private temp directory is best-effort cleanup.
-    }
-  }
 }
 
 function runOnce(options = {}) {
@@ -290,37 +209,8 @@ function runOnce(options = {}) {
       return { status: 'retry', error: error.message || String(error) };
     }
 
-    if (!config.autoRemediation || issue.target !== 'ecc') {
-      markProcessed(event, 'reported', { issue_url: issue.url, target: issue.target }, env);
-      return { status: 'reported', issueUrl: issue.url, target: issue.target };
-    }
-
-    try {
-      const prUrl = remediate(event, config, env);
-      updateIssueStatus(issue, 'status:draft-pr', `Automatic draft remediation created: ${prUrl}`, config, env);
-      markProcessed(event, 'draft-pr', { issue_url: issue.url, pr_url: prUrl, target: issue.target }, env);
-      return { status: 'draft-pr', issueUrl: issue.url, prUrl };
-    } catch (error) {
-      recordIncident(
-        {
-          type: 'incident_remediation_failure',
-          severity: 'minor',
-          promotable: false,
-          message: error.message || String(error),
-          metadata: { source_fingerprint: event.fingerprint, issue_url: issue.url }
-        },
-        { env }
-      );
-      updateIssueStatus(
-        issue,
-        'status:needs-human',
-        `Background remediation failed. Continue with the normal Claude Code CLI workflow.\n\n${error.message || String(error)}`,
-        config,
-        env
-      );
-      markProcessed(event, 'needs-human', { issue_url: issue.url, target: issue.target }, env);
-      return { status: 'needs-human', issueUrl: issue.url, error: error.message || String(error) };
-    }
+    markProcessed(event, 'reported', { issue_url: issue.url, target: issue.target }, env);
+    return { status: 'reported', issueUrl: issue.url, target: issue.target };
   } finally {
     release();
   }
@@ -337,7 +227,6 @@ module.exports = {
   classifyTarget,
   createCentralIssue,
   eligible,
-  ensureForkTarget,
   markProcessed,
   nextIncident,
   publicIncident,

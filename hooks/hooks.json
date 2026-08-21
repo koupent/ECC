@@ -316,7 +316,7 @@
             "timeout": 1800
           }
         ],
-        "description": "Promote sanitized repeated or critical harness incidents and create draft PRs only in koupent/ECC",
+        "description": "Promote sanitized repeated or critical harness incidents to the central Kit Issue queue; product sessions only report and return to product work",
         "id": "session:end:codex-incident-worker"
       }
     ]
