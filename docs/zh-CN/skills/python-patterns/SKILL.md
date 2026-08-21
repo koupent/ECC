@@ -541,8 +541,8 @@ from fastapi import FastAPI
 from mypackage.models import User
 from mypackage.utils import format_name
 
-# Good: Use isort for automatic import sorting
-# pip install isort
+# Good: Sort imports with the tool the project already depends on
+# ruff check --select I --fix .   (or, for an isort project: isort .)
 ```
 
 ### **init**.py 用于包导出
@@ -619,14 +619,19 @@ result = buffer.getvalue()
 
 ### 基本命令
 
+格式化工具、导入排序工具与 linter 由项目决定，而不是由本技能决定：请分别根据
+`pyproject.toml` 与已声明的依赖来判断（参见 `rules/python/coding-style.md` 的格式化一节）。
+下面的命令展示 ruff 组合，并在注释中给出 black/isort 项目的等价命令——每类只运行其中一个。
+
 ```bash
 # Code formatting
-black .
-isort .
+ruff format .                    # or: black .
+
+# Import sorting
+ruff check --select I --fix .    # or: isort .
 
 # Linting
-ruff check .
-pylint mypackage/
+ruff check .                     # or: flake8 . / pylint mypackage/
 
 # Type checking
 mypy .
@@ -658,18 +663,19 @@ dependencies = [
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
-    "black>=23.0.0",
+    # 只保留一套格式化组合：ruff（见下）或改用 black + isort。
     "ruff>=0.1.0",
     "mypy>=1.5.0",
 ]
 
-[tool.black]
-line-length = 88
-target-version = ['py39']
-
 [tool.ruff]
 line-length = 88
+
+[tool.ruff.lint]
 select = ["E", "F", "I", "N", "W"]
+
+[tool.ruff.format]
+docstring-code-format = true
 
 [tool.mypy]
 python_version = "3.9"

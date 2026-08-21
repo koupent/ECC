@@ -3,9 +3,16 @@
  *
  * Regression coverage for issue #72:
  *  1. coding-style.md must not hardcode black/isort — ruff-only projects have
- *     neither installed, so the rule demanded uninstallable tooling.
+ *     neither installed, so the rule demanded uninstallable tooling. The same
+ *     applies in reverse: a black/isort/flake8 project must not be told to run
+ *     ruff, so formatter, import sorter, and linter resolve independently.
  *  2. fastapi.md path globs must match the common `api/` layout
  *     (api/main.py, api/routers/*.py, api/schemas.py), not just `app/`.
+ *
+ * The guidance reaches users through several surfaces, so all of them are
+ * checked: the canonical pack, its locale mirrors, the Cursor rules (which the
+ * Codex sync script re-exports as the python rule pack), and the
+ * `python-patterns` skill the rules point at for details.
  *
  * Run with: node tests/rules/python-rule-pack.test.js
  */
@@ -14,11 +21,22 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 
-const RULES_DIR = path.resolve(__dirname, '..', '..', 'rules', 'python');
+const REPO_ROOT = path.resolve(__dirname, '..', '..');
+const RULES_DIR = path.join(REPO_ROOT, 'rules', 'python');
+const CURSOR_RULES_DIR = path.join(REPO_ROOT, '.cursor', 'rules');
+const CODEX_SYNC_SCRIPT = path.join(REPO_ROOT, 'scripts', 'sync-ecc-to-codex.sh');
+const SKILL_FILE = path.join(REPO_ROOT, 'skills', 'python-patterns', 'SKILL.md');
+
+const LOCALES = ['es', 'ja-JP', 'tr', 'zh-CN'];
 
 /** Locale mirrors of rules/python that must not contradict the source pack. */
-const LOCALE_RULE_DIRS = ['es', 'ja-JP', 'tr', 'zh-CN'].map(locale =>
-  path.resolve(__dirname, '..', '..', 'docs', locale, 'rules', 'python')
+const LOCALE_RULE_DIRS = LOCALES.map(locale =>
+  path.join(REPO_ROOT, 'docs', locale, 'rules', 'python')
+);
+
+/** Locale mirrors of the skill the python rules reference. */
+const LOCALE_SKILL_FILES = LOCALES.map(locale =>
+  path.join(REPO_ROOT, 'docs', locale, 'skills', 'python-patterns', 'SKILL.md')
 );
 
 /**
@@ -127,23 +145,66 @@ function matchesAny(globs, filePath) {
 }
 
 /**
- * Extract the tool-resolution steps from coding-style.md's Formatting section.
+ * Extract the inline `globs:` array from a Cursor rule's frontmatter.
  *
- * The section holds two ordered lists (formatter, then import sorter); this
- * returns one entry per numbered step, excluding the introductory prose.
- *
- * @param {string} source - coding-style.md contents
- * @returns {string[]} The numbered steps, in file order
+ * @param {string} source - Cursor rule file contents
+ * @returns {string[]} The declared globs, in file order
  */
-function parseFormattingSteps(source) {
+function parseCursorGlobs(source) {
+  const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---/.exec(source);
+  assert.ok(frontmatter, 'cursor rule must start with YAML frontmatter');
+
+  const globsLine = /^globs:\s*\[(.*)\]\s*$/m.exec(frontmatter[1]);
+  assert.ok(globsLine, 'cursor rule must declare an inline globs array');
+
+  return globsLine[1]
+    .split(',')
+    .map(entry => entry.trim().replace(/^["']|["']$/g, ''))
+    .filter(Boolean);
+}
+
+/**
+ * Extract the tool-resolution lists from a Formatting section.
+ *
+ * The section holds one ordered list per tool role (formatter, import sorter,
+ * linter). Wrapped continuation lines are folded back into their step so each
+ * entry can be matched as a single condition/command pair.
+ *
+ * @param {string} source - Contents of a coding-style rule file
+ * @returns {Record<string, string[]>} Steps keyed by the role heading
+ */
+function parseResolutionLists(source) {
   const start = source.indexOf('## Formatting');
-  assert.notStrictEqual(start, -1, 'coding-style.md must have a Formatting section');
+  assert.notStrictEqual(start, -1, 'coding-style rule must have a Formatting section');
 
-  const end = source.indexOf('Use **ruff** for linting', start);
-  assert.notStrictEqual(end, -1, 'Formatting section must end with the linting rule');
+  const end = source.indexOf('When a rule here disagrees', start);
+  assert.notStrictEqual(end, -1, 'Formatting section must end with the project-wins note');
 
-  // Drop the leading chunk: prose before the first numbered step.
-  return source.slice(start, end).split(/^\d+\.\s/m).slice(1);
+  const lists = {};
+  let current = null;
+
+  for (const rawLine of source.slice(start, end).split(/\r?\n/)) {
+    const heading = /^(Formatter|Import sorting|Linting):\s*$/.exec(rawLine);
+    if (heading) {
+      current = heading[1];
+      lists[current] = [];
+      continue;
+    }
+    if (!current) continue;
+
+    const step = /^\d+\.\s+(.*)$/.exec(rawLine);
+    if (step) {
+      lists[current].push(step[1].trim());
+      continue;
+    }
+
+    const continuation = /^\s{2,}(\S.*)$/.exec(rawLine);
+    if (continuation && lists[current].length > 0) {
+      lists[current][lists[current].length - 1] += ` ${continuation[1].trim()}`;
+    }
+  }
+
+  return lists;
 }
 
 function runTests() {
@@ -208,25 +269,71 @@ function runTests() {
     assert.ok(/black/.test(formatting) && /isort/.test(formatting));
   });
 
-  run('coding-style.md resolves formatter and import sorter independently', () => {
-    const source = readRule(RULES_DIR, 'coding-style.md');
-    assert.ok(
-      /^Formatter:\s*$/m.test(source),
-      'Formatting must resolve the formatter in its own list'
-    );
-    assert.ok(
-      /^Import sorting:\s*$/m.test(source),
-      'Formatting must resolve the import sorter in its own list'
+  run('coding-style.md resolves formatter, import sorter, and linter separately', () => {
+    const lists = parseResolutionLists(readRule(RULES_DIR, 'coding-style.md'));
+
+    assert.deepStrictEqual(
+      Object.keys(lists),
+      ['Formatter', 'Import sorting', 'Linting'],
+      'Formatting must resolve each tool role in its own list'
     );
 
-    // A step naming both tools would tell a black-only (or isort-only) project
-    // to run a tool it does not depend on — the issue #72 regression.
-    for (const step of parseFormattingSteps(source)) {
+    for (const [role, steps] of Object.entries(lists)) {
+      assert.ok(steps.length >= 3, `${role} must document a full resolution order`);
+
+      // A step naming both tools would tell a black-only (or isort-only)
+      // project to run a tool it does not depend on — the issue #72 regression.
+      for (const step of steps) {
+        assert.ok(
+          !(/black/.test(step) && /isort/.test(step)),
+          `no resolution step may require black and isort together: ${step}`
+        );
+      }
+    }
+  });
+
+  run('coding-style.md never forces ruff on a black/isort/flake8 project', () => {
+    const source = readRule(RULES_DIR, 'coding-style.md');
+    const lists = parseResolutionLists(source);
+
+    // Issue #72 in reverse: the project from the report has ruff only, but a
+    // project with black + isort + flake8 must reach a step of its own before
+    // any step that prescribes ruff.
+    assert.ok(
+      lists.Formatter.some(step => /`black`/.test(step) && !/ruff/.test(step)),
+      'Formatter must have a black step that does not mention ruff'
+    );
+    assert.ok(
+      lists['Import sorting'].some(step => /`isort`/.test(step) && !/ruff/.test(step)),
+      'Import sorting must have an isort step that does not mention ruff'
+    );
+    assert.ok(
+      lists.Linting.some(step => /`flake8`|`pylint`/.test(step) && !/ruff/.test(step)),
+      'Linting must have a non-ruff linter step'
+    );
+
+    assert.ok(
+      !/Use \*\*ruff\*\* for linting/.test(source),
+      'Formatting must not mandate ruff linting unconditionally'
+    );
+  });
+
+  run('coding-style.md treats adding a tool as a dependency change', () => {
+    const source = readRule(RULES_DIR, 'coding-style.md');
+    const lists = parseResolutionLists(source);
+
+    for (const [role, steps] of Object.entries(lists)) {
+      const last = steps[steps.length - 1];
       assert.ok(
-        !(/black/.test(step) && /isort/.test(step)),
-        `no resolution step may require black and isort together: ${step.trim()}`
+        /propose/.test(last),
+        `${role}'s fallback must propose the new dependency instead of assuming it: ${last}`
       );
     }
+
+    assert.ok(
+      /changes the project's dependencies/.test(source),
+      'Formatting must state that adding a tool is a dependency change'
+    );
   });
 
   run('hooks.md does not prescribe a fixed python formatter', () => {
@@ -286,6 +393,23 @@ function runTests() {
         formatting.includes('ruff check --select I'),
         `${file} must name ruff import sorting for ruff-configured projects`
       );
+      assert.ok(
+        formatting.includes('flake8') || formatting.includes('pylint'),
+        `${file} must offer a non-ruff linter for projects without ruff`
+      );
+    }
+  });
+
+  run('locale hooks mirrors do not prescribe a fixed formatter', () => {
+    for (const dir of LOCALE_RULE_DIRS) {
+      const file = path.join(dir, 'hooks.md');
+      if (!fs.existsSync(file)) continue;
+
+      const source = fs.readFileSync(file, 'utf8');
+      assert.ok(
+        !/\*\*black\/ruff\*\*/.test(source),
+        `${file} must defer to the project formatter instead of naming black/ruff`
+      );
     }
   });
 
@@ -299,6 +423,117 @@ function runTests() {
         parsePathGlobs(fs.readFileSync(file, 'utf8')),
         expected,
         `${file} must declare the same path globs as rules/python/fastapi.md`
+      );
+    }
+  });
+
+  // ── referenced skill must not re-introduce fixed tooling ──────
+
+  run('python-patterns skill defers tool choice to the project', () => {
+    for (const file of [SKILL_FILE, ...LOCALE_SKILL_FILES]) {
+      if (!fs.existsSync(file)) continue;
+
+      const source = fs.readFileSync(file, 'utf8');
+      assert.ok(
+        source.includes('rules/python/coding-style.md'),
+        `${file} must point at the coding-style resolution order`
+      );
+      // Every tool stays available; none of them is the unconditional default.
+      for (const command of ['ruff format .', 'ruff check --select I --fix .', 'black .', 'isort .']) {
+        assert.ok(
+          source.includes(command),
+          `${file} must keep ${command} available as a documented option`
+        );
+      }
+    }
+  });
+
+  run('skills the changed rules reference do not hardcode black/isort', () => {
+    // The rules are the always-on layer and the skills are their detail layer,
+    // so a skill that still demands black/isort reproduces issue #72 for anyone
+    // who follows the reference.
+    const referencedSkills = { 'coding-style.md': 'python-patterns', 'fastapi.md': 'fastapi-patterns' };
+
+    for (const [rule, skill] of Object.entries(referencedSkills)) {
+      assert.ok(
+        readRule(RULES_DIR, rule).includes(`See skill: \`${skill}\``),
+        `rules/python/${rule} must reference the ${skill} skill`
+      );
+
+      const files = [
+        path.join(REPO_ROOT, 'skills', skill, 'SKILL.md'),
+        ...LOCALES.map(locale => path.join(REPO_ROOT, 'docs', locale, 'skills', skill, 'SKILL.md'))
+      ];
+
+      for (const file of files) {
+        if (!fs.existsSync(file)) continue;
+
+        const source = fs.readFileSync(file, 'utf8');
+        assert.ok(
+          !/pip install (?:black|isort)/.test(source),
+          `${file} must not tell every project to install black/isort`
+        );
+        // Bare commands at the start of a line are unconditional instructions.
+        assert.ok(
+          !/^(?:black|isort) \.$/m.test(source),
+          `${file} must not list black/isort as unconditional commands`
+        );
+        assert.ok(
+          !/^\[tool\.black\]$/m.test(source),
+          `${file} must not configure a second formatter alongside ruff`
+        );
+      }
+    }
+  });
+
+  // ── Cursor / Codex surfaces must carry the same pack ──────────
+
+  run('every python rule has a Cursor counterpart', () => {
+    for (const file of fs.readdirSync(RULES_DIR)) {
+      if (!file.endsWith('.md')) continue;
+
+      const counterpart = path.join(CURSOR_RULES_DIR, `python-${file}`);
+      assert.ok(
+        fs.existsSync(counterpart),
+        `rules/python/${file} must ship a Cursor rule at ${counterpart}`
+      );
+    }
+  });
+
+  run('Cursor python-coding-style.md matches the source resolution lists', () => {
+    assert.deepStrictEqual(
+      parseResolutionLists(readRule(CURSOR_RULES_DIR, 'python-coding-style.md')),
+      parseResolutionLists(readRule(RULES_DIR, 'coding-style.md')),
+      '.cursor/rules/python-coding-style.md must resolve tools like rules/python/coding-style.md'
+    );
+  });
+
+  run('Cursor python-hooks.md does not prescribe a fixed formatter', () => {
+    assert.ok(
+      !/\*\*black\/ruff\*\*/.test(readRule(CURSOR_RULES_DIR, 'python-hooks.md')),
+      'Cursor hooks rule must defer to the project formatter'
+    );
+  });
+
+  run('Cursor python-fastapi.md declares the source globs', () => {
+    assert.deepStrictEqual(
+      parseCursorGlobs(readRule(CURSOR_RULES_DIR, 'python-fastapi.md')),
+      parsePathGlobs(readRule(RULES_DIR, 'fastapi.md')),
+      '.cursor/rules/python-fastapi.md must match rules/python/fastapi.md globs'
+    );
+  });
+
+  run('Codex python rule pack references every Cursor python rule', () => {
+    const script = fs.readFileSync(CODEX_SYNC_SCRIPT, 'utf8');
+    const cursorPythonRules = fs
+      .readdirSync(CURSOR_RULES_DIR)
+      .filter(file => file.startsWith('python-') && file.endsWith('.md'));
+
+    assert.ok(cursorPythonRules.length > 0, 'expected Cursor python rules to exist');
+    for (const file of cursorPythonRules) {
+      assert.ok(
+        script.includes(`$CURSOR_RULES_DIR/${file}`),
+        `sync-ecc-to-codex.sh must list ${file} in the python rule pack`
       );
     }
   });

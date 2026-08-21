@@ -468,6 +468,7 @@ Use \`$PROMPTS_DEST/ecc-rules-pack-common.md\`.
 
 ## Python Extensions
 - \`$CURSOR_RULES_DIR/python-coding-style.md\`
+- \`$CURSOR_RULES_DIR/python-fastapi.md\`
 - \`$CURSOR_RULES_DIR/python-hooks.md\`
 - \`$CURSOR_RULES_DIR/python-patterns.md\`
 - \`$CURSOR_RULES_DIR/python-security.md\`
