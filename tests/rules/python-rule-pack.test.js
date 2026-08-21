@@ -6,6 +6,9 @@
  *     neither installed, so the rule demanded uninstallable tooling. The same
  *     applies in reverse: a black/isort/flake8 project must not be told to run
  *     ruff, so formatter, import sorter, and linter resolve independently.
+ *     Independence is checked against the rule's decision table, because
+ *     `ruff` fills all three roles: having it in the dependencies must not
+ *     decide the roles the project gave to another tool.
  *  2. fastapi.md path globs must match the common `api/` layout
  *     (api/main.py, api/routers/*.py, api/schemas.py), not just `app/`.
  *
@@ -207,6 +210,55 @@ function parseResolutionLists(source) {
   return lists;
 }
 
+/**
+ * Extract the worked-examples decision table from a Formatting section.
+ *
+ * The header row is dropped: only the data rows carry the resolution. Locale
+ * mirrors translate the section heading, so they are scanned from the top of
+ * the file — the worked examples are the only table these rules contain.
+ *
+ * @param {string} source - Contents of a coding-style rule file
+ * @param {{requireSection?: boolean}} [options] - `requireSection: false` for mirrors
+ * @returns {string[][]} Rows of trimmed cells, project column first
+ */
+function parseDecisionTable(source, { requireSection = true } = {}) {
+  const start = source.indexOf('## Formatting');
+  if (requireSection) {
+    assert.notStrictEqual(start, -1, 'coding-style rule must have a Formatting section');
+  }
+
+  const rows = [];
+  for (const rawLine of source.slice(Math.max(start, 0)).split(/\r?\n/)) {
+    if (!rawLine.trimStart().startsWith('|')) {
+      if (rows.length > 0) break; // the table ended
+      continue;
+    }
+
+    const cells = rawLine.trim().split('|').slice(1, -1).map(cell => cell.trim());
+    if (cells.every(cell => /^-+$/.test(cell))) continue; // alignment row
+    rows.push(cells);
+  }
+
+  assert.ok(rows.length > 1, 'Formatting section must document a decision table');
+  return rows.slice(1);
+}
+
+/**
+ * The resolution each documented project shape must reach, in table order:
+ * `[formatter, import sorter, linter]`.
+ *
+ * The mixed rows are the issue #72 regression: `ruff` in the dependencies must
+ * not drag every role over to ruff (`ruff format` leaves linting to `flake8`,
+ * a ruff lint config leaves formatting to `black`), and the last row must stay
+ * ruff-free for a project that never installed it.
+ */
+const DECISION_TABLE = [
+  ['`ruff format`', '`ruff check --select I --fix`', '`ruff check`'],
+  ['`ruff format`', '`ruff check --select I --fix`', '`flake8`'],
+  ['`black`', '`ruff check --select I --fix`', '`ruff check`'],
+  ['`black`', '`isort`', '`flake8`']
+];
+
 function runTests() {
   console.log('\n=== Testing python rule pack ===\n');
 
@@ -297,24 +349,87 @@ function runTests() {
     const lists = parseResolutionLists(source);
 
     // Issue #72 in reverse: the project from the report has ruff only, but a
-    // project with black + isort + flake8 must reach a step of its own before
-    // any step that prescribes ruff.
+    // project with black + isort + flake8 must keep every role, so each list
+    // has to offer that project's tool and the table has to land on it.
     assert.ok(
-      lists.Formatter.some(step => /`black`/.test(step) && !/ruff/.test(step)),
-      'Formatter must have a black step that does not mention ruff'
+      lists.Formatter.some(step => /`black`/.test(step)),
+      'Formatter must offer black to projects that use it'
     );
     assert.ok(
-      lists['Import sorting'].some(step => /`isort`/.test(step) && !/ruff/.test(step)),
-      'Import sorting must have an isort step that does not mention ruff'
+      lists['Import sorting'].some(step => /`isort`/.test(step)),
+      'Import sorting must offer isort to projects that use it'
     );
     assert.ok(
-      lists.Linting.some(step => /`flake8`|`pylint`/.test(step) && !/ruff/.test(step)),
-      'Linting must have a non-ruff linter step'
+      lists.Linting.some(step => /`flake8`|`pylint`/.test(step)),
+      'Linting must offer a non-ruff linter'
+    );
+
+    const noRuffRow = parseDecisionTable(source).at(-1);
+    assert.deepStrictEqual(
+      noRuffRow.slice(1),
+      ['`black`', '`isort`', '`flake8`'],
+      'a project without ruff must resolve to its own tools for all three roles'
     );
 
     assert.ok(
       !/Use \*\*ruff\*\* for linting/.test(source),
       'Formatting must not mandate ruff linting unconditionally'
+    );
+  });
+
+  run('coding-style.md decision table keeps each tool role independent', () => {
+    const rows = parseDecisionTable(readRule(RULES_DIR, 'coding-style.md'));
+
+    assert.deepStrictEqual(
+      rows.map(row => row.slice(1)),
+      DECISION_TABLE,
+      'the worked examples must resolve every role from its own evidence'
+    );
+
+    // Bind each row to the project shape it is meant to answer, so the table
+    // cannot keep passing while the scenarios drift.
+    const [ruffOnly, ruffFlake8, ruffBlack, noRuff] = rows.map(row => row[0]);
+    assert.ok(
+      /`ruff`/.test(ruffOnly) && !/`black`|`isort`|`flake8`/.test(ruffOnly),
+      `row 1 must describe a ruff-only project: ${ruffOnly}`
+    );
+    assert.ok(
+      /`ruff`/.test(ruffFlake8) && /`flake8`/.test(ruffFlake8),
+      `row 2 must describe a ruff + flake8 project: ${ruffFlake8}`
+    );
+    assert.ok(
+      /`ruff`/.test(ruffBlack) && /`black`/.test(ruffBlack),
+      `row 3 must describe a ruff + black project: ${ruffBlack}`
+    );
+    assert.ok(
+      /`black`/.test(noRuff) && /`isort`/.test(noRuff) && /`flake8`/.test(noRuff),
+      `row 4 must describe a black + isort + flake8 project: ${noRuff}`
+    );
+  });
+
+  run('coding-style.md does not resolve a role from a bare ruff dependency', () => {
+    const source = readRule(RULES_DIR, 'coding-style.md');
+    const lists = parseResolutionLists(source);
+
+    // The regression this test guards: `ruff` covers formatting, imports, and
+    // linting, so "ruff is a dependency" as a standalone condition hands it
+    // every role and silently overrides the tool the project configured.
+    for (const [role, steps] of Object.entries(lists)) {
+      for (const step of steps) {
+        assert.ok(
+          !/`ruff` is a dependency/.test(step),
+          `${role} must not pick a tool from the bare ruff dependency: ${step}`
+        );
+      }
+    }
+
+    assert.ok(
+      /`ruff` can fill all three roles/.test(source),
+      'Formatting must say that ruff covers all three roles'
+    );
+    assert.ok(
+      /single-purpose tool wins/.test(source),
+      'Formatting must give single-purpose tools precedence over ruff per role'
     );
   });
 
@@ -396,6 +511,22 @@ function runTests() {
       assert.ok(
         formatting.includes('flake8') || formatting.includes('pylint'),
         `${file} must offer a non-ruff linter for projects without ruff`
+      );
+    }
+  });
+
+  run('locale coding-style mirrors resolve tool roles like the source pack', () => {
+    for (const dir of LOCALE_RULE_DIRS) {
+      const file = path.join(dir, 'coding-style.md');
+      if (!fs.existsSync(file)) continue;
+
+      // Only the command columns are compared: the project column is prose and
+      // gets translated, while the commands stay identical in every locale.
+      assert.deepStrictEqual(
+        parseDecisionTable(fs.readFileSync(file, 'utf8'), { requireSection: false })
+          .map(row => row.slice(1)),
+        DECISION_TABLE,
+        `${file} must reach the same tool per role as rules/python/coding-style.md`
       );
     }
   });
@@ -505,6 +636,14 @@ function runTests() {
       parseResolutionLists(readRule(CURSOR_RULES_DIR, 'python-coding-style.md')),
       parseResolutionLists(readRule(RULES_DIR, 'coding-style.md')),
       '.cursor/rules/python-coding-style.md must resolve tools like rules/python/coding-style.md'
+    );
+  });
+
+  run('Cursor python-coding-style.md matches the source decision table', () => {
+    assert.deepStrictEqual(
+      parseDecisionTable(readRule(CURSOR_RULES_DIR, 'python-coding-style.md')),
+      parseDecisionTable(readRule(RULES_DIR, 'coding-style.md')),
+      '.cursor/rules/python-coding-style.md must document the same worked examples'
     );
   });
 
