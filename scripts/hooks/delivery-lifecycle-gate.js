@@ -73,7 +73,18 @@ function run(rawInput, options = {}) {
 
   const state = readState(input, env);
   if (!state.delivery) return rawInput;
-  if (state.delivery.status === 'draft-pr' || state.delivery.status === 'merged') return rawInput;
+  if (state.delivery.status === 'merged') return rawInput;
+  if (state.delivery.status === 'draft-pr') {
+    // Draft PRまで到達したDeliveryの参照は保持するが、その状態のまま編集を続けると
+    // commit記録もfresh reviewもStop Gateも適用されない。次の変更要求で
+    // initializeDelivery()が同じIssue/branchのままreadyへ戻すため、編集はそこまで待たせる。
+    if (!['Edit', 'Write', 'MultiEdit'].includes(String(input.tool_name || ''))) return rawInput;
+    return deny(
+      `[ECC Delivery Gate] The delivery for Issue #${state.delivery.issue_number || '<unknown>'} already reached its Draft PR ` +
+        `(${state.delivery.draft_pr_url || 'recorded in ECC state'}). Ask for the follow-up change explicitly so the delivery resumes on ${state.delivery.branch || 'the recorded branch'} ` +
+        `with a fresh review, or reset it with node "${path.resolve(__dirname, '../codex/reset.js')}" "${resolveSessionId(input, env)}".`
+    );
+  }
   if (state.delivery.status !== 'ready') {
     const toolName = String(input.tool_name || '');
     const command = String(input.tool_input && input.tool_input.command || '');

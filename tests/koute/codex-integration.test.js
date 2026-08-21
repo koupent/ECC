@@ -357,57 +357,173 @@ test('follow-up prompts preserve the active delivery and reuse its Context Build
   assert.match(output.hookSpecificOutput.additionalContext, /active Delivery/);
 });
 
-test('a draft-pr delivery survives a differently worded follow-up without creating a new Issue or branch', () => {
-  const fixture = createGitFixture('delivery-draft-pr-repo');
+function createDraftPrFixture(name, sessionId, stateName) {
+  const fixture = createGitFixture(name);
   fs.writeFileSync(
     path.join(fixture, '.ecc', 'config.json'),
     JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
     'utf8'
   );
-  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-draft-pr-state') };
-  const input = { session_id: 'delivery-draft-pr', cwd: fixture };
+  assert.strictEqual(spawnSync('git', ['add', '.ecc/config.json'], { cwd: fixture }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'require delivery workflow'], { cwd: fixture }).status, 0);
+  const baseBranch = spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  const branch = 'codex/issue-271-task';
+  assert.strictEqual(spawnSync('git', ['switch', '-c', branch], { cwd: fixture }).status, 0);
+  const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, stateName) };
+  const input = { session_id: sessionId, cwd: fixture };
   const first = initializeDelivery(input, 'Issue #271 の配信不具合を修正してください', { cwd: fixture, env: fixtureEnv });
   writeState(input, {
     delivery: {
       ...first,
       status: 'draft-pr',
       issue_number: 271,
-      branch: 'codex/issue-271-task',
+      branch,
+      base_branch: baseBranch,
       draft_pr_url: 'https://example.invalid/pull/274',
+      committed_head: head,
+      completion_stage: 'review-required',
       completed_at: '2026-08-20T14:29:52.372Z'
     },
+    review_role: 'review',
+    review_status: 'ok',
+    review_complete: true,
+    review_head: head,
+    review_worktree_clean: true,
+    review_blocking_findings: 0,
     context_status: 'ready',
     context_request_hash: first.request_hash,
     context: { status: 'ok', summary: 'draft pr packet', files: [], constraints: [], risks: [], verification: [] }
   }, fixtureEnv);
+  return { fixture, fixtureEnv, input, first, branch, baseBranch, head };
+}
+
+test('a draft-pr delivery resumes on the same Issue and branch and re-applies every required gate', () => {
+  const { fixture, fixtureEnv, input, first, branch, baseBranch, head } =
+    createDraftPrFixture('delivery-draft-pr-repo', 'delivery-draft-pr', 'delivery-draft-pr-state');
+
+  // 再開前: draft-prのまま編集を続けることはできない。
+  const beforeResume = JSON.parse(deliveryGate.run(
+    JSON.stringify({ ...input, tool_name: 'Edit', tool_input: { file_path: path.join(fixture, 'src', 'product.ts') } }),
+    { cwd: fixture, env: fixtureEnv }
+  ));
+  assert.strictEqual(beforeResume.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(beforeResume.hookSpecificOutput.permissionDecisionReason, /already reached its Draft PR/);
+  // Plan modeでは状態遷移を起こさない（編集は上のdenyでfail-closeしたまま）。
+  const planned = initializeDelivery(input, '続きの実装を検討してください', { cwd: fixture, env: fixtureEnv, deferred: true });
+  assert.strictEqual(planned.status, 'draft-pr');
+  assert.strictEqual(readState(input, fixtureEnv).delivery.status, 'draft-pr');
 
   const followUp = 'そのDraft PRをマージまで進めてください';
-  const preserved = initializeDelivery(input, followUp, { cwd: fixture, env: fixtureEnv });
-  assert.strictEqual(preserved.status, 'draft-pr');
-  assert.strictEqual(preserved.request_hash, first.request_hash);
-  assert.strictEqual(preserved.issue_number, 271);
-  assert.strictEqual(preserved.branch, 'codex/issue-271-task');
-  assert.strictEqual(preserved.draft_pr_url, 'https://example.invalid/pull/274');
-  // prepareはpending/deferredのDeliveryだけを扱うため、維持されたDeliveryでは
-  // Issue作成もbranch切替も起こらない。
+  const resumed = initializeDelivery(input, followUp, { cwd: fixture, env: fixtureEnv });
+  // Issue / branch / Draft PR の参照は保持する（Issue #67）。
+  assert.strictEqual(resumed.request_hash, first.request_hash);
+  assert.strictEqual(resumed.issue_number, 271);
+  assert.strictEqual(resumed.branch, branch);
+  assert.strictEqual(resumed.draft_pr_url, 'https://example.invalid/pull/274');
+  // 一方で完了印とcommit/review証拠は破棄し、必須Gateを最初から適用し直す。
+  assert.strictEqual(resumed.status, 'ready');
+  assert.strictEqual(resumed.completed_at, null);
+  assert.strictEqual(resumed.committed_head, null);
+  assert.strictEqual(resumed.completion_stage, null);
+  const afterResume = readState(input, fixtureEnv);
+  assert.strictEqual(afterResume.review_status, null);
+  assert.strictEqual(afterResume.review_head, null);
+  assert.strictEqual(afterResume.review_complete, null);
+  assert.strictEqual(afterResume.review_worktree_clean, false);
+
+  // prepareはpending/deferredのDeliveryだけを扱うため、Issue作成もbranch切替も起こらない。
   assert.throws(
     () => prepareDelivery(input, { cwd: fixture, env: fixtureEnv }),
     /No pending required delivery task/
   );
   assert.strictEqual(
-    spawnSync('git', ['branch', '--list', 'codex/*'], { cwd: fixture, encoding: 'utf8' }).stdout.trim(),
-    ''
+    spawnSync('git', ['branch', '--list', 'codex/*', '--format=%(refname:short)'], { cwd: fixture, encoding: 'utf8' }).stdout.trim(),
+    branch
   );
 
+  // Edit: 記録されたbranchでは通り、別branchではfail-closeする。
+  const edit = JSON.stringify({ ...input, tool_name: 'Edit', tool_input: { file_path: path.join(fixture, 'src', 'product.ts') } });
+  assert.strictEqual(deliveryGate.run(edit, { cwd: fixture, env: fixtureEnv }), edit);
+  assert.strictEqual(spawnSync('git', ['switch', baseBranch], { cwd: fixture }).status, 0);
+  const mismatch = JSON.parse(deliveryGate.run(edit, { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(mismatch.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(mismatch.hookSpecificOutput.permissionDecisionReason, /Expected issue-linked branch codex\/issue-271-task/);
+  assert.strictEqual(spawnSync('git', ['switch', branch], { cwd: fixture }).status, 0);
+
+  // Stop: 再開直後はcurrent commitに紐づくfresh reviewが無いのでblockする。
+  const stopped = JSON.parse(deliveryCompletion.run(JSON.stringify(input), { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(stopped.decision, 'block');
+  assert.match(stopped.reason, /fresh independent Codex review/);
+
+  // commit: 再開したDeliveryのcommitは再び記録され、次のreviewを必須にする。
+  fs.writeFileSync(path.join(fixture, 'src', 'product.ts'), 'export const product = false;\n', 'utf8');
+  assert.strictEqual(spawnSync('git', ['add', '-A'], { cwd: fixture }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'resumed change'], { cwd: fixture }).status, 0);
+  const resumedHead = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  assert.notStrictEqual(resumedHead, head);
+  deliveryProgress.run(JSON.stringify({
+    ...input,
+    tool_name: 'Bash',
+    tool_input: { command: 'git commit -m "resumed change"' },
+    tool_response: { exit_code: 0, stdout: '1 file changed' }
+  }), { cwd: fixture, env: fixtureEnv });
+  const afterCommit = readState(input, fixtureEnv);
+  assert.strictEqual(afterCommit.delivery.committed_head, resumedHead);
+  assert.strictEqual(afterCommit.delivery.completion_stage, 'review-required');
+  const afterCommitEdit = JSON.parse(deliveryGate.run(edit, { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(afterCommitEdit.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(afterCommitEdit.hookSpecificOutput.permissionDecisionReason, /independent Codex review/);
+
+  // Context Builderは同じDeliveryのpacketを再利用し、prepareも要求しない。
   const output = JSON.parse(contextBuilder.run(JSON.stringify({ ...input, prompt: followUp }), {
     cwd: fixture,
     env: fixtureEnv,
     runRole() {
-      throw new Error('Context Builder must not rerun while the draft-pr Delivery is active');
+      throw new Error('Context Builder must not rerun for the resumed Delivery');
     }
   }));
   assert.match(output.hookSpecificOutput.additionalContext, /draft pr packet/);
   assert.doesNotMatch(output.hookSpecificOutput.additionalContext, /delivery-lifecycle\.js/);
+});
+
+test('a request naming another Issue starts a new pending delivery that keeps the draft-pr record and fails closed', () => {
+  const { fixture, fixtureEnv, input, branch } =
+    createDraftPrFixture('delivery-draft-pr-switch-repo', 'delivery-draft-pr-switch', 'delivery-draft-pr-switch-state');
+
+  const other = 'Issue #300 のログ出力を修正してください';
+  const started = initializeDelivery(input, other, { cwd: fixture, env: fixtureEnv });
+  assert.strictEqual(started.status, 'pending');
+  assert.strictEqual(started.requested_issue_number, 300);
+  assert.strictEqual(started.issue_number, null);
+  assert.strictEqual(started.draft_pr_url, null);
+  const state = readState(input, fixtureEnv);
+  // 進行中だったDraft PRの参照は消さずに退避する。
+  assert.strictEqual(state.previous_delivery.status, 'draft-pr');
+  assert.strictEqual(state.previous_delivery.issue_number, 271);
+  assert.strictEqual(state.previous_delivery.branch, branch);
+  assert.strictEqual(state.previous_delivery.draft_pr_url, 'https://example.invalid/pull/274');
+  assert.strictEqual(state.review_status, null);
+  assert.strictEqual(state.review_head, null);
+
+  // prepare前はEditもcommitもStopもfail-closeする。
+  const edit = JSON.stringify({ ...input, tool_name: 'Edit', tool_input: { file_path: path.join(fixture, 'src', 'product.ts') } });
+  const deniedEdit = JSON.parse(deliveryGate.run(edit, { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(deniedEdit.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(deniedEdit.hookSpecificOutput.permissionDecisionReason, /delivery-lifecycle\.js/);
+  const commit = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: 'git commit -m "unreviewed"' } });
+  const deniedCommit = JSON.parse(deliveryGate.run(commit, { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(deniedCommit.hookSpecificOutput.permissionDecision, 'deny');
+  deliveryProgress.run(JSON.stringify({
+    ...input,
+    tool_name: 'Bash',
+    tool_input: { command: 'git commit -m "unreviewed"' },
+    tool_response: { exit_code: 0, stdout: '1 file changed' }
+  }), { cwd: fixture, env: fixtureEnv });
+  assert.strictEqual(readState(input, fixtureEnv).delivery.committed_head, undefined);
+  const stopped = JSON.parse(deliveryCompletion.run(JSON.stringify(input), { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(stopped.decision, 'block');
+  assert.match(stopped.reason, /has not been prepared/);
 });
 
 test('Context Builder distinguishes unavailable evidence from verified absence and avoids delivery diagnostics', () => {
@@ -521,8 +637,16 @@ test('required delivery gate blocks edits until issue and branch evidence are re
   assert.strictEqual(spawnSync('git', ['switch', '-c', branch], { cwd: fixture }).status, 0);
   writeState(input, { delivery: { ...delivery, status: 'ready', issue_number: 42, branch } }, fixtureEnv);
   assert.strictEqual(deliveryGate.run(raw, { cwd: fixture, env: fixtureEnv }), raw);
-  writeState(input, { delivery: { ...delivery, status: 'draft-pr', issue_number: 42, branch } }, fixtureEnv);
+  writeState(input, {
+    delivery: { ...delivery, status: 'draft-pr', issue_number: 42, branch, draft_pr_url: 'https://example.invalid/pull/43' }
+  }, fixtureEnv);
+  // Draft PR到達後もPR確認などの読み取りは通すが、Gateの外で差分を積み上げる編集は止める。
   assert.strictEqual(deliveryGate.run(bash, { cwd: fixture, env: fixtureEnv }), bash);
+  const afterDraftPr = JSON.parse(deliveryGate.run(raw, { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(afterDraftPr.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(afterDraftPr.hookSpecificOutput.permissionDecisionReason, /already reached its Draft PR/);
+  assert.match(afterDraftPr.hookSpecificOutput.permissionDecisionReason, /reset\.js/);
+  writeState(input, { delivery: { ...delivery, status: 'merged', issue_number: 42, branch } }, fixtureEnv);
   assert.strictEqual(deliveryGate.run(raw, { cwd: fixture, env: fixtureEnv }), raw);
 });
 

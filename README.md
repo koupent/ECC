@@ -43,6 +43,7 @@ bound to the following Hook-enforced lifecycle:
 2. `/ecc:delivery-prepare` searches open Issues, selects or creates one, and creates its `codex/issue-*` branch.
 3. Repository edits fail closed until that external-state evidence and branch agree.
 4. A fresh Codex review, clean commit, push, and open Draft PR are required before the task can stop.
+5. A follow-up request after the Draft PR keeps the same Issue, branch, and PR, but reopens the delivery: the recorded completion, commit, and review evidence are dropped so steps 3 and 4 apply again. Only a request naming a different Issue or PR starts a new delivery, and the previous record is retained in external state.
 
 The Draft PR gate never marks a PR ready and never merges it.
 

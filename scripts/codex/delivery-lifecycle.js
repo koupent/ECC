@@ -13,8 +13,23 @@ const NEGATED_DELIVERY_REQUEST = /(?:\b(?:do\s+not|don't|without)\s+(?:implement
 const DIAGNOSTIC_REQUEST = /(?:\b(?:investigate|review|analy[sz]e|diagnose|inspect|check)\b|調査|確認|レビュー|分析|診断|調べて|教えて)/i;
 const EXPLICIT_MUTATION_REQUEST = /(?:\b(?:implement|fix|add|remove|refactor|build|create|update)\b|(?:実装|修正|変更|追加|削除|作成|更新|直)(?:を)?(?:して|する|してください|してほしい|したい|せよ))/i;
 // draft-pr はreadyより先へ進んだ進行中Deliveryであり、Draft PR・Issue・branchの参照を
-// 保持し続ける必要がある。mergedだけは完了済みとして次の要求に新規Deliveryを許す。
+// 保持し続ける必要がある。ただし保持だけでは全Gateが素通りになるため、次の変更要求では
+// resumeDeliveryAfterDraftPr()でreadyへ戻す。mergedだけは完了済みとして新規Deliveryを許す。
 const ACTIVE_DELIVERY_STATUSES = new Set(['deferred', 'pending', 'ready', 'draft-pr']);
+// 再開時に破棄する証拠。Issue・branch・PR参照だけを引き継ぎ、commit記録とreview証拠は
+// 捨てて、branch一致・clean commit・fresh review・Completion Gateを最初から適用し直す。
+const CLEARED_REVIEW_EVIDENCE = {
+  review_role: null,
+  review_status: null,
+  review_complete: null,
+  review_head: null,
+  review_worktree_clean: false,
+  review_blocking_findings: null,
+  review_owner_actions: [],
+  review_result: null,
+  review_snapshot: null,
+  review_request_hash: null
+};
 
 function isActiveDelivery(delivery) {
   return Boolean(delivery && ACTIVE_DELIVERY_STATUSES.has(delivery.status));
@@ -53,6 +68,34 @@ function explicitIssueNumber(request) {
 function explicitPrNumber(request) {
   const match = String(request || '').match(/\bpr\s*#?\s*(\d+)\b/i);
   return match ? Number(match[1]) : null;
+}
+
+function deliveryPrNumber(delivery) {
+  const match = String(delivery && delivery.draft_pr_url || '').match(/\/pull\/(\d+)(?:\D|$)/);
+  return match ? Number(match[1]) : (delivery && delivery.requested_pr_number) || null;
+}
+
+function referencesOtherDelivery(delivery, request) {
+  const issueNumber = explicitIssueNumber(request);
+  if (issueNumber && delivery.issue_number && issueNumber !== Number(delivery.issue_number)) return true;
+  const prNumber = explicitPrNumber(request);
+  const recordedPr = deliveryPrNumber(delivery);
+  return Boolean(prNumber && recordedPr && prNumber !== recordedPr);
+}
+
+function resumeDeliveryAfterDraftPr(input, delivery, env) {
+  const resumed = {
+    ...delivery,
+    status: 'ready',
+    completed_at: null,
+    committed_head: null,
+    committed_at: null,
+    completion_stage: null,
+    incomplete_reported_at: null,
+    resumed_at: new Date().toISOString()
+  };
+  writeState(input, { delivery: resumed, ...CLEARED_REVIEW_EVIDENCE }, env);
+  return resumed;
 }
 
 function normalizeIssueTitle(value) {
@@ -97,12 +140,26 @@ function initializeDelivery(input, request, options = {}) {
     return deferred;
   }
   if (!isDeliveryRequest(request)) return null;
-  if (current.delivery && current.delivery.request_hash === requestHash) return current.delivery;
-  // Claude Code の継続turnでは、ユーザーの追記文面が変わっても同じDeliveryである。
-  // 進行中Deliveryを本文ハッシュだけで上書きすると、Context Builder、Issue、branchが
-  // 二重に作られるため、Draft PR到達後も含め、マージ完了または明示的な新規Session/resetまでは
-  // 既存Deliveryを維持する。
-  if (isActiveDelivery(current.delivery)) return current.delivery;
+  const active = isActiveDelivery(current.delivery) ? current.delivery : null;
+  let superseded = null;
+  if (active && active.status === 'draft-pr') {
+    // Plan mode中はIssue・branch・状態遷移を起こさない。承認後の編集もDelivery Gateが
+    // draft-prのままfail-closeするため、ここを素通りさせても迂回にはならない。
+    if (options.deferred) return active;
+    // Draft PR到達後の追加要求は、同じIssue/PRを指す限り同じDeliveryの続きである。
+    // 参照を保ったままreadyへ戻し、branch一致、clean commit、fresh review、
+    // Completion Gateを再適用する。draft-prのまま継続すると全Gateが素通りになる。
+    if (!referencesOtherDelivery(active, request)) return resumeDeliveryAfterDraftPr(input, active, env);
+    // 別のIssue/PRを名指しする要求だけは新しいDeliveryを開始する。旧Deliveryの
+    // Issue・branch・Draft PR参照はstateに退避し、記録から消さない。
+    superseded = active;
+  } else {
+    if (current.delivery && current.delivery.request_hash === requestHash) return current.delivery;
+    // Claude Code の継続turnでは、ユーザーの追記文面が変わっても同じDeliveryである。
+    // 進行中Deliveryを本文ハッシュだけで上書きすると、Context Builder、Issue、branchが
+    // 二重に作られるため、マージ完了または明示的な新規Session/resetまでは既存Deliveryを維持する。
+    if (active) return active;
+  }
 
   const delivery = {
     // Plan modeではIssueやbranchをまだ変更しない一方、承認後の同じturnで
@@ -118,7 +175,13 @@ function initializeDelivery(input, request, options = {}) {
     branch: null,
     draft_pr_url: null
   };
-  writeState(input, { delivery, project: projectFingerprint(cwd) }, env);
+  writeState(
+    input,
+    superseded
+      ? { delivery, project: projectFingerprint(cwd), previous_delivery: superseded, ...CLEARED_REVIEW_EVIDENCE }
+      : { delivery, project: projectFingerprint(cwd) },
+    env
+  );
   return delivery;
 }
 
@@ -308,6 +371,9 @@ module.exports = {
   explicitIssueNumber,
   explicitPrNumber,
   deliveryBranch,
+  deliveryPrNumber,
+  referencesOtherDelivery,
+  resumeDeliveryAfterDraftPr,
   findDuplicateIssue,
   findExistingDeliveryPr,
   initializeDelivery,
