@@ -112,11 +112,71 @@ test('an unterminated heredoc keeps its body out of the executed commands', () =
   assert.deepStrictEqual(commands(command), ['cat']);
 });
 
-test('recursion is bounded and empty input yields no commands', () => {
+test('reserved words and negation introduce a command instead of hiding it', () => {
+  for (const command of [
+    'if gh pr merge 12 --squash; then echo merged; fi',
+    'if true; then gh pr merge 12; fi',
+    'if false; then :; else gh pr merge 12; fi',
+    '! gh pr merge 12',
+    'while ! gh pr merge 12; do sleep 1; done',
+    'until gh pr merge 12; do sleep 1; done',
+    'for pr in 12; do gh pr merge "$pr"; done',
+    'case 12 in 12) gh pr merge 12;; esac'
+  ]) {
+    assert.strictEqual(runsPrMerge(command), true, command);
+  }
+  // 条件式の中身はコマンドではない。普通の分岐まで解析不能として扱ってはいけない。
+  assert.strictEqual(runsPrMerge('[[ "$mode" == squash ]] && gh pr merge 12'), true);
+  assert.deepStrictEqual(commands('case "$mode" in squash) echo ok;; esac'), ['echo']);
+});
+
+test('eval runs its arguments, so they are a script rather than data', () => {
+  for (const command of [
+    'eval "gh pr merge 12 --squash"',
+    "eval 'gh pr merge' 12",
+    'eval "gh pr merge $NUMBER"'
+  ]) {
+    assert.strictEqual(runsPrMerge(command), true, command);
+  }
+  assert.throws(() => extractInvocations('eval "$(printf %s \'gh pr merge 12\')"'), /eval/);
+});
+
+test('a command word that only exists after expansion is not read as "no command"', () => {
+  assert.throws(() => extractInvocations('$(printf %s gh) pr merge 12'), /展開後/);
+  assert.throws(() => extractInvocations('$CMD pr merge 12'), /展開後/);
+  assert.throws(() => extractInvocations('npm test && `printf %s gh` pr merge 12'), /展開後/);
+  // 展開されるのが引数やpath前半なら、コマンド語は読める。
+  assert.strictEqual(extractInvocations('"$HOME/bin/gh" pr merge 12')[0].command, 'gh');
+  assert.strictEqual(extractInvocations('git commit -m "$(cat message.txt)"')[0].command, 'git');
+});
+
+test('ANSI-C and locale quoting resolve to the word bash runs', () => {
+  for (const command of ["$'gh' pr merge 12", "gh $'pr' merge 12", "$'\\x67h' pr merge 12", '$"gh" pr merge 12']) {
+    assert.strictEqual(runsPrMerge(command), true, command);
+  }
+  assert.strictEqual(extractInvocations("$'\\x67\\150' pr merge 12")[0].command, 'gh');
+});
+
+test('a wrapper option value does not shadow the command the wrapper runs', () => {
+  for (const command of [
+    'sudo -u ci gh pr merge 12',
+    'env -u GH_TOKEN gh pr merge 12',
+    'nice -n 10 gh pr merge 12',
+    'timeout 30 gh pr merge 12',
+    'xargs -I{} gh pr merge {} <<< 12',
+    'sudo -u ci bash -lc "gh pr merge 12"'
+  ]) {
+    assert.strictEqual(runsPrMerge(command), true, command);
+  }
+});
+
+test('input the parser cannot enumerate fails closed instead of reporting no commands', () => {
   assert.deepStrictEqual(extractInvocations(''), []);
   assert.deepStrictEqual(extractInvocations('   '), []);
-  const deep = `${'$('.repeat(8)}gh pr merge 12${')'.repeat(8)}`;
-  assert.ok(Array.isArray(extractInvocations(deep)));
+  const deep = `${'echo $('.repeat(8)}gh pr merge 12${')'.repeat(8)}`;
+  assert.throws(() => extractInvocations(deep), /入れ子が深すぎます/);
+  const many = Array.from({ length: 600 }, () => 'gh pr merge 12').join('; ');
+  assert.throws(() => extractInvocations(many), /上限/);
 });
 
 process.stdout.write(`\nPassed: ${passed}\nFailed: ${failed}\n`);

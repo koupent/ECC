@@ -76,8 +76,8 @@ function run(rawInput, options = {}) {
   try {
     invocations = extractInvocations(command);
   } catch (error) {
-    // 解析できないコマンドは許可しない。Policyの判断根拠が無い状態で通すと、
-    // merge禁止が黙って外れる。
+    // 解析できないコマンドは許可しない。深い入れ子や展開後にしか決まらないコマンド語
+    // など、実行されるものを列挙できない形をそのまま通すと、merge禁止が黙って外れる。
     return deny(`コマンドを解析できませんでした（${error.message}）。単純な形へ分けて実行してください。`);
   }
   if (invocations.some(isPullRequestMerge)) {

@@ -962,6 +962,30 @@ test('local merge policy blocks merge bypasses and direct success status publica
     const denied = JSON.parse(localMergePolicy.run(bash(command), { cwd: fixture, env }));
     assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny', command);
   }
+  // 通常のBash構文でparserを迂回してもmergeはmergeである。列挙できない形は
+  // 「実行されるコマンドが無い」ではなく、解析不能として拒否する。
+  for (const command of [
+    'if gh pr merge 12 --squash; then echo merged; fi',
+    'if true; then gh pr merge 12; fi',
+    '! gh pr merge 12',
+    'while ! gh pr merge 12; do sleep 1; done',
+    'eval "gh pr merge 12 --squash"',
+    'sudo -u ci gh pr merge 12',
+    'timeout 60 gh pr merge 12',
+    "$'gh' pr merge 12",
+    "$'\\x67h' pr merge 12",
+    `${'echo $('.repeat(8)}gh pr merge 12${')'.repeat(8)}`,
+    '$CMD pr merge 12',
+    'eval "$(printf %s \'gh pr merge 12\')"',
+    'if gh api repos/acme/example/statuses/abc -f state=success; then echo posted; fi',
+    'eval "curl -X POST https://api.github.com/repos/acme/example/statuses/abc -d \'{\\"state\\":\\"success\\"}\'"',
+    'sudo -u ci gh api repos/acme/example/statuses/abc -f state=success',
+    '! curl -X POST https://api.github.com/repos/acme/example/statuses/abc -d \'{"state":"success"}\'',
+    '$\'gh\' api repos/acme/example/statuses/abc -f state=success'
+  ]) {
+    const denied = JSON.parse(localMergePolicy.run(bash(command), { cwd: fixture, env }));
+    assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny', command);
+  }
   // 取り込み操作について書いた文書を作ることは、取り込み操作ではない。heredoc本文も
   // quotedな `--body` も実行されるコマンド語ではないため、Policyの対象にしない。
   for (const command of [
@@ -975,7 +999,9 @@ test('local merge policy blocks merge bypasses and direct success status publica
       'BODY',
       'gh issue create --title policy --body-file /tmp/issue-body.md'
     ].join('\n'),
-    'echo "post /statuses/abc with state=success only from the merge gate" >> notes.md'
+    'echo "post /statuses/abc with state=success only from the merge gate" >> notes.md',
+    'gh issue create --title policy --body "if gh pr merge 12; then … は拒否されます"',
+    'printf \'%s\' "! gh pr merge 12 も同じく拒否されます" >> notes.md'
   ]) {
     const allowed = bash(command);
     assert.strictEqual(localMergePolicy.run(allowed, { cwd: fixture, env }), allowed, command);
