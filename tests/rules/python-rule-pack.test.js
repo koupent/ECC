@@ -126,6 +126,26 @@ function matchesAny(globs, filePath) {
   return globs.some(glob => globToRegExp(glob).test(filePath));
 }
 
+/**
+ * Extract the tool-resolution steps from coding-style.md's Formatting section.
+ *
+ * The section holds two ordered lists (formatter, then import sorter); this
+ * returns one entry per numbered step, excluding the introductory prose.
+ *
+ * @param {string} source - coding-style.md contents
+ * @returns {string[]} The numbered steps, in file order
+ */
+function parseFormattingSteps(source) {
+  const start = source.indexOf('## Formatting');
+  assert.notStrictEqual(start, -1, 'coding-style.md must have a Formatting section');
+
+  const end = source.indexOf('Use **ruff** for linting', start);
+  assert.notStrictEqual(end, -1, 'Formatting section must end with the linting rule');
+
+  // Drop the leading chunk: prose before the first numbered step.
+  return source.slice(start, end).split(/^\d+\.\s/m).slice(1);
+}
+
 function runTests() {
   console.log('\n=== Testing python rule pack ===\n');
 
@@ -188,6 +208,27 @@ function runTests() {
     assert.ok(/black/.test(formatting) && /isort/.test(formatting));
   });
 
+  run('coding-style.md resolves formatter and import sorter independently', () => {
+    const source = readRule(RULES_DIR, 'coding-style.md');
+    assert.ok(
+      /^Formatter:\s*$/m.test(source),
+      'Formatting must resolve the formatter in its own list'
+    );
+    assert.ok(
+      /^Import sorting:\s*$/m.test(source),
+      'Formatting must resolve the import sorter in its own list'
+    );
+
+    // A step naming both tools would tell a black-only (or isort-only) project
+    // to run a tool it does not depend on — the issue #72 regression.
+    for (const step of parseFormattingSteps(source)) {
+      assert.ok(
+        !(/black/.test(step) && /isort/.test(step)),
+        `no resolution step may require black and isort together: ${step.trim()}`
+      );
+    }
+  });
+
   run('hooks.md does not prescribe a fixed python formatter', () => {
     const source = readRule(RULES_DIR, 'hooks.md');
     assert.ok(
@@ -235,6 +276,15 @@ function runTests() {
       assert.ok(
         formatting.includes('[tool.ruff.format]'),
         `${file} must key off pyproject.toml [tool.ruff.format]`
+      );
+      // Command strings survive translation, so they are safe to assert on.
+      assert.ok(
+        formatting.includes('ruff format'),
+        `${file} must name \`ruff format\` for ruff-configured projects`
+      );
+      assert.ok(
+        formatting.includes('ruff check --select I'),
+        `${file} must name ruff import sorting for ruff-configured projects`
       );
     }
   });

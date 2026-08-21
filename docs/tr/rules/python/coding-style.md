@@ -33,21 +33,31 @@ class Point(NamedTuple):
 
 ## Formatlama
 
-Projenin halihazırda yapılandırdığı formatlayıcıyı kullanın. Asla ikinci bir
+Projenin halihazırda yapılandırdığı araçları kullanın. Asla ikinci bir
 formatlayıcı eklemeyin ve projenin bağımlılıklarında olmayan bir aracı
-çalıştırmayın. Şu sırayla belirleyin:
+çalıştırmayın. Formatlayıcıyı ve import sıralayıcıyı ayrı ayrı belirleyin: bir
+proje `black` ile ruff'un import kurallarını ya da `ruff format` ile `isort`
+kullanıyor olabilir.
+
+Formatlayıcı:
 
 1. `pyproject.toml` içinde `[tool.ruff.format]` varsa ya da `ruff` bağımlılıkta
-   olup `black` yoksa — formatlama için `ruff format`, import sıralama için
+   olup `black` yoksa — `ruff format` kullanın.
+2. `black` bağımlılıkta ise — `black` kullanın.
+3. Hiçbiri bağımlılıkta değilse — ECC'nin kendi quality gate'i ile uyumlu olacak
+   şekilde `ruff` ekleyip `ruff format` kullanın.
+
+Import sıralama:
+
+1. ruff lint yapılandırması `I` seçiyorsa ya da `[tool.ruff.lint.isort]` varsa —
    `ruff check --select I --fix` kullanın.
-2. `black` ve/veya `isort` bağımlılıkta ise — formatlama için `black`, import
-   sıralama için `isort` kullanın.
-3. Hiçbiri yapılandırılmamışsa — ECC'nin kendi quality gate'i ile uyumlu olacak
-   şekilde `ruff format` ve `ruff check --select I` varsayılan olsun.
+2. `isort` bağımlılıkta ise — `isort` kullanın.
+3. Hiçbiri bağımlılıkta değilse — `ruff` ekleyip `ruff check --select I --fix`
+   kullanın.
 
 Linting için her durumda **ruff** kullanın.
 
-Buradaki bir kural projenin kendi formatlayıcı yapılandırmasıyla çelişirse proje
+Buradaki bir kural projenin kendi yapılandırmasıyla çelişirse proje
 yapılandırması kazanır: ruff ile formatlanmış bir kod tabanını `black` ile (ya da
 tersi) yeniden formatlamak ilgisiz diff gürültüsü üretir.
 

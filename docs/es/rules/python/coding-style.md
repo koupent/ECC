@@ -33,23 +33,32 @@ class Point(NamedTuple):
 
 ## Formateo
 
-Usa el formateador que el proyecto ya tiene configurado. Nunca introduzcas un
+Usa las herramientas que el proyecto ya tiene configuradas. Nunca introduzcas un
 segundo formateador ni ejecutes una herramienta que no esté en las dependencias
-del proyecto. Resuélvelo en este orden:
+del proyecto. Resuelve el formateador y el ordenador de imports por separado: un
+proyecto puede combinar `black` con las reglas de imports de ruff, o
+`ruff format` con `isort`.
+
+Formateador:
 
 1. `pyproject.toml` declara `[tool.ruff.format]`, o `ruff` es una dependencia y
-   `black` no lo es — usa `ruff format` para formatear y
-   `ruff check --select I --fix` para ordenar imports.
-2. `black` y/o `isort` son dependencias — usa `black` para formatear e `isort`
-   para ordenar imports.
-3. Ninguno está configurado — por defecto usa `ruff format` y
-   `ruff check --select I`, igual que el quality gate del propio ECC.
+   `black` no lo es — usa `ruff format`.
+2. `black` es una dependencia — usa `black`.
+3. Ninguno es dependencia — añade `ruff` y usa `ruff format`, igual que el
+   quality gate del propio ECC.
+
+Ordenación de imports:
+
+1. La configuración de lint de ruff selecciona `I`, o declara
+   `[tool.ruff.lint.isort]` — usa `ruff check --select I --fix`.
+2. `isort` es una dependencia — usa `isort`.
+3. Ninguno es dependencia — añade `ruff` y usa `ruff check --select I --fix`.
 
 Usa **ruff** para linting en todos los casos.
 
-Cuando una regla de aquí contradiga la configuración de formateo del proyecto,
-gana la configuración del proyecto: reformatear con `black` un código formateado
-con ruff (o al revés) produce ruido de diff sin relación con el cambio.
+Cuando una regla de aquí contradiga la configuración del propio proyecto, gana
+la configuración del proyecto: reformatear con `black` un código formateado con
+ruff (o al revés) produce ruido de diff sin relación con el cambio.
 
 ## Referencia
 
