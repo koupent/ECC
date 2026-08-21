@@ -838,7 +838,20 @@ test('local merge policy blocks merge bypasses and direct success status publica
     "printf 'gh pr merge 12 --squash' | bash",
     // The payload of a status mutation is not visible in argv: fail closed.
     'gh api --method POST repos/acme/example/statuses/abc --input body.json',
-    'curl -XPOST https://api.github.com/repos/acme/example/statuses/abc -d @status.json'
+    'curl -XPOST https://api.github.com/repos/acme/example/statuses/abc -d @status.json',
+    // Shell grammar: a reserved word introduces the command, it is not the command.
+    'if true; then gh pr merge 12 --squash; fi',
+    'while ! gh pr merge 12 --squash; do sleep 1; done',
+    // The binary can be named by an expansion or by a substitution.
+    'GH=gh; "$GH" pr merge 12 --squash',
+    '$(command -v gh) pr merge 12 --squash',
+    "S=bash; \"$S\" -c 'gh pr merge 12 --squash'",
+    // gh accepts flags before the subcommand, and their values are not operands.
+    'gh pr -R acme/example merge 12 --squash',
+    'gh --repo acme/example pr merge 12 --squash',
+    // A payload assembled by an expansion cannot be cleared as non-success.
+    'STATE=success; gh api repos/acme/example/statuses/abc -f state="$STATE"',
+    'STATE=success; curl -X POST https://api.github.com/repos/acme/example/statuses/abc -d "state=$STATE"'
   ];
   for (const command of denied) {
     const decision = JSON.parse(localMergePolicy.run(bash(command), { cwd: fixture, env }));
@@ -861,7 +874,17 @@ test('local merge policy blocks merge bypasses and direct success status publica
     // Ordinary shell usage keeps working: a script file, a plain pipe, flags.
     'bash scripts/ci/project-verify.sh',
     'bash --version',
-    'git log --oneline | head -20'
+    'git log --oneline | head -20',
+    // Reserved words and clause heads are ordinary shell control flow.
+    'if git diff --quiet; then echo clean; fi',
+    'for file in src/*.ts; do echo "$file"; done',
+    'echo "$(git rev-parse HEAD)"',
+    // Quoting still wins: control-flow text inside a message executes nothing.
+    'git commit -m "if true; then gh pr merge 12; fi"',
+    // Only success is reserved for the merge gate; other states stay available.
+    'gh api repos/acme/example/statuses/abc -f state=failure -f context="Local Merge Gate"',
+    // An unresolved binary that sends no request only mentions the endpoint.
+    '"$PYTHON" scripts/report.py --url https://api.github.com/repos/acme/example/statuses/abc'
   ];
   for (const command of allowedCommands) {
     const allowed = bash(command);

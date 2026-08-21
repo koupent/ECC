@@ -36,10 +36,28 @@ const WRAPPER_VALUE_OPTIONS = {
 // as its own command instead of being treated as inert text.
 const SHELL_BINARIES = new Set(['bash', 'busybox', 'dash', 'ksh', 'sh', 'zsh']);
 
+// Reserved words that only introduce a command instead of being one. Without
+// them `if true; then gh pr merge 12; fi` would resolve `then` as the executed
+// binary and let the merge through.
+const COMMAND_PREFIX_WORDS = new Set([
+  '!', 'coproc', 'do', 'done', 'elif', 'else', 'fi', 'if', 'then', 'until', 'while'
+]);
+
+// Reserved words whose clause head is a word list rather than a command:
+// `for file in src/*.ts` and `case $x in` execute nothing, so those words are
+// data and must not be resolved as a binary with arguments.
+const DATA_CLAUSE_WORDS = new Set(['case', 'esac', 'for', 'in', 'select']);
+
 // Binaries that can actually publish a commit status. Anything else — `echo`,
 // a commit message, a Python or Node snippet that only prints the endpoint —
 // is inert text and must stay allowed (central Issue #75).
 const HTTP_CLIENTS = new Set(['curl', 'gh', 'http', 'https', 'wget']);
+
+// Name given to a command word this gate cannot resolve, such as `"$GH" pr
+// merge 12` or `$(command -v gh) pr merge 12`. It contains a path separator, so
+// `binaryName()` can never produce it from real input. Such a command is
+// checked as if it were any of the binaries the policy cares about.
+const UNRESOLVED_BINARY = 'unresolved/command';
 
 const METHOD_OPTIONS = {
   curl: new Set(['-X', '--request']),
@@ -66,6 +84,28 @@ const FILE_BODY_OPTIONS = {
 
 const NO_OPTIONS = new Set();
 
+/** @param {Record<string, Set<string>>} map */
+function unionOptions(map) {
+  return new Set(Object.values(map).flatMap(flags => [...flags]));
+}
+
+// An unresolved command word could be any client, so it is measured against
+// every option table at once.
+METHOD_OPTIONS[UNRESOLVED_BINARY] = unionOptions(METHOD_OPTIONS);
+BODY_OPTIONS[UNRESOLVED_BINARY] = unionOptions(BODY_OPTIONS);
+FILE_BODY_OPTIONS[UNRESOLVED_BINARY] = unionOptions(FILE_BODY_OPTIONS);
+
+// `gh` uses Cobra, which accepts flags before the subcommand: `gh pr -R
+// owner/name merge 12` is a merge. Flags that consume the next word must be
+// skipped so the value is not read as the subcommand; flags of unknown arity
+// are resolved both ways instead of guessed.
+const GH_VALUE_OPTIONS = new Set([
+  '-B', '-F', '-H', '-R', '-X', '-b', '-f', '-q', '-t',
+  '--author-email', '--base', '--body', '--body-file', '--cache', '--field', '--header',
+  '--hostname', '--input', '--jq', '--match-head-commit', '--method', '--raw-field',
+  '--repo', '--subject', '--template'
+]);
+
 // Nested substitutions terminate because each level parses a strictly shorter
 // string, but a hostile input can still nest far enough to be unreadable. Past
 // this depth the input is treated as unresolved and denied instead of allowed.
@@ -74,6 +114,14 @@ const MAX_PARSE_DEPTH = 12;
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 // A parameter expansion left in a token value: the text it produces is unknown.
 const EXPANSION = /\$[A-Za-z_{]/;
+// Placeholder left in a token value where a command substitution was consumed.
+// The substitution body is parsed separately, but the surrounding token stays
+// marked as text this gate cannot resolve.
+const SUBSTITUTION = '$()';
+// Any expansion or substitution left in a token value. A command word or a
+// request body carrying one resolves to unknown text at run time, so both fail
+// closed rather than being read literally (`"$GH" pr merge`, `-f state="$S"`).
+const UNRESOLVED_TEXT = /\$\S|`/;
 const WRAPPER_OPERAND = /^\d+(?:\.\d+)?[smhd]?$/i;
 const STATUS_ENDPOINT = /(?:\/statuses\/|\/status$)/i;
 const SUCCESS_FIELD = /(?:^|=)state=success$/i;
@@ -174,16 +222,18 @@ function readDoubleQuoted(source, start, substitutions) {
       continue;
     }
     // Substitutions still execute inside double quotes; their bodies are parsed
-    // separately and contribute nothing to the surrounding token value.
+    // separately and leave a placeholder in the surrounding token value.
     if (ch === '$' && source[i + 1] === '(') {
       const span = readParenSpan(source, i + 1);
       substitutions.push(span.body);
+      value += SUBSTITUTION;
       i = span.next;
       continue;
     }
     if (ch === '`') {
       const span = readBacktickSpan(source, i);
       substitutions.push(span.body);
+      value += SUBSTITUTION;
       i = span.next;
       continue;
     }
@@ -304,7 +354,6 @@ function tokenizeScript(source) {
   let expanded = [];
   // Heredoc bodies and here-strings feeding this command's stdin.
   let stdinData = [];
-  let bareExpansion = false;
   let tokenExpanded = false;
   let inputFromUnknown = false;
   let lastDetail = null;
@@ -331,8 +380,18 @@ function tokenizeScript(source) {
   const endCommand = () => {
     endToken();
     redirectTarget = null;
+    // Reserved words are not the executed binary: `then gh pr merge 12` runs
+    // `gh`, and a `for`/`case` clause head runs nothing at all.
+    while (tokens.length && COMMAND_PREFIX_WORDS.has(tokens[0])) {
+      tokens.shift();
+      expanded.shift();
+    }
+    if (tokens.length && DATA_CLAUSE_WORDS.has(tokens[0])) {
+      tokens = [];
+      expanded = [];
+    }
     if (tokens.length) {
-      lastDetail = { tokens, expanded, bareExpansion, stdin: stdinData, inputFromUnknown };
+      lastDetail = { tokens, expanded, stdin: stdinData, inputFromUnknown };
       commands.push(tokens);
       details.push(lastDetail);
       tokens = [];
@@ -341,13 +400,15 @@ function tokenizeScript(source) {
       lastDetail = null;
     }
     stdinData = [];
-    bareExpansion = false;
     tokenExpanded = false;
     inputFromUnknown = false;
   };
+  // A substitution leaves a placeholder in the token it belongs to, so a
+  // command word or an argument built from one stays visibly unresolved.
   const noteSubstitution = () => {
-    if (started) tokenExpanded = true;
-    else bareExpansion = true;
+    token += SUBSTITUTION;
+    started = true;
+    tokenExpanded = true;
   };
   // Consumes `>`, `>>`, `<`, `>|`, `<>`, `>&2`, and any `N` file-descriptor
   // prefix already accumulated in the current token.
@@ -546,6 +607,10 @@ function binaryName(token) {
  * candidates keep an unrecognized `env --unknown VALUE gh pr merge` fail-closed
  * instead of resolving `VALUE` as the binary and allowing the merge.
  *
+ * A command word carrying an expansion or a substitution (`"$GH" pr merge 12`)
+ * names an unknown binary, so it resolves to {@link UNRESOLVED_BINARY} and its
+ * arguments are still checked.
+ *
  * @param {string[]} tokens
  * @returns {{ name: string, args: string[] }[]}
  */
@@ -559,7 +624,7 @@ function resolveExecutions(tokens) {
       index += 1;
       continue;
     }
-    const name = binaryName(tokens[index]);
+    const name = UNRESOLVED_TEXT.test(tokens[index]) ? UNRESOLVED_BINARY : binaryName(tokens[index]);
     if (!COMMAND_WRAPPERS.has(name)) {
       executions.push({ name, args: tokens.slice(index + 1) });
       if (!wrapped) break;
@@ -595,6 +660,12 @@ function resolveExecution(tokens) {
   return resolveExecutions(tokens)[0] || null;
 }
 
+// An unresolved command word can name a shell, so `S=bash; "$S" -c <script>`
+// is parsed like `bash -c <script>` instead of being read as opaque arguments.
+function runsShellScripts(name) {
+  return SHELL_BINARIES.has(name) || name === UNRESOLVED_BINARY;
+}
+
 /**
  * Scripts that a token list hands to another interpreter: `sh -c <script>` and
  * `eval <words>` both execute their operands, so they are parsed as commands.
@@ -609,7 +680,7 @@ function shellScriptArguments(tokens) {
       if (execution.args.length) scripts.push(execution.args.join(' '));
       continue;
     }
-    if (!SHELL_BINARIES.has(execution.name)) continue;
+    if (!runsShellScripts(execution.name)) continue;
     const flag = shellScriptFlagIndex(execution.args);
     if (flag !== -1 && flag + 1 < execution.args.length) scripts.push(execution.args[flag + 1]);
   }
@@ -634,7 +705,7 @@ function shellStdinScripts({ tokens, stdin, inputFromUnknown }) {
   const scripts = [];
   let unresolved = false;
   for (const execution of resolveExecutions(tokens)) {
-    if (!SHELL_BINARIES.has(execution.name)) continue;
+    if (!runsShellScripts(execution.name)) continue;
     if (shellScriptFlagIndex(execution.args) !== -1) continue;
     if (execution.args.some(argument => !argument.startsWith('-'))) continue;
     if (stdin.length) scripts.push(...stdin);
@@ -651,20 +722,20 @@ function shellStdinScripts({ tokens, stdin, inputFromUnknown }) {
  * Such input is reported as unresolved and denied instead of allowed; the
  * script it would run is unknown, so no allow decision can be justified.
  *
- * @param {{ tokens: string[], expanded: boolean[], bareExpansion: boolean }} detail
+ * @param {{ tokens: string[], expanded: boolean[] }} detail
  * @returns {boolean}
  */
-function executesDynamicScript({ tokens, expanded, bareExpansion }) {
+function executesDynamicScript({ tokens, expanded }) {
   const dynamic = (index, value) => Boolean(expanded[index]) || EXPANSION.test(String(value || ''));
   return resolveExecutions(tokens).some(execution => {
     const offset = tokens.length - execution.args.length;
     if (execution.name === 'eval') {
-      return bareExpansion || execution.args.some((argument, index) => dynamic(offset + index, argument));
+      return execution.args.some((argument, index) => dynamic(offset + index, argument));
     }
-    if (!SHELL_BINARIES.has(execution.name)) return false;
+    if (!runsShellScripts(execution.name)) return false;
     const flag = shellScriptFlagIndex(execution.args);
     if (flag === -1 || flag + 1 >= execution.args.length) return false;
-    return bareExpansion || dynamic(offset + flag + 1, execution.args[flag + 1]);
+    return dynamic(offset + flag + 1, execution.args[flag + 1]);
   });
 }
 
@@ -702,31 +773,78 @@ function hasSuccessValue(values) {
   return values.some(value => SUCCESS_FIELD.test(value) || SUCCESS_JSON.test(value));
 }
 
-// `@file` and `-` read the payload from elsewhere, so its content cannot be
-// cleared here. An empty list means a mutation whose body is not in argv at all.
+// `@file`, `-` and an expanded value read the payload from elsewhere, so its
+// content cannot be cleared here.
 function isOpaqueBody(value) {
-  return value === '' || value === '-' || value.startsWith('@');
+  return value === '' || value === '-' || value.startsWith('@') || UNRESOLVED_TEXT.test(value);
+}
+
+/**
+ * True when the request body sent to a status endpoint cannot be read as a
+ * non-success payload: a body file, no body in argv at all, or a value built by
+ * an expansion (`-f state="$STATE"` posts `success` when `STATE=success`).
+ *
+ * @param {string[]} bodies values of the body options found in argv
+ * @param {string[]} files values of the file-body options found in argv
+ * @returns {boolean}
+ */
+function hasUnreadablePayload(bodies, files) {
+  return files.length > 0 || bodies.length === 0 || bodies.some(isOpaqueBody);
+}
+
+/**
+ * Positional operands of a `gh` invocation, with flag values consumed so a
+ * value is never read as a subcommand (`gh pr -R owner/name merge 12`).
+ *
+ * @param {string[]} args
+ * @param {boolean} unknownTakesValue how a flag of unknown arity is resolved
+ * @returns {string[]}
+ */
+function ghOperands(args, unknownTakesValue) {
+  const operands = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === '--') {
+      operands.push(...args.slice(index + 1));
+      break;
+    }
+    if (!argument.startsWith('-') || argument === '-') {
+      operands.push(argument);
+      continue;
+    }
+    // `--flag=value` and attached short forms such as `-Rowner/name` carry
+    // their own value; a separate word is consumed only when the flag takes one.
+    if (argument.includes('=') || (!argument.startsWith('--') && argument.length > 2)) continue;
+    if (GH_VALUE_OPTIONS.has(argument) || unknownTakesValue) index += 1;
+  }
+  return operands;
+}
+
+// Both readings of an unknown flag's arity are checked, so an unrecognized
+// `gh pr --unknown value merge 12` cannot shift `merge` out of view.
+function ghOperandResolutions(args) {
+  return [ghOperands(args, false), ghOperands(args, true)];
 }
 
 function mergesPullRequest(tokens) {
   return resolveExecutions(tokens).some(execution => {
-    if (execution.name !== 'gh') return false;
-    const operands = execution.args.filter(argument => !argument.startsWith('-'));
-    return operands.some((operand, index) => operand === 'pr' && operands[index + 1] === 'merge');
+    if (execution.name !== 'gh' && execution.name !== UNRESOLVED_BINARY) return false;
+    return ghOperandResolutions(execution.args)
+      .some(operands => operands.some((operand, index) => operand === 'pr' && operands[index + 1] === 'merge'));
   });
 }
 
 function ghPublishesSuccessStatus(args) {
-  const operands = args.filter(argument => !argument.startsWith('-'));
-  if (operands[0] !== 'api') return false;
-  if (!operands.some(operand => STATUS_ENDPOINT.test(operand))) return false;
+  const resolutions = ghOperandResolutions(args);
+  if (!resolutions.some(operands => operands[0] === 'api')) return false;
+  if (!resolutions.some(operands => operands.some(operand => STATUS_ENDPOINT.test(operand)))) return false;
   const bodies = optionValues(args, BODY_OPTIONS.gh);
   const files = optionValues(args, FILE_BODY_OPTIONS.gh);
   const methods = optionValues(args, METHOD_OPTIONS.gh);
   // `gh api` only sends a request body for field/input flags or an explicit
   // mutating method; a plain read of the statuses endpoint stays allowed.
   if (!bodies.length && !files.length && !methods.some(method => MUTATING_METHOD.test(method))) return false;
-  return hasSuccessValue(bodies) || files.length > 0 || bodies.every(isOpaqueBody);
+  return hasSuccessValue(bodies) || hasUnreadablePayload(bodies, files);
 }
 
 function clientPublishesSuccessStatus(name, args) {
@@ -741,19 +859,24 @@ function clientPublishesSuccessStatus(name, args) {
     || methods.some(method => MUTATING_METHOD.test(method))
     || operands.some(operand => MUTATING_METHOD.test(operand));
   if (!mutating) return false;
-  return hasSuccessValue(bodies) || hasSuccessValue(operands) || files.length > 0 || bodies.every(isOpaqueBody);
+  return hasSuccessValue(bodies) || hasSuccessValue(operands) || hasUnreadablePayload(bodies, files);
 }
 
 /**
  * True only when the token list runs an HTTP client that writes a success commit
  * status. Printing the same endpoint and payload (`echo`, a commit message, a
- * Python snippet) executes no request and stays allowed.
+ * Python snippet) executes no request and stays allowed. A command word this
+ * gate cannot resolve is measured as any of the clients.
  *
  * @param {string[]} tokens
  * @returns {boolean}
  */
 function publishesSuccessStatus(tokens) {
   return resolveExecutions(tokens).some(execution => {
+    if (execution.name === UNRESOLVED_BINARY) {
+      return ghPublishesSuccessStatus(execution.args)
+        || clientPublishesSuccessStatus(UNRESOLVED_BINARY, execution.args);
+    }
     if (!HTTP_CLIENTS.has(execution.name)) return false;
     return execution.name === 'gh'
       ? ghPublishesSuccessStatus(execution.args)
