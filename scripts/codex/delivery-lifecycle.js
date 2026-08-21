@@ -279,6 +279,50 @@ function findDuplicateIssue(delivery, options = {}) {
   }) || null;
 }
 
+// PRを名指しした要求は、Issue検索やbranch作成より先にそのPRを解決してDeliveryを拘束する。
+// 解決しないままprepareへ進むと、指定PRのheadを一度も見ないまま別Issueと別branchを作り、
+// 指定PRと無関係なDeliveryが動き出す。
+const PR_ISSUE_LINK = /(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)\b/i;
+
+function resolveRequestedPr(delivery, options = {}) {
+  const requested = delivery && delivery.requested_pr_number;
+  if (!requested) return null;
+  const execute = options.runCommand || runCommand;
+  const raw = execute(
+    'gh',
+    ['pr', 'view', String(requested), '--json', 'number,url,state,headRefName,baseRefName,body,isCrossRepository'],
+    options
+  );
+  const pr = JSON.parse(raw || '{}');
+  if (Number(pr.number) !== Number(requested)) {
+    throw new Error(`gh pr view ${requested} did not return PR #${requested}; refusing to start a delivery on an unresolved PR.`);
+  }
+  if (String(pr.state || '').toUpperCase() !== 'OPEN') {
+    throw new Error(`Referenced PR #${requested} is ${String(pr.state || 'unknown').toUpperCase()}; reopen it or name the Issue explicitly instead of creating a new one.`);
+  }
+  if (pr.isCrossRepository) {
+    throw new Error(`Referenced PR #${requested} comes from a fork; its head branch cannot be delivered from this clone.`);
+  }
+  if (!pr.headRefName) {
+    throw new Error(`Referenced PR #${requested} has no head branch; resolve the PR before continuing.`);
+  }
+  const linked = String(pr.body || '').match(PR_ISSUE_LINK);
+  const issueNumber = linked ? Number(linked[1]) : Number(delivery.requested_issue_number) || null;
+  if (!issueNumber) {
+    throw new Error(`Referenced PR #${requested} does not link an Issue (Closes #<number>); name the Issue explicitly instead of creating a new one.`);
+  }
+  if (delivery.requested_issue_number && issueNumber !== Number(delivery.requested_issue_number)) {
+    throw new Error(`Referenced PR #${requested} links Issue #${issueNumber}, but the request named Issue #${delivery.requested_issue_number}; resolve the conflict before continuing.`);
+  }
+  return {
+    number: Number(pr.number),
+    url: pr.url,
+    headRefName: pr.headRefName,
+    baseRefName: pr.baseRefName || null,
+    issueNumber
+  };
+}
+
 function findExistingDeliveryPr(delivery, currentBranch, options = {}) {
   if (!currentBranch || !delivery.requested_issue_number) return null;
   const execute = options.runCommand || runCommand;
@@ -308,17 +352,21 @@ function prepareDelivery(input = {}, options = {}) {
     throw new Error('No pending required delivery task. Submit the implementation request first.');
   }
 
+  const execute = options.runCommand || runCommand;
+  const commandOptions = { cwd, env, runCommand: execute };
+
   try {
-    const dirty = runCommand('git', ['status', '--porcelain'], { cwd, env });
+    const dirty = execute('git', ['status', '--porcelain'], commandOptions);
     if (dirty) throw new Error('Delivery preparation requires a clean working tree; preserve or commit existing changes first.');
 
-    const currentBranch = runCommand('git', ['branch', '--show-current'], { cwd, env });
-    const existingPr = findExistingDeliveryPr(delivery, currentBranch, { cwd, env });
-    let issue = findDuplicateIssue(delivery, {
-      cwd,
-      env,
-      allowClosedReferencedIssue: Boolean(existingPr)
-    });
+    const currentBranch = execute('git', ['branch', '--show-current'], commandOptions);
+    // 指定PRの解決に失敗したときは、Issueもbranchも作らずここでfail-closeする。
+    const requestedPr = resolveRequestedPr(delivery, commandOptions);
+    const existingPr = requestedPr || findExistingDeliveryPr(delivery, currentBranch, commandOptions);
+    let issue = findDuplicateIssue(
+      requestedPr ? { ...delivery, requested_issue_number: requestedPr.issueNumber } : delivery,
+      { ...commandOptions, allowClosedReferencedIssue: Boolean(existingPr) }
+    );
     if (!issue) {
       const body = [
         'ECC deterministic delivery workflow がユーザー要求から自動作成しました。',
@@ -327,36 +375,53 @@ function prepareDelivery(input = {}, options = {}) {
         '',
         'このIssueに紐づくDraft PRが作成されるまで自動クローズしません。'
       ].join('\n');
-      const url = runCommand('gh', ['issue', 'create', '--title', delivery.title, '--body', body], { cwd, env });
+      const url = execute('gh', ['issue', 'create', '--title', delivery.title, '--body', body], commandOptions);
       issue = { number: parseIssueNumber(url), title: delivery.title, url };
     }
 
-    const existingIssueBranches = runCommand(
+    const existingIssueBranches = execute(
       'git',
       ['branch', '--list', `codex/issue-${issue.number}-*`, '--format=%(refname:short)'],
-      { cwd, env }
+      commandOptions
     ).split(/\r?\n/).filter(Boolean);
     // 再開時にタイトルやslugが変わっても、同じIssueの現在branchを優先する。
     // これにより同一Issueへ複数branchを作ることを防ぐ。
-    const branch = existingPr
-      ? currentBranch
-      : selectDeliveryBranch(issue.number, delivery.title, currentBranch, existingIssueBranches);
+    // 指定PRがあるときは、そのhead branchだけがDeliveryの対象になる。
+    const branch = requestedPr
+      ? requestedPr.headRefName
+      : existingPr
+        ? currentBranch
+        : selectDeliveryBranch(issue.number, delivery.title, currentBranch, existingIssueBranches);
     if (currentBranch !== branch) {
-      const existing = runCommand('git', ['branch', '--list', branch], { cwd, env });
+      const existing = execute('git', ['branch', '--list', branch], commandOptions);
       if (existing) {
-        runCommand('git', ['switch', branch], { cwd, env });
+        execute('git', ['switch', branch], commandOptions);
+      } else if (requestedPr) {
+        // 指定PRのhead branchはPR側の実体である。baseから作り直すと別の変更になるため、
+        // 手元に無ければ取得を促してfail-closeする。
+        const tracked = execute(
+          'git',
+          ['branch', '--list', '--remotes', `*/${branch}`, '--format=%(refname:short)'],
+          commandOptions
+        ).split(/\r?\n/).filter(Boolean);
+        if (tracked.length !== 1) {
+          throw new Error(`PR #${requestedPr.number} head branch ${branch} is not available in this clone; fetch it before continuing.`);
+        }
+        execute('git', ['switch', '--track', tracked[0]], commandOptions);
       } else {
-        runCommand('git', ['rev-parse', '--verify', delivery.base_branch], { cwd, env });
-        runCommand('git', ['switch', '-c', branch, delivery.base_branch], { cwd, env });
+        execute('git', ['rev-parse', '--verify', delivery.base_branch], commandOptions);
+        execute('git', ['switch', '-c', branch, delivery.base_branch], commandOptions);
       }
     }
 
     const next = {
       ...delivery,
       status: 'ready',
+      requested_issue_number: requestedPr ? requestedPr.issueNumber : delivery.requested_issue_number,
       issue_number: Number(issue.number),
       issue_url: issue.url,
       branch,
+      base_branch: requestedPr && requestedPr.baseRefName ? requestedPr.baseRefName : delivery.base_branch,
       draft_pr_url: existingPr ? existingPr.url : delivery.draft_pr_url,
       prepared_at: new Date().toISOString()
     };
@@ -407,6 +472,7 @@ module.exports = {
   parseIssueNumber,
   pendingSessionForProject,
   prepareDelivery,
+  resolveRequestedPr,
   runCommand,
   selectDeliveryBranch,
   slug,

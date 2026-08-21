@@ -50,6 +50,7 @@ const {
   parseIssueNumber,
   pendingSessionForProject,
   prepareDelivery,
+  runCommand,
   selectDeliveryBranch,
   slug,
   titleFromRequest
@@ -539,6 +540,12 @@ test('a draft-pr delivery allows only read-only Bash and fails closed when the w
     'git branch --show-current',
     'gh pr view 274',
     'gh api repos/acme/repo/pulls/274',
+    'rg -n needle src',
+    'grep -rn needle src',
+    'cat -n src/product.ts',
+    'ls -la src',
+    'wc -l src/product.ts',
+    'stat -c %s src/product.ts',
     'node "/plugin/scripts/codex/reset.js" "delivery-draft-pr-bash"'
   ]) {
     assert.strictEqual(deliveryGate.run(bash(allowed), { cwd: fixture, env: fixtureEnv }), bash(allowed), allowed);
@@ -558,7 +565,20 @@ test('a draft-pr delivery allows only read-only Bash and fails closed when the w
     'cat src/product.ts | tee src/product.ts',
     'gh pr merge 274 --squash',
     'gh api -X POST repos/acme/repo/issues',
-    'node "/plugin/scripts/codex/delivery-lifecycle.js" prepare --session "delivery-draft-pr-bash"'
+    'node "/plugin/scripts/codex/delivery-lifecycle.js" prepare --session "delivery-draft-pr-bash"',
+    // read-onlyなbinaryでも、引数で外部コマンドを起動できるoptionは通さない。
+    'rg --pre "touch review-bypass-sentinel" needle src',
+    'rg --pre-glob * --pre touch needle src',
+    'rg --search-zip needle src',
+    'rg -z needle src',
+    'file -C -m custom.mgc src/product.ts',
+    'git -c core.pager=touch log',
+    'git --exec-path=/tmp log',
+    'git log --ext-diff',
+    'git show --textconv HEAD',
+    'gh pr view 274 --web',
+    'tail -f src/product.ts',
+    'date -s 2020-01-01'
   ]) {
     const output = JSON.parse(deliveryGate.run(bash(denied), { cwd: fixture, env: fixtureEnv }));
     assert.strictEqual(output.hookSpecificOutput.permissionDecision, 'deny', denied);
@@ -568,6 +588,10 @@ test('a draft-pr delivery allows only read-only Bash and fails closed when the w
   assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git status; git commit -m x'), false);
   assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git log --output=/tmp/log'), false);
   assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git branch codex/issue-999-bypass'), false);
+  // binary名だけの許可では、`--pre` のような実行optionを取りこぼす。
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand("rg --pre 'touch review-bypass-sentinel' needle src"), false);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('rg -n --glob=*.ts needle src'), true);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git blame --textconv src/product.ts'), false);
 
   // Stop: 変更が無ければ完了状態のまま停止できる。
   const stop = JSON.stringify(input);
@@ -637,6 +661,87 @@ test('a GitHub URL naming another Issue or PR starts a new delivery while the re
   assert.strictEqual(explicitPrNumber('pull-request 300 を確認してください'), 300);
   assert.strictEqual(explicitIssueNumber('https://github.com/acme/repo/pull/300 を修正してください'), null);
   assert.strictEqual(explicitPrNumber('https://github.com/acme/repo/issues/300 を修正してください'), null);
+});
+
+test('preparing a delivery that names another PR binds it to that PR head instead of creating an Issue and branch', () => {
+  const codexBranches = fixture => spawnSync(
+    'git',
+    ['branch', '--list', 'codex/*', '--format=%(refname:short)'],
+    { cwd: fixture, encoding: 'utf8' }
+  ).stdout.trim().split(/\r?\n/).filter(Boolean).sort();
+  const prBranch = 'codex/issue-299-other-work';
+  const ghCalls = [];
+  const stubbedGh = pr => (binary, args, commandOptions) => {
+    if (binary !== 'gh') return runCommand(binary, args, commandOptions);
+    ghCalls.push(args.join(' '));
+    if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify(pr);
+    if (args[0] === 'issue' && args[1] === 'view') {
+      return JSON.stringify({ number: 299, title: 'other work', url: 'https://example.invalid/issues/299', state: 'OPEN' });
+    }
+    throw new Error(`unexpected gh call: ${args.join(' ')}`);
+  };
+
+  const { fixture, fixtureEnv, input, branch: draftBranch, baseBranch } =
+    createDraftPrFixture('delivery-other-pr-repo', 'delivery-other-pr', 'delivery-other-pr-state');
+  // 指定PRのhead branchはこのcloneに存在する。切り替えるのはprepareの仕事である。
+  assert.strictEqual(spawnSync('git', ['branch', prBranch], { cwd: fixture }).status, 0);
+  const openPr = {
+    number: 300,
+    url: 'https://example.invalid/pull/300',
+    state: 'OPEN',
+    headRefName: prBranch,
+    baseRefName: baseBranch,
+    body: 'Closes #299',
+    isCrossRepository: false
+  };
+
+  const started = initializeDelivery(
+    input,
+    'https://github.com/acme/repo/pull/300 の指摘を修正してください',
+    { cwd: fixture, env: fixtureEnv }
+  );
+  assert.strictEqual(started.status, 'pending');
+  assert.strictEqual(started.requested_pr_number, 300);
+
+  const prepared = prepareDelivery(input, { cwd: fixture, env: fixtureEnv, runCommand: stubbedGh(openPr) });
+  // 指定PRはIssue検索より先に解決され、Delivery はそのPRのhead / base / 関連Issueに拘束される。
+  assert.match(ghCalls[0], /^pr view 300 --json /);
+  assert.ok(!ghCalls.some(call => call.startsWith('issue create')));
+  assert.strictEqual(prepared.issue_number, 299);
+  assert.strictEqual(prepared.issue_url, 'https://example.invalid/issues/299');
+  assert.strictEqual(prepared.branch, prBranch);
+  assert.strictEqual(prepared.base_branch, baseBranch);
+  assert.strictEqual(prepared.draft_pr_url, 'https://example.invalid/pull/300');
+  assert.strictEqual(
+    spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim(),
+    prBranch
+  );
+  // 自動生成Issue用の別branchは作られない。
+  assert.deepStrictEqual(codexBranches(fixture), [draftBranch, prBranch].sort());
+
+  // 指定PRを解決できないときは、Issueもbranchも作らずfail-closeする。
+  for (const [name, pr, expected] of [
+    ['closed', { ...openPr, state: 'CLOSED' }, /is CLOSED/],
+    ['fork', { ...openPr, isCrossRepository: true }, /fork/],
+    ['unlinked', { ...openPr, body: 'no linked issue' }, /does not link an Issue/],
+    ['missing-head', { ...openPr, headRefName: 'codex/issue-299-missing' }, /not available in this clone/]
+  ]) {
+    const other = createDraftPrFixture(
+      `delivery-other-pr-${name}-repo`,
+      `delivery-other-pr-${name}`,
+      `delivery-other-pr-${name}-state`
+    );
+    assert.strictEqual(spawnSync('git', ['branch', prBranch], { cwd: other.fixture }).status, 0);
+    initializeDelivery(other.input, 'PR #300 の指摘を修正してください', { cwd: other.fixture, env: other.fixtureEnv });
+    assert.throws(
+      () => prepareDelivery(other.input, { cwd: other.fixture, env: other.fixtureEnv, runCommand: stubbedGh(pr) }),
+      expected,
+      name
+    );
+    assert.strictEqual(readState(other.input, other.fixtureEnv).delivery.status, 'pending', name);
+    assert.deepStrictEqual(codexBranches(other.fixture), [other.branch, prBranch].sort(), name);
+  }
+  assert.ok(!ghCalls.some(call => call.startsWith('issue create')));
 });
 
 test('a completed delivery is not reused when the same request text is sent again', () => {

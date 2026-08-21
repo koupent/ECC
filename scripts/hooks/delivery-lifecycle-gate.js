@@ -60,7 +60,39 @@ const READ_ONLY_GH_SUBCOMMANDS = new Map([
   ['run', new Set(['view', 'list'])],
   ['auth', new Set(['status'])]
 ]);
-const READ_ONLY_BINARIES = new Set(['cat', 'date', 'echo', 'file', 'grep', 'head', 'ls', 'pwd', 'rg', 'stat', 'tail', 'wc']);
+// binary名だけを許可すると、引数で外部コマンドを起動できるoption（`rg --pre <cmd>`、
+// `rg --search-zip`、`file -C` など）まで通り、Draft PR後でもファイルやGit状態を変更できる。
+// read-onlyと確認したoptionだけをbinaryごとに列挙し、未知のoptionは拒否する。option以外の
+// 位置引数はpattern/pathとして渡るだけで実行されない。
+const READ_ONLY_BINARY_OPTIONS = new Map([
+  ['cat', /^-(?:[AbEnsTv]+|-(?:number|number-nonblank|squeeze-blank|show-all|show-ends|show-tabs|show-nonprinting))$/],
+  ['date', /^(?:-[uR]|-I[a-z]*|--(?:utc|universal|rfc-email|iso-8601(?:=[a-z]+)?|rfc-3339=[a-z]+))$/],
+  ['echo', /^-[neE]+$/],
+  ['file', /^-(?:[bhikLNprsv]+|-(?:brief|mime|mime-type|mime-encoding|no-pad|preserve-date|raw|dereference|keep-going))$/],
+  [
+    'grep',
+    /^(?:-[abcdeEFGHhIiLlnPqRrsUvwxZz]+|-[ABCm]\d*|--(?:after-context|before-context|context|binary-files|colou?r|exclude|exclude-dir|include|max-count|regexp)=\S*|--(?:count|dereference-recursive|extended-regexp|files-with-matches|files-without-match|fixed-strings|ignore-case|invert-match|line-number|line-regexp|no-filename|no-messages|null|only-matching|perl-regexp|quiet|recursive|silent|text|with-filename|word-regexp))$/
+  ],
+  ['head', /^(?:-[qvz]+|-[cn][0-9+-]*|-\d+|--(?:bytes|lines)=\S+|--(?:quiet|silent|verbose|zero-terminated))$/],
+  [
+    'ls',
+    /^(?:-[1AaBbCcdFfGghHiklLmNnpQqRrSsTtUuvXx]+|--(?:colou?r|hide|ignore|sort|time|time-style)=\S*|--(?:all|almost-all|classify|directory|full-time|group-directories-first|human-readable|inode|literal|numeric-uid-gid|recursive|reverse|si|size))$/
+  ],
+  ['pwd', /^-[LP]$/],
+  [
+    'rg',
+    /^(?:-[eg]|-[ABCm]\d*|-[TtP]\S*|-[cFHhIiLlNnpSsUvwx]+|--(?:after-context|before-context|context|colou?r|colors|engine|glob|iglob|max-columns|max-count|max-depth|max-filesize|regexp|sort|sortr|type|type-not)=\S+|--(?:byte-offset|case-sensitive|column|count|count-matches|crlf|files|files-with-matches|files-without-match|fixed-strings|follow|heading|hidden|ignore-case|invert-match|json|line-number|line-regexp|multiline|multiline-dotall|no-column|no-filename|no-heading|no-ignore|no-ignore-vcs|no-line-number|no-messages|null|null-data|one-file-system|only-matching|passthru|pcre2|pretty|quiet|smart-case|sort-files|stats|text|trim|vimgrep|with-filename|word-regexp))$/
+  ],
+  ['stat', /^(?:-[cfLt]|--(?:cached=[a-z]+|dereference|file-system|format=\S*|printf=\S*|terse))$/],
+  ['tail', /^(?:-[qvz]+|-[cn][0-9+-]*|-\d+|--(?:bytes|lines)=\S+|--(?:quiet|silent|verbose|zero-terminated))$/],
+  ['wc', /^(?:-[cLlmw]+|--(?:bytes|chars|lines|max-line-length|words))$/]
+]);
+// subcommandがread-onlyでも、外部コマンドを起動できるoptionは拒否する。`git -c` /
+// `--config-env` / `--exec-path` はpagerやdiff.externalを差し替えられ、`--ext-diff` と
+// `--textconv` は設定済みの外部filterをそのまま実行する。
+const GIT_EXEC_FLAG = /^(?:-c|-C|--config-env|--exec-path|--ext-diff|--textconv|--upload-pack|--receive-pack)(?:=|$)/i;
+// `gh ... --web` はブラウザ起動コマンドを実行する。
+const GH_EXEC_FLAG = /^(?:-w|--web)(?:=|$)/i;
 const GH_WRITE_FLAG = /^(?:-X|--method|-f|-F|--field|--raw-field|--input)(?:=|$)/i;
 const OUTPUT_FLAG = /^(?:-o|--output)(?:=|$)/i;
 
@@ -73,6 +105,7 @@ function commandTokens(command) {
 }
 
 function isReadOnlyGitCommand(args) {
+  if (args.some(argument => GIT_EXEC_FLAG.test(argument))) return false;
   const rest = args[0] === '--no-pager' ? args.slice(1) : args;
   const subcommand = String(rest[0] || '').toLowerCase();
   if (READ_ONLY_GIT_SUBCOMMANDS.has(subcommand)) return true;
@@ -82,11 +115,19 @@ function isReadOnlyGitCommand(args) {
 }
 
 function isReadOnlyGhCommand(args) {
+  if (args.some(argument => GH_EXEC_FLAG.test(argument))) return false;
   const group = String(args[0] || '').toLowerCase();
   // `gh api` は既定でGETだが、method指定やfield付与は書き込みになり得る。
   if (group === 'api') return !args.slice(1).some(argument => GH_WRITE_FLAG.test(argument));
   const subcommands = READ_ONLY_GH_SUBCOMMANDS.get(group);
   return Boolean(subcommands && subcommands.has(String(args[1] || '').toLowerCase()));
+}
+
+function isReadOnlyArguments(binary, args) {
+  const allowed = READ_ONLY_BINARY_OPTIONS.get(binary);
+  if (!allowed) return false;
+  // `-`（stdin）と `--`（option終端）以外のoptionは、許可listに載るものだけ通す。
+  return args.every(argument => !/^-./.test(argument) || argument === '--' || allowed.test(argument));
 }
 
 function isReadOnlyBashCommand(command) {
@@ -98,7 +139,7 @@ function isReadOnlyBashCommand(command) {
   if (args.some(argument => OUTPUT_FLAG.test(argument))) return false;
   if (binary === 'git') return isReadOnlyGitCommand(args);
   if (binary === 'gh') return isReadOnlyGhCommand(args);
-  return READ_ONLY_BINARIES.has(binary);
+  return isReadOnlyArguments(binary, args);
 }
 
 function isExactLifecycleCommand(command, action) {
