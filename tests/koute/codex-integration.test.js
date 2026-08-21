@@ -34,7 +34,7 @@ const deliveryGate = require('../../scripts/hooks/delivery-lifecycle-gate');
 const deliveryCompletion = require('../../scripts/hooks/delivery-completion-gate');
 const localMergePolicy = require('../../scripts/hooks/local-merge-policy-gate');
 const incidentOwnershipGate = require('../../scripts/hooks/incident-ownership-gate');
-const { PRE_BASH_HOOKS } = require('../../scripts/hooks/bash-hook-dispatcher');
+const { PRE_BASH_HOOKS, runPreBash } = require('../../scripts/hooks/bash-hook-dispatcher');
 const deliveryProgress = require('../../scripts/hooks/delivery-progress');
 const deliveryFinalizer = require('../../scripts/hooks/delivery-session-finalizer');
 const configProtection = require('../../scripts/hooks/config-protection');
@@ -810,7 +810,7 @@ test('local merge policy blocks merge bypasses and direct success status publica
     'utf8'
   );
   const bash = command => JSON.stringify({ cwd: fixture, tool_name: 'Bash', tool_input: { command } });
-  for (const command of [
+  const denied = [
     'gh pr merge 12 --squash',
     'gh pr merge 12 --admin --squash',
     'gh api repos/acme/example/statuses/abc -f state=success -f context="Local Merge Gate"',
@@ -819,20 +819,75 @@ test('local merge policy blocks merge bypasses and direct success status publica
     'echo "$(gh pr merge 12 --squash)"',
     'cat <<EOF\n$(gh pr merge 12 --squash)\nEOF',
     'bash -lc "gh pr merge 12 --squash"',
-    'curl -X POST https://api.github.com/repos/acme/example/statuses/abc -d \'{"state":"success"}\''
-  ]) {
-    const denied = JSON.parse(localMergePolicy.run(bash(command), { cwd: fixture, env }));
-    assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny', command);
+    'curl -X POST https://api.github.com/repos/acme/example/statuses/abc -d \'{"state":"success"}\'',
+    // Wrapper options that take their own operand must not hide the binary.
+    'env -u GH_TOKEN gh pr merge 12 --squash',
+    'sudo -u ci gh pr merge 12 --squash',
+    'timeout -k 5 10 gh pr merge 12 --squash',
+    'xargs -I {} gh pr merge {} --squash',
+    // Redirections are not arguments, wherever they appear in the command.
+    'gh pr </dev/null merge 12 --squash',
+    'gh pr merge 12 --squash >/tmp/merge.log 2>&1',
+    // Indirect execution through eval and through deeply nested substitutions.
+    "eval 'gh pr merge 12 --squash'",
+    'eval "$(printf \'gh pr merge 12 --squash\')"',
+    `echo "${'$('.repeat(14)}gh pr merge 12${')'.repeat(14)}"`,
+    // A shell also executes the script it reads from stdin.
+    "bash <<'EOF'\ngh pr merge 12 --squash\nEOF",
+    'bash <<< "gh pr merge 12 --squash"',
+    "printf 'gh pr merge 12 --squash' | bash",
+    // The payload of a status mutation is not visible in argv: fail closed.
+    'gh api --method POST repos/acme/example/statuses/abc --input body.json',
+    'curl -XPOST https://api.github.com/repos/acme/example/statuses/abc -d @status.json'
+  ];
+  for (const command of denied) {
+    const decision = JSON.parse(localMergePolicy.run(bash(command), { cwd: fixture, env }));
+    assert.strictEqual(decision.hookSpecificOutput.permissionDecision, 'deny', command);
   }
-  for (const command of [
+  const allowedCommands = [
     'gh pr view 12 --json state',
     'git commit -m "gh pr merge stays with the completion gate"',
     'bash -lc "echo \'gh pr merge stays with the completion gate\'"',
     "python3 - <<'PY'\nnote = \"gh pr merge and -f state=success are blocked locally\"\nopen('memory.md', 'w').write(note)\nPY",
-    "cat > notes.md <<'EOF'\ngh api repos/acme/example/statuses/abc -f state=success\nEOF"
-  ]) {
+    "cat > notes.md <<'EOF'\ngh api repos/acme/example/statuses/abc -f state=success\nEOF",
+    // Inert command text: printing an endpoint and a payload publishes nothing.
+    'echo https://api.github.com/repos/acme/example/statuses/abc \'{"state":"success"}\'',
+    'python3 -c \'print("https://api.github.com/repos/acme/example/statuses/abc", {"state": "success"})\'',
+    'node -e \'console.log("gh pr merge 12 --squash")\'',
+    'git commit -m "note: -f state=success on /statuses/ belongs to the merge gate"',
+    // Reads of the same endpoint stay available to the delivery flow.
+    'gh api repos/acme/example/statuses/abc --jq \'.[0].state\'',
+    'curl -sS https://api.github.com/repos/acme/example/statuses/abc',
+    // Ordinary shell usage keeps working: a script file, a plain pipe, flags.
+    'bash scripts/ci/project-verify.sh',
+    'bash --version',
+    'git log --oneline | head -20'
+  ];
+  for (const command of allowedCommands) {
     const allowed = bash(command);
     assert.strictEqual(localMergePolicy.run(allowed, { cwd: fixture, env }), allowed, command);
+  }
+
+  // The gate ships behind the consolidated PreToolUse dispatcher, so the same
+  // decisions must hold on that path. GateGuard is disabled here so its
+  // once-per-session Bash gate does not answer for this hook.
+  const previous = { profile: process.env.ECC_HOOK_PROFILE, gateguard: process.env.GATEGUARD_DISABLED };
+  process.env.ECC_HOOK_PROFILE = 'standard';
+  process.env.GATEGUARD_DISABLED = '1';
+  try {
+    for (const command of denied) {
+      const output = runPreBash(bash(command)).output;
+      assert.match(output, /Local Merge Policy/, command);
+      assert.strictEqual(JSON.parse(output).hookSpecificOutput.permissionDecision, 'deny', command);
+    }
+    for (const command of allowedCommands) {
+      assert.ok(!runPreBash(bash(command)).output.includes('Local Merge Policy'), command);
+    }
+  } finally {
+    if (previous.profile === undefined) delete process.env.ECC_HOOK_PROFILE;
+    else process.env.ECC_HOOK_PROFILE = previous.profile;
+    if (previous.gateguard === undefined) delete process.env.GATEGUARD_DISABLED;
+    else process.env.GATEGUARD_DISABLED = previous.gateguard;
   }
 
   const backgroundReview = JSON.stringify({
