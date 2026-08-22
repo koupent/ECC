@@ -856,6 +856,14 @@ test('local merge policy blocks merge bypasses and direct success status publica
     // and `find` runs the words after `-exec` up to `;` or `+`.
     "env -S 'gh pr merge 12 --squash'",
     "env --split-string='gh pr merge 12 --squash'",
+    // `env` appends its remaining operands to the words it split out, so the
+    // command line continues after the option value.
+    'env -Sgh pr merge 12 --squash',
+    "env -S 'gh pr' merge 12 --squash",
+    "env --split-string='gh pr merge' 12 --squash",
+    // An option of unknown arity may or may not take the next word, so the
+    // command is looked for in both readings.
+    'env --unknown-flag value gh pr merge 12 --squash',
     'find . -name "*.md" -exec gh pr merge 12 --squash \\;',
     "find . -exec sh -c 'gh pr merge 12 --squash' \\;",
     "CMD='gh pr merge 12 --squash'; env -S \"$CMD\"",
@@ -867,7 +875,12 @@ test('local merge policy blocks merge bypasses and direct success status publica
     'URL=repos/acme/example/statuses/abc; gh api "$URL" -f state=success',
     'STATE=success; gh api "$URL" -f state="$STATE"',
     'URL=repos/acme/example/statuses/abc; gh api "$URL" --input body.json',
-    'URL=https://api.github.com/repos/acme/example/statuses/abc; curl -X POST "$URL" -d \'{"state":"success"}\''
+    'URL=https://api.github.com/repos/acme/example/statuses/abc; curl -X POST "$URL" -d \'{"state":"success"}\'',
+    // The endpoint can also be named by an option instead of by an operand,
+    // in the separate form and in the attached one.
+    'curl --url https://api.github.com/repos/acme/example/statuses/abc -d \'{"state":"success"}\'',
+    'curl --url=https://api.github.com/repos/acme/example/statuses/abc -d \'{"state":"success"}\'',
+    'curl --url=https://api.github.com/repos/acme/example/statuses/abc -X POST -T status.json'
   ];
   for (const command of denied) {
     const decision = JSON.parse(localMergePolicy.run(bash(command), { cwd: fixture, env }));
@@ -906,6 +919,14 @@ test('local merge policy blocks merge bypasses and direct success status publica
     'find . -name "*.js" -exec grep -l "gh pr merge" {} +',
     'echo -exec gh pr merge 12 --squash',
     "env -S 'echo the merge stays with the completion gate'",
+    // A known wrapper runs the word right after its own options; the words after
+    // that are arguments of a command that merges nothing (central Issue #75).
+    "env printf '%s\\n' gh pr merge 12 --squash",
+    'sudo -u ci echo "gh pr merge stays with the completion gate"',
+    'timeout 10 echo "gh api repos/acme/example/statuses/abc -f state=success"',
+    "xargs -I {} echo 'gh pr merge {} --squash'",
+    // Neither reading of the unknown option puts `gh` in the command position.
+    "env -i printf '%s\\n' gh pr merge 12 --squash",
     // An endpoint this gate cannot read is not a status post when the field the
     // request writes is readable and is not the commit state.
     'gh api "repos/$REPO/issues/1/comments" -f body="$MSG"',
@@ -988,7 +1009,11 @@ test('local merge policy blocks merge bypasses and direct success status publica
   const backgroundText = [
     'echo scripts/codex/run-role.js',
     'git commit -m "run scripts/codex/run-role.js in the foreground"',
-    'node scripts/ci/project-verify.js --json'
+    'node scripts/ci/project-verify.js --json',
+    // A wrapper runs only the word right after its own options: the runner path
+    // is an argument of `echo` here, so no role starts (central Issue #75).
+    'env echo scripts/codex/run-role.js',
+    'timeout 10 printf \'%s\\n\' scripts/codex/run-role.js'
   ];
   for (const command of backgroundText) {
     const allowed = JSON.stringify({ cwd: fixture, tool_name: 'Bash', tool_input: { command, run_in_background: true } });

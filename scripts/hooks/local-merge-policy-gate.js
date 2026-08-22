@@ -34,7 +34,9 @@ const WRAPPER_VALUE_OPTIONS = {
 
 // Wrapper options whose value is a command line the wrapper runs itself:
 // `env -S 'gh pr merge 12'` splits the string into words and executes them, so
-// the value is parsed as a command instead of skipped as a plain operand.
+// the value is parsed as a command instead of skipped as a plain operand. The
+// wrapper's remaining operands are appended to those words, so `env -Sgh pr
+// merge 12` runs `gh pr merge 12`.
 const SPLIT_STRING_OPTIONS = {
   env: new Set(['-S', '--split-string'])
 };
@@ -102,6 +104,13 @@ const FILE_BODY_OPTIONS = {
   wget: new Set(['--body-file', '--post-file'])
 };
 
+// Options whose value is the request target rather than an operand. Without
+// them `curl --url=https://api.github.com/repos/acme/example/statuses/abc` hides
+// the endpoint inside a `--flag=value` word that the operand scan drops.
+const URL_OPTIONS = {
+  curl: new Set(['--url'])
+};
+
 // Options of the HTTP clients whose value is not the request target. They are
 // consumed so a header or an output path is never read as the endpoint, and so
 // the endpoint operand of `curl -H "$AUTH" "$URL"` stays visible.
@@ -123,6 +132,7 @@ function unionOptions(map) {
 METHOD_OPTIONS[UNRESOLVED_BINARY] = unionOptions(METHOD_OPTIONS);
 BODY_OPTIONS[UNRESOLVED_BINARY] = unionOptions(BODY_OPTIONS);
 FILE_BODY_OPTIONS[UNRESOLVED_BINARY] = unionOptions(FILE_BODY_OPTIONS);
+URL_OPTIONS[UNRESOLVED_BINARY] = unionOptions(URL_OPTIONS);
 
 // `gh` uses Cobra, which accepts flags before the subcommand: `gh pr -R
 // owner/name merge 12` is a merge. Flags that consume the next word must be
@@ -603,10 +613,10 @@ function tokenizeScript(source) {
     const stdin = shellStdinScripts(detail);
     nested.push(...stdin.scripts);
     if (stdin.unresolved || executesDynamicScript(detail)) unresolved = true;
-    for (const script of delegatedScripts) {
-      nested.push(script);
+    for (const delegation of delegatedScripts) {
+      nested.push(delegatedScriptLine(delegation));
       // `env -S "$CMD"` runs a command line this gate cannot read.
-      if (UNRESOLVED_TEXT.test(script)) unresolved = true;
+      if (UNRESOLVED_TEXT.test(delegation.script)) unresolved = true;
     }
     for (const delegated of delegatedCommands(detail.tokens)) {
       commands.push(delegated);
@@ -655,70 +665,97 @@ function binaryName(token) {
 
 /**
  * Resolve the executions a token list can start: the binary left after
- * assignment prefixes and wrapper commands are skipped, plus — when a wrapper is
- * involved — every later operand position.
+ * assignment prefixes and wrapper commands are skipped.
  *
- * Wrapper option arity is only known for the wrappers listed above, so the extra
- * candidates keep an unrecognized `env --unknown VALUE gh pr merge` fail-closed
- * instead of resolving `VALUE` as the binary and allowing the merge.
+ * Only the command position is resolved, never the words after it: `env printf
+ * '%s\n' gh pr merge` prints those words and merges nothing, so reading them as
+ * a second execution would block an ordinary write (central Issue #75).
+ *
+ * Wrapper option arity is only known for the wrappers listed above. An option
+ * that may still consume the following word leaves that word ambiguous, so both
+ * readings are kept and an unrecognized `env --unknown VALUE gh pr merge` stays
+ * fail-closed instead of resolving `VALUE` as the binary and allowing the merge.
  *
  * A command word carrying an expansion or a substitution (`"$GH" pr merge 12`)
  * names an unknown binary, so it resolves to {@link UNRESOLVED_BINARY} and its
  * arguments are still checked.
  *
  * A wrapper option that carries a whole command line is not an operand of the
- * wrapper: `env -S 'gh pr merge 12'` executes its value, so the value is
- * reported through `delegated` and parsed as a script of its own.
+ * wrapper: `env -S 'gh pr merge 12'` executes its value together with the words
+ * that follow it, so both are reported through `delegated` and parsed as a
+ * script of their own.
  *
  * @param {string[]} tokens
- * @param {string[]} [delegated] receives command lines a wrapper option runs
+ * @param {{ script: string, rest: string[] }[]} [delegated] receives command
+ *   lines a wrapper option runs
  * @returns {{ name: string, args: string[] }[]}
  */
 function resolveExecutions(tokens, delegated) {
   const executions = [];
+  const commandName = word => (UNRESOLVED_TEXT.test(word) ? UNRESOLVED_BINARY : binaryName(word));
+  const addExecution = position => {
+    executions.push({ name: commandName(tokens[position]), args: tokens.slice(position + 1) });
+  };
   let index = 0;
-  let wrapped = false;
 
   while (index < tokens.length) {
     if (ASSIGNMENT.test(tokens[index])) {
       index += 1;
       continue;
     }
-    const name = UNRESOLVED_TEXT.test(tokens[index]) ? UNRESOLVED_BINARY : binaryName(tokens[index]);
+    const name = commandName(tokens[index]);
     if (!COMMAND_WRAPPERS.has(name)) {
-      executions.push({ name, args: tokens.slice(index + 1) });
-      if (!wrapped) break;
-      index += 1;
-      continue;
+      addExecution(index);
+      break;
     }
 
-    wrapped = true;
     const values = WRAPPER_VALUE_OPTIONS[name] || NO_OPTIONS;
     const scripts = SPLIT_STRING_OPTIONS[name] || NO_OPTIONS;
+    // Options of unknown arity that may still swallow the following word. Each
+    // one makes the next operand a command candidate as well as a value.
+    let unknownOptions = 0;
     index += 1;
     while (index < tokens.length) {
       const argument = tokens[index];
+      // `--` ends the wrapper's own options; the next word is the command.
+      if (argument === '--') {
+        index += 1;
+        break;
+      }
       if (argument.startsWith('-') && argument !== '-') {
         const separator = argument.indexOf('=');
         const flag = separator === -1 ? argument : argument.slice(0, separator);
         index += 1;
+        // `-S value`, `--split-string=value` and the attached `-Svalue`. The
+        // wrapper runs that command line with its remaining words appended, so
+        // nothing is left for this token list to execute.
         if (scripts.has(flag)) {
-          // `-S value`, `--split-string=value` and the attached `-Svalue`.
-          if (separator !== -1) noteScript(delegated, argument.slice(separator + 1));
-          else if (index < tokens.length) {
-            noteScript(delegated, tokens[index]);
-            index += 1;
-          }
-          continue;
+          if (separator !== -1) noteScript(delegated, argument.slice(separator + 1), tokens.slice(index));
+          else if (index < tokens.length) noteScript(delegated, tokens[index], tokens.slice(index + 1));
+          return executions;
         }
         if (!flag.startsWith('--') && flag.length > 2 && scripts.has(flag.slice(0, 2))) {
-          noteScript(delegated, flag.slice(2));
+          noteScript(delegated, flag.slice(2), tokens.slice(index));
+          return executions;
+        }
+        if (values.has(flag)) {
+          if (separator === -1 && index < tokens.length) index += 1;
           continue;
         }
-        if (values.has(argument) && index < tokens.length) index += 1;
+        // An attached short form such as `-n5` or `-I{}` carries its own value.
+        if (!flag.startsWith('--') && flag.length > 2 && values.has(flag.slice(0, 2))) continue;
+        if (separator === -1) unknownOptions += 1;
         continue;
       }
       if (ASSIGNMENT.test(argument) || WRAPPER_OPERAND.test(argument)) {
+        index += 1;
+        continue;
+      }
+      // This word is the command unless an option of unknown arity takes it as
+      // its value, so it is resolved as a command and the scan goes on.
+      if (unknownOptions > 0) {
+        unknownOptions -= 1;
+        addExecution(index);
         index += 1;
         continue;
       }
@@ -728,8 +765,25 @@ function resolveExecutions(tokens, delegated) {
   return executions;
 }
 
-function noteScript(delegated, script) {
-  if (delegated && script) delegated.push(script);
+function noteScript(delegated, script, rest) {
+  if (delegated && script) delegated.push({ script, rest: rest || [] });
+}
+
+function quoteWord(word) {
+  return `'${String(word).replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * The command line a split-string option really runs. `env` appends its own
+ * remaining operands to the words split out of the option value, so `env -Sgh
+ * pr merge 12 --squash` runs `gh pr merge 12 --squash`. The trailing words are
+ * quoted back on so each stays a single word when the line is parsed again.
+ *
+ * @param {{ script: string, rest: string[] }} delegation
+ * @returns {string}
+ */
+function delegatedScriptLine({ script, rest }) {
+  return rest.length ? `${script} ${rest.map(quoteWord).join(' ')}` : script;
 }
 
 /**
@@ -777,7 +831,8 @@ function runsShellScripts(name) {
  * `eval <words>` both execute their operands, so they are parsed as commands.
  *
  * @param {string[]} tokens
- * @param {string[]} [delegated] receives command lines a wrapper option runs
+ * @param {{ script: string, rest: string[] }[]} [delegated] receives command
+ *   lines a wrapper option runs
  * @returns {string[]}
  */
 function shellScriptArguments(tokens, delegated) {
@@ -960,9 +1015,16 @@ function clientOperands(name, args) {
     ...CLIENT_VALUE_OPTIONS,
     ...(METHOD_OPTIONS[name] || NO_OPTIONS),
     ...(BODY_OPTIONS[name] || NO_OPTIONS),
-    ...(FILE_BODY_OPTIONS[name] || NO_OPTIONS)
+    ...(FILE_BODY_OPTIONS[name] || NO_OPTIONS),
+    ...(URL_OPTIONS[name] || NO_OPTIONS)
   ]);
   return commandOperands(args, valueOptions, false);
+}
+
+// Everything a client call can send the request to: the operands plus the value
+// of an explicit URL option, in both the separate and the attached form.
+function clientTargets(name, args) {
+  return [...clientOperands(name, args), ...optionValues(args, URL_OPTIONS[name] || NO_OPTIONS)];
 }
 
 /**
@@ -1031,7 +1093,7 @@ function ghPublishesSuccessStatus(args) {
 }
 
 function clientPublishesSuccessStatus(name, args) {
-  const reach = statusEndpointReach([clientOperands(name, args)]);
+  const reach = statusEndpointReach([clientTargets(name, args)]);
   if (reach === 'no') return false;
   const bodies = optionValues(args, BODY_OPTIONS[name] || NO_OPTIONS);
   const files = optionValues(args, FILE_BODY_OPTIONS[name] || NO_OPTIONS);
