@@ -44,9 +44,14 @@ For complex tasks requiring deep reasoning:
 1. Ensure extended thinking is enabled
 2. Use structured approach for planning
 3. Use multiple critique rounds for thorough analysis
-4. Use sub-agents for diverse perspectives
+4. Cover diverse perspectives — split-role sub-agents when the agent orchestration steering file
+   (`agents.md`) permits delegation, separate passes in the parent context otherwise
 
 ## Build Troubleshooting
+
+> The delegation step below follows the agent orchestration steering file (`agents.md`): delegate
+> when a delegation tool is available and higher-priority instructions permit it, and otherwise
+> resolve the errors in the parent context.
 
 If build fails:
 1. Use build-error-resolver agent

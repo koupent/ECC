@@ -27,7 +27,7 @@ The installer uses non-destructive copy — it will not overwrite your existing 
 | Agents (JSON) | 33 | `.kiro/agents/*.json` |
 | Agents (MD) | 33 | `.kiro/agents/*.md` |
 | Skills | 43 | `.kiro/skills/*/SKILL.md` |
-| Steering Files | 22 | `.kiro/steering/*.md` |
+| Steering Files | 23 | `.kiro/steering/*.md` |
 | IDE Hooks | 13 | `.kiro/hooks/*.kiro.hook` |
 | Scripts | 2 | `.kiro/scripts/*.sh` |
 | MCP Examples | 1 | `.kiro/settings/mcp.json.example` |
@@ -158,6 +158,7 @@ Steering files provide always-on rules and context that shape how the agent work
 
 | File | Inclusion | Description |
 |------|-----------|-------------|
+| `agents.md` | auto | Agent delegation policy: no runtime spawns an agent on its own, when to delegate, and that higher-priority system/harness/user instructions win. Governs every "use the X agent" step in the other steering files. Loaded in every conversation. |
 | `coding-style.md` | auto | Core coding style rules: immutability, file organization, error handling, and code quality standards. Loaded in every conversation. |
 | `security.md` | auto | Security best practices including mandatory checks, secret management, and security response protocol. Loaded in every conversation. |
 | `testing.md` | auto | Testing requirements: 80% coverage minimum, TDD workflow, and test types (unit, integration, E2E). Loaded in every conversation. |

@@ -1358,7 +1358,8 @@ test('the canonical delegation policy is named as canonical and is subordinate t
     [readRepoFile('CLAUDE.md'), /canonical delegation policy/],
     [readRepoFile('AGENTS.md'), /canonical delegation policy/],
     [readRepoFile('.cursor', 'rules', 'common-agents.md'), /canonical delegation policy/],
-    [readRepoFile('.opencode', 'instructions', 'INSTRUCTIONS.md'), /canonical delegation policy/]
+    [readRepoFile('.opencode', 'instructions', 'INSTRUCTIONS.md'), /canonical delegation policy/],
+    [readRepoFile('.kiro', 'steering', 'agents.md'), /canonical delegation policy/]
   ]) {
     assert.match(file, /rules\/common\/agents\.md/);
     assert.match(file, restatement);
@@ -1396,6 +1397,30 @@ test('rules that name an agent stay conditional on the canonical delegation poli
   for (const rules of [readRepoFile('RULES.md'), readRepoFile('docs', 'ja-JP', 'RULES.md')]) {
     assert.match(rules, /rules\/common\/agents\.md/);
   }
+});
+
+test('the Kiro steering surface ships the delegation policy and keeps its agent steps conditional', () => {
+  // 中央Issue #58: Kiroのsteeringは自動読込されるため、委任ポリシーが無いと同じ衝突が残る。
+  const policy = readRepoFile('.kiro', 'steering', 'agents.md');
+  assert.match(policy, /^---\n[\s\S]*inclusion: auto[\s\S]*?\n---/, '.kiro/steering/agents.md');
+  assert.match(policy, /does not automatically spawn/i);
+  assert.match(policy, /do not call the Agent tool unless the user requested it/);
+
+  for (const file of [
+    ['.kiro', 'steering', 'testing.md'],
+    ['.kiro', 'steering', 'development-workflow.md'],
+    ['.kiro', 'steering', 'security.md'],
+    ['.kiro', 'steering', 'performance.md']
+  ]) {
+    const source = readRepoFile(...file);
+    const label = file.join('/');
+    assert.match(source, /permits? delegation|agent orchestration steering file/, label);
+    assert.doesNotMatch(source, /Use PROACTIVELY/, label);
+  }
+
+  // 配布と自動読込の経路が壊れていないこと。
+  assert.match(readRepoFile('.kiro', 'install.sh'), /SOURCE_KIRO\/steering"\/\*\.md/);
+  assert.match(readRepoFile('.kiro', 'README.md'), /`agents\.md` \| auto \|/);
 });
 
 test('every translated delegation policy carries the same mechanism and precedence', () => {
