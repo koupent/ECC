@@ -347,7 +347,7 @@ function ensureDeliveryWorktree(delivery, branch, options = {}) {
       throw new Error(
         `Branch ${target} is checked out in the shared working tree ${existingPath}. ` +
           'Delivery work always runs in a worktree of its own, and preparation never adopts the shared working tree. ' +
-          `Commit or stash the work that belongs to ${target} first: the new worktree checks out the same branch, so committed work follows it while uncommitted changes stay in the shared tree. ` +
+          `Commit the work that belongs to ${target} first, or set it aside yourself outside this session: the new worktree checks out the same branch, so committed work follows it while uncommitted changes stay in the shared tree. ` +
           `Then switch ${existingPath} to another branch yourself and run this command again.`
       );
     }

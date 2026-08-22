@@ -76,9 +76,13 @@ const GIT_UNTRACEABLE_OPTIONS = new Set(['--git-dir', '--work-tree', '--namespac
 // 今いるbranchを実行中に動かせてしまい、Issue #79が報告した衝突がそのまま戻る。許可する形を
 // 列挙するfail-closeにして、ここにも読み取りの列挙にも無い名前（未知のsubcommandとalias）は
 // 実行directoryを問わず拒否する。
+// `stash` も共有領域への書き込みである。退避先の `refs/stash` はgit common-dirにあって
+// 全worktreeで一つしかなく、worktreeの中で走らせた `git stash drop` や `git stash clear` が
+// 別のworktreeや共有ツリーの退避データを消す。Issueが報告した衝突と同じ「他の作業を
+// 巻き添えにする」経路なので、書き込む形は通さず、`git stash list` だけを読み取りとして残す。
 const GIT_WORKTREE_LOCAL_SUBCOMMANDS = new Set([
   'add', 'am', 'apply', 'checkout', 'cherry-pick', 'clean', 'commit', 'fetch', 'merge', 'mv',
-  'pull', 'push', 'rebase', 'reset', 'restore', 'revert', 'rm', 'stash', 'switch'
+  'pull', 'push', 'rebase', 'reset', 'restore', 'revert', 'rm', 'switch'
 ]);
 // 許可した名前でも、引数次第で共有refへ書く形がある。`-B` と `-C` は既にあるbranchを強制的に
 // 付け替え（`git checkout -B main`）、`<src>:<dst>` のrefspecはremoteが自リポジトリなら
@@ -989,9 +993,10 @@ function run(rawInput, options = {}) {
   // isExactLifecycleCommandが弾く。
   const isLifecycleCommand = toolName === 'Bash' &&
     (isExactLifecycleCommand(command, 'prepare') || isExactLifecycleCommand(command, 'reset'));
-  // 隔離が成立した後のfail-closeでは、script名の一致だけでECCのcommandと認めない。同じ
-  // 名前で置いた任意のscriptを通すと、拒否しているはずの共有ツリーへの書き込みが復旧
-  // commandの顔で通ってしまう。実体がこのplugin自身のscriptである場合だけ復旧と認める。
+  // ただしcommandの形だけでは、そのscriptがECC自身のものだとは言えない。
+  // `scripts/codex/reset.js` はprojectの中にも同じ名前で置けるため、名前の一致で通すと、
+  // Gateが止めているはずの共有ツリーへの書き込みが復旧commandの顔で走ってしまう。
+  // 実体pathがこのplugin自身のscriptと一致する場合だけ、Deliveryの状態を問わず復旧と認める。
   const isLifecycleRecovery = isLifecycleCommand && isWorktreeAwareTool(tokenize(command), cwd, env);
 
   if (state.delivery.status !== 'ready') {
@@ -999,13 +1004,15 @@ function run(rawInput, options = {}) {
     // Plan mode中はClaude自身のread-only制約に任せて調査を許可する。承認後は同じ
     // deferred stateが残るため、最初のBash/Edit/Writeをprepare完了までfail-closeする。
     if (state.delivery.status === 'deferred' && permissionMode === 'plan') return rawInput;
-    // prepare前は隔離すべきworktreeがまだ無い。ここは従来どおりcommandの形だけで通す。
-    if (isLifecycleCommand) return rawInput;
+    // prepare前は隔離すべきworktreeがまだ無いが、共有ツリーは既に守る対象である。
+    // 実体がplugin自身のscriptだと確認できたprepare／resetだけを通す。
+    if (isLifecycleRecovery) return rawInput;
     return deny(
       '[ECC Delivery Gate] Repository tools are blocked until duplicate Issue search, Issue selection/creation, and the issue-linked worktree are recorded. ' +
         'Preparation never switches the shared working tree; it checks the issue-linked branch out in a separate worktree and reports that path. ' +
         `Run node "${prepareScript}" prepare --session "${sessionId}" first, then continue this delivery inside the reported worktree path. ` +
-        `If the recorded Delivery is stale or unrecoverable, explicitly reset it with node "${resetScript}" "${sessionId}".`
+        `If the recorded Delivery is stale or unrecoverable, explicitly reset it with node "${resetScript}" "${sessionId}". ` +
+        "Only those exact script paths are accepted here: a same-named script that is not this plugin's own file is rejected."
     );
   }
 
@@ -1019,8 +1026,9 @@ function run(rawInput, options = {}) {
     return deny(
       `[ECC Delivery Gate] Issue #${state.delivery.issue_number} was prepared before deliveries were isolated, so no worktree is bound to it and work would land in the shared working tree. ` +
         `Run node "${prepareScript}" prepare --session "${sessionId}" to check the recorded branch ${state.delivery.branch} out in its own worktree, then continue there. ` +
-        'Preparation keeps the recorded Issue and branch; if the shared working tree still has that branch checked out, commit or stash that work and switch it to another branch first. ' +
-        `If the recorded Delivery is stale or unrecoverable, explicitly reset it with node "${resetScript}" "${sessionId}".`
+        'Preparation keeps the recorded Issue and branch; if the shared working tree still has that branch checked out, commit that work or set it aside yourself outside this session, then switch it to another branch first. ' +
+        `If the recorded Delivery is stale or unrecoverable, explicitly reset it with node "${resetScript}" "${sessionId}". ` +
+        "Only those exact script paths are accepted here: a same-named script that is not this plugin's own file is rejected."
     );
   }
   if (!workspace) {
@@ -1170,6 +1178,8 @@ function run(rawInput, options = {}) {
           'because refs and configuration are shared with the tree that has another branch checked out: ' +
           '`git update-ref`, `git branch -f`, `git tag`, `git symbolic-ref`, `git remote`, `git notes`, `git worktree`, ' +
           '`git checkout -B`/`git switch -C`, a `<src>:<dst>` refspec (`git push . HEAD:main`) and any subcommand this gate does not know. ' +
+          '`git stash` is rejected there too, in every writing form (`push`, `pop`, `drop`, `clear`): the single shared `refs/stash` ' +
+          'also holds what another worktree put aside, so only `git stash list` is allowed; commit on the delivery branch to set work aside. ' +
           'The same boundary applies when this session already runs inside the worktree: the shared working tree and every sibling worktree stay protected.'
       );
     }

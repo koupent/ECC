@@ -428,7 +428,11 @@ test('required delivery gate blocks edits until issue and branch evidence are re
     JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
     'utf8'
   );
-  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-gate-state') };
+  const fixtureEnv = {
+    ...env,
+    ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-gate-state'),
+    CLAUDE_PLUGIN_ROOT: pluginRoot
+  };
   const input = { session_id: 'delivery-gate', cwd: fixture };
   const delivery = initializeDelivery(input, 'worktree lintの誤検出を修正してください', { cwd: fixture, env: fixtureEnv });
   assert.strictEqual(delivery.status, 'pending');
@@ -477,8 +481,31 @@ test('required delivery gate blocks edits until issue and branch evidence are re
   assert.strictEqual(JSON.parse(deliveryGate.run(bash, { cwd: fixture, env: fixtureEnv })).hookSpecificOutput.permissionDecision, 'deny');
   const prepare = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: 'node "$CLAUDE_PLUGIN_ROOT/scripts/codex/delivery-lifecycle.js" prepare --session test' } });
   assert.strictEqual(deliveryGate.run(prepare, { cwd: fixture, env: fixtureEnv }), prepare);
-  const reset = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: 'node "/plugin/scripts/codex/reset.js" delivery-gate' } });
+  const reset = JSON.stringify({
+    ...input,
+    tool_name: 'Bash',
+    tool_input: { command: `node "${path.join(pluginRoot, 'scripts', 'codex', 'reset.js')}" delivery-gate` }
+  });
   assert.strictEqual(deliveryGate.run(reset, { cwd: fixture, env: fixtureEnv }), reset);
+  // prepare前でも、script名が同じだけのcommandは復旧commandとして通さない。projectの中に
+  // 同じ名前で置いたscriptを通すと、Gateが止めているはずの共有ツリーへの書き込みが
+  // prepare/resetの顔で走る。
+  for (const command of [
+    'node "/plugin/scripts/codex/reset.js" delivery-gate',
+    'node "/plugin/scripts/codex/delivery-lifecycle.js" prepare --session delivery-gate',
+    `node "${path.join(fixture, 'scripts', 'codex', 'reset.js')}" delivery-gate`,
+    `node "${path.join(fixture, 'scripts', 'codex', 'delivery-lifecycle.js')}" prepare --session delivery-gate`,
+    'node scripts/codex/reset.js delivery-gate',
+    `node "${path.join(pluginRoot, 'scripts', 'codex', 'reset.js')}.bak" delivery-gate`,
+    'node "$ECC_UNKNOWN_ROOT/scripts/codex/reset.js" delivery-gate'
+  ]) {
+    const impostor = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command } });
+    assert.strictEqual(
+      JSON.parse(deliveryGate.run(impostor, { cwd: fixture, env: fixtureEnv })).hookSpecificOutput.permissionDecision,
+      'deny',
+      command
+    );
+  }
 
   const branch = 'codex/issue-42-worktree-lint';
   assert.strictEqual(spawnSync('git', ['switch', '-c', branch], { cwd: fixture }).status, 0);
@@ -502,6 +529,16 @@ test('required delivery gate blocks edits until issue and branch evidence are re
     const recovery = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command } });
     assert.strictEqual(deliveryGate.run(recovery, { cwd: fixture, env: fixtureEnv }), recovery, command);
   }
+  // 移行の間も、plugin本体のscriptでない同名commandは復旧として通らない。
+  const migrationImpostor = JSON.stringify({
+    ...input,
+    tool_name: 'Bash',
+    tool_input: { command: `node "${path.join(fixture, 'scripts', 'codex', 'reset.js')}" delivery-gate` }
+  });
+  assert.strictEqual(
+    JSON.parse(deliveryGate.run(migrationImpostor, { cwd: fixture, env: fixtureEnv })).hookSpecificOutput.permissionDecision,
+    'deny'
+  );
   writeState(input, { delivery: { ...delivery, status: 'draft-pr', issue_number: 42, branch } }, fixtureEnv);
   assert.strictEqual(deliveryGate.run(bash, { cwd: fixture, env: fixtureEnv }), bash);
   assert.strictEqual(deliveryGate.run(raw, { cwd: fixture, env: fixtureEnv }), raw);
@@ -1603,7 +1640,6 @@ test('an isolated delivery only allows commands that provably act inside the wor
     'git config --list',
     // 書き込みでも、そのworktreeの作業ツリー・index・現在のbranchに収まる形は通る。
     `git -C "${workspace}" mv src/product.ts src/renamed.ts`,
-    `cd "${workspace}" && git stash`,
     `cd "${workspace}" && git switch -c codex/issue-79-follow-up`,
     // worktreeの中で走るcommandは、gitでなくてもファイルを作ってよい。
     `cd "${workspace}" && npm test`,
@@ -1679,6 +1715,14 @@ test('an isolated delivery only allows commands that provably act inside the wor
     `git -C "${workspace}" notes add -m "note"`,
     `cd "${workspace}" && git worktree remove "${shared}"`,
     `cd "${workspace}" && git gc --prune=now`,
+    // 退避先の `refs/stash` もgit common-dirにあり、全worktreeで一つしかない。worktreeの中で
+    // 走らせても、別のworktreeが退避した内容を消したり取り出したりできる。
+    `cd "${workspace}" && git stash`,
+    `cd "${workspace}" && git stash push -m "wip"`,
+    `git -C "${workspace}" stash pop`,
+    `git -C "${workspace}" stash drop`,
+    `cd "${workspace}" && git stash clear`,
+    `git -C "${workspace}" stash apply`,
     // 許可したsubcommandでも、既にあるbranchを付け替える形と、書き込み先のrefを名指しする
     // refspecは共有refへ届く。
     `git -C "${workspace}" checkout -B main`,
@@ -1879,6 +1923,65 @@ test('an isolated delivery cannot move the branch the shared working tree has ch
   assert.strictEqual(
     spawnSync('git', ['rev-parse', baseBranch], { cwd: fixture, encoding: 'utf8' }).stdout.trim(),
     sharedHead
+  );
+});
+
+test('an isolated delivery cannot destroy stash entries the whole repository shares', () => {
+  const fixture = createGitFixture('delivery-shared-stash-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  assert.strictEqual(spawnSync('git', ['add', '.ecc/config.json'], { cwd: fixture }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'require delivery workflow'], { cwd: fixture }).status, 0);
+  const baseBranch = spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  const branch = 'codex/issue-79-shared-stash';
+  const worktreePath = path.join(temp, 'delivery-shared-stash-worktree');
+  assert.strictEqual(
+    spawnSync('git', ['worktree', 'add', '--quiet', '-b', branch, worktreePath], { cwd: fixture }).status,
+    0
+  );
+  // 共有ツリーで別の作業を退避しておく。`refs/stash` はgit common-dirにあり、この一つを
+  // 全worktreeが共有する。
+  fs.writeFileSync(path.join(fixture, 'src', 'product.ts'), 'export const product = false;\n', 'utf8');
+  assert.strictEqual(spawnSync('git', ['stash', 'push', '-m', 'other tool work'], { cwd: fixture }).status, 0);
+  const stashed = spawnSync('git', ['stash', 'list'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  assert.match(stashed, /other tool work/);
+
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-shared-stash-state') };
+  const input = { session_id: 'delivery-shared-stash', cwd: fixture };
+  writeState(input, {
+    project: projectFingerprint(fixture),
+    delivery: { status: 'ready', issue_number: 79, branch, base_branch: baseBranch, worktree_path: worktreePath }
+  }, fixtureEnv);
+
+  const bash = command => JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command } });
+  // worktreeの中で走る形でも、退避データを書き換えるstashは通さない。
+  for (const command of [
+    `cd "${worktreePath}" && git stash`,
+    `cd "${worktreePath}" && git stash push -m "delivery wip"`,
+    `git -C "${worktreePath}" stash pop`,
+    `git -C "${worktreePath}" stash drop`,
+    `cd "${worktreePath}" && git stash clear`,
+    'git stash clear'
+  ]) {
+    const denied = JSON.parse(deliveryGate.run(bash(command), { cwd: fixture, env: fixtureEnv }));
+    assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny', command);
+  }
+  // 一覧表示は読み取りなので、共有ツリーからでもworktreeからでも通る。
+  for (const command of ['git stash list', `git -C "${worktreePath}" stash list`]) {
+    const allowed = bash(command);
+    assert.strictEqual(deliveryGate.run(allowed, { cwd: fixture, env: fixtureEnv }), allowed, command);
+  }
+  // 拒否している間、他の作業の退避データは一つも失われていない。
+  assert.strictEqual(
+    spawnSync('git', ['stash', 'list'], { cwd: fixture, encoding: 'utf8' }).stdout.trim(),
+    stashed
+  );
+  assert.strictEqual(
+    spawnSync('git', ['stash', 'list'], { cwd: worktreePath, encoding: 'utf8' }).stdout.trim(),
+    stashed
   );
 });
 

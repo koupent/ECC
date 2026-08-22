@@ -17,6 +17,11 @@ manually. The preparer resolves the single pending session for the current
 project. When the Delivery Gate provides an explicit session-bound command, use
 that exact command instead. After it succeeds, retry the blocked edit.
 
+Before preparation the Delivery Gate blocks every repository tool except this
+preparer and `reset.js`, and it accepts them only when the script path resolves to
+this plugin's own file: a script with the same name inside the repository is
+rejected, so it can never run as a recovery command.
+
 The preparer never switches the shared working tree. It checks the issue-linked
 branch out in a worktree of its own and records the absolute path in
 `worktree_path`, reporting the same path on stderr. Continue the normal CLI
@@ -55,8 +60,9 @@ Worktree handling is deliberately fail-closed:
   the Completion Gate, the acceptance audit and every Codex role stop until it has a
   worktree, and only `delivery-lifecycle.js prepare` and `reset.js` stay available.
   Running preparation again moves that same Issue and branch into a worktree without
-  searching GitHub or creating a second Issue. Commit or stash the work first if the
-  shared tree still has that branch checked out; committed work follows the branch
+  searching GitHub or creating a second Issue. If the shared tree still has that branch
+  checked out, put its work away yourself outside this session (the gate allows nothing
+  but those two commands until the migration is done); committed work follows the branch
   into the new worktree, uncommitted changes stay behind.
 
 Once a delivery is bound to its own worktree, every later stage stays bound to it.
@@ -70,7 +76,9 @@ session itself already runs in that path. If the recorded directory is gone, or 
 replaced by a directory that belongs to another repository, they stop and ask you to
 restore it or reset the delivery; none of them falls back to the shared working tree. Recovery stays
 reachable while the gate is closed: the exact `delivery-lifecycle.js prepare` and
-`reset.js` commands are always allowed, and when the worktree is on the wrong branch
+`reset.js` commands are always allowed — but only when the script path resolves to this
+plugin's own file, so a project script with the same name never passes as a recovery
+command — and when the worktree is on the wrong branch
 the branch can be restored there. That recovery is narrow: only a `git switch` or
 `git checkout` whose single argument is the recorded branch
 (`git -C "<worktree_path>" switch <branch>`) and side-effect-free inspection are
@@ -122,9 +130,13 @@ have run in the worktree:
   `git branch -f`/`-D`/`-M`, `git tag`, `git symbolic-ref`, `git remote`, `git notes`,
   `git worktree`, `git gc` and `git config` could move the branch the shared tree has
   checked out while it is running — exactly the collision this isolation exists to
-  prevent. Only writes that stay inside the worktree's own working tree, index and
+  prevent. `git stash` is rejected there for the same reason: the stash is kept in the
+  single shared `refs/stash`, so `git stash drop`, `git stash clear` and even a plain
+  `git stash` reach the entries another worktree put aside. Only `git stash list` stays
+  available as a read; set work aside with a commit on the delivery branch instead.
+  Only writes that stay inside the worktree's own working tree, index and
   current branch pass there (`git add`, `git commit`, `git mv`, `git rm`, `git restore`,
-  `git reset`, `git stash`, `git merge`, `git rebase`, `git cherry-pick`, `git revert`,
+  `git reset`, `git merge`, `git rebase`, `git cherry-pick`, `git revert`,
   `git switch`/`git checkout`, `git fetch`, `git pull`, `git push`), and a subcommand the
   gate does not know — an alias included — is rejected there as well. Two argument forms
   of those allowed subcommands reach shared refs and are rejected too: `git checkout -B`
