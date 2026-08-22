@@ -895,6 +895,9 @@ test('the boundary holds when the session itself already runs inside the deliver
   // 手順書どおり、以後の作業は払い出されたworktreeの中で進む。cwdはworktreeである。
   const input = { session_id: 'delivery-inside-worktree', cwd: worktreePath };
   writeState(input, {
+    // prepareが記録するのと同じ、共有リポジトリのproject識別子。cwdが記録worktreeそのもの
+    // であるときに、記録pathの素性を突き合わせる拠り所になる。
+    project: projectFingerprint(fixture),
     delivery: {
       status: 'ready',
       request_hash: 'inside-worktree-fixture',
@@ -1803,6 +1806,86 @@ test('a delivery whose worktree is gone fails closed instead of falling back to 
   assert.strictEqual(deliveryWorkspace(readState(input, fixtureEnv), fixture), null);
 });
 
+test('a recorded worktree swapped for another repository fails closed, even from inside that path', () => {
+  const fixture = createGitFixture('delivery-worktree-swap-repo');
+  const deliveryConfig = JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } });
+  fs.writeFileSync(path.join(fixture, '.ecc', 'config.json'), deliveryConfig, 'utf8');
+  // 払い出したworktreeにも同じ設定が渡るよう、先にcommitしておく。
+  assert.strictEqual(spawnSync('git', ['add', '.ecc/config.json'], { cwd: fixture }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'require delivery workflow'], { cwd: fixture }).status, 0);
+  const baseBranch = spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  const branch = 'codex/issue-79-worktree-swap';
+  const worktreePath = path.join(temp, 'delivery-worktree-swap-tree');
+  assert.strictEqual(
+    spawnSync('git', ['worktree', 'add', '--quiet', '-b', branch, worktreePath], { cwd: fixture }).status,
+    0
+  );
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-worktree-swap-state') };
+  // 手順書どおり、以後の作業は払い出されたworktreeの中で進む。cwdは記録pathそのものである。
+  const input = { session_id: 'delivery-worktree-swap', cwd: worktreePath };
+  writeState(input, {
+    project: projectFingerprint(fixture),
+    delivery: {
+      status: 'ready',
+      request_hash: 'worktree-swap-fixture',
+      title: 'the recorded worktree must stay this repository',
+      base_branch: baseBranch,
+      issue_number: 79,
+      issue_url: 'https://example.invalid/issues/79',
+      branch,
+      worktree_path: worktreePath,
+      draft_pr_url: null
+    }
+  }, fixtureEnv);
+
+  const edit = JSON.stringify({
+    ...input,
+    tool_name: 'Edit',
+    tool_input: { file_path: path.join(worktreePath, 'src', 'product.ts') }
+  });
+  const ready = readState(input, fixtureEnv);
+  assert.strictEqual(deliveryWorkspace(ready, worktreePath), worktreePath);
+  assert.strictEqual(deliveryWorkspace(ready, fixture), worktreePath);
+  assert.strictEqual(deliveryGate.run(edit, { cwd: worktreePath, env: fixtureEnv }), edit);
+
+  // 記録pathを、同じ設定と同じbranch名を持つ別リポジトリの作業ツリーへ差し替える。
+  // pathも設定も見た目は変わらないので、リポジトリの素性を測り直さない限り区別できない。
+  fs.rmSync(worktreePath, { recursive: true, force: true });
+  fs.mkdirSync(path.join(worktreePath, '.ecc'), { recursive: true });
+  fs.mkdirSync(path.join(worktreePath, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(worktreePath, '.ecc', 'config.json'), deliveryConfig, 'utf8');
+  fs.writeFileSync(path.join(worktreePath, 'src', 'product.ts'), 'export const product = true;\n', 'utf8');
+  assert.strictEqual(spawnSync('git', ['init', '--quiet'], { cwd: worktreePath }).status, 0);
+  assert.strictEqual(spawnSync('git', ['config', 'user.email', 'ecc-test@example.invalid'], { cwd: worktreePath }).status, 0);
+  assert.strictEqual(spawnSync('git', ['config', 'user.name', 'ECC Test'], { cwd: worktreePath }).status, 0);
+  assert.strictEqual(spawnSync('git', ['add', '.'], { cwd: worktreePath }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'foreign repository'], { cwd: worktreePath }).status, 0);
+  assert.strictEqual(spawnSync('git', ['switch', '--quiet', '-c', branch], { cwd: worktreePath }).status, 0);
+
+  // 一度通ったpathでも、判定のたびに現在のリポジトリを測り直す。cwdが記録path自身でも、
+  // 突き合わせる相手はDeliveryが記録したproject識別子であって、cwd自身ではない。
+  const swapped = readState(input, fixtureEnv);
+  assert.strictEqual(deliveryWorkspace(swapped, worktreePath), null);
+  assert.strictEqual(deliveryWorkspace(swapped, fixture), null);
+
+  const denied = JSON.parse(deliveryGate.run(edit, { cwd: worktreePath, env: fixtureEnv }));
+  assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(denied.hookSpecificOutput.permissionDecisionReason, /no longer a working tree of this repository/);
+
+  // Codexレビューも完了Gateも、差し替えられたツリーを証拠として読まない。
+  assert.throws(
+    () => runRole({ role: 'review', request: 'review the delivery', cwd: worktreePath, sessionId: input.session_id, env: fixtureEnv }),
+    /missing or belongs to another repository/
+  );
+  const blocked = JSON.parse(deliveryCompletion.run(JSON.stringify(input), {
+    cwd: worktreePath,
+    env: fixtureEnv,
+    command: () => { throw new Error('completion must not inspect any working tree'); }
+  }));
+  assert.strictEqual(blocked.decision, 'block');
+  assert.match(blocked.reason, /no longer a working tree of this repository/);
+});
+
 test('delivery completion gate rejects a review that is not bound to the current clean commit', () => {
   const fixture = createGitFixture('delivery-completion-repo');
   fs.writeFileSync(
@@ -2521,6 +2604,7 @@ test('Codex roles refuse an explicit cwd that is not the recorded delivery workt
   );
   const session = { session_id: 'run-role-cwd' };
   writeState(session, {
+    project: projectFingerprint(fixture),
     delivery: { status: 'ready', issue_number: 79, branch, base_branch: 'main', worktree_path: worktreePath }
   }, fixtureEnv);
 

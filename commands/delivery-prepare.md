@@ -60,9 +60,12 @@ Once a delivery is bound to its own worktree, every later stage stays bound to i
 The Delivery Gate, the Context Builder, the commit observer, `/ecc:code-review`, the
 Completion Gate and the acceptance audit read that worktree only. Every Codex role
 resolves it from the recorded delivery, so the session itself may keep running in the
-shared working tree without pointing a role at it. If the recorded directory is gone or
-now belongs to another repository, they stop and ask you to restore it or reset the
-delivery; none of them falls back to the shared working tree. Recovery stays
+shared working tree without pointing a role at it. Each of them re-checks, every time,
+that the recorded path is still a working tree of the repository the delivery was
+recorded against; that check is never skipped and never cached, not even when the
+session itself already runs in that path. If the recorded directory is gone, or has been
+replaced by a directory that belongs to another repository, they stop and ask you to
+restore it or reset the delivery; none of them falls back to the shared working tree. Recovery stays
 reachable while the gate is closed: the exact `delivery-lifecycle.js prepare` and
 `reset.js` commands are always allowed, and when the worktree is on the wrong branch
 a command that provably acts inside it (`git -C "<worktree_path>" switch <branch>`)

@@ -124,12 +124,33 @@ function repositoryIdentity(root) {
   }
 }
 
+// stateの照合や事象記録では、同じリポジトリを何度もgitへ問い合わせる必要がないので
+// process内で使い回す。隔離境界の判定にこのキャッシュを使ってはいけない。判定した後で
+// pathの中身が入れ替わっても、キャッシュはそれ以前の答えを返し続ける。
 function projectFingerprint(cwd = process.cwd()) {
   const root = path.resolve(cwd || process.cwd());
   if (!REPOSITORY_IDENTITY_CACHE.has(root)) {
     REPOSITORY_IDENTITY_CACHE.set(root, hash(repositoryIdentity(root) || root));
   }
   return REPOSITORY_IDENTITY_CACHE.get(root);
+}
+
+// 隔離境界では毎回gitへ問い合わせ直す。Git配下でないpathは識別子を持たず、記録済み
+// worktreeとしては認めない。
+function repositoryFingerprint(root) {
+  const identity = repositoryIdentity(root);
+  return identity ? hash(identity) : '';
+}
+
+// 同じdirectoryかどうかは実体で判定する。字面だけで比べると、記録pathへのsymbolic linkを
+// cwdに渡すだけで「別の場所」に見せかけられる。
+function sameDirectory(left, right) {
+  if (left === right) return true;
+  try {
+    return fs.realpathSync(left) === fs.realpathSync(right);
+  } catch {
+    return false;
+  }
 }
 
 // 以前のprojectは「作業ツリーの絶対pathのhash」だった。読み込み側がcommon-dir由来の
@@ -205,6 +226,8 @@ function listProjectSessions(cwd = process.cwd(), env = process.env) {
 // 検証はそのworktreeで行う。記録済みのworktreeが消えている、あるいは別リポジトリを
 // 指しているときはnullを返してfail-closeさせる。ここで共有ツリーへ戻すと、隔離したはずの
 // Deliveryを共有ツリーのbranchとHEADで判定し、Issueが指摘した衝突を再現してしまう。
+// 素性の確認は呼ばれるたびにやり直す。一度通ったpathを覚えておくと、その後で中身が別の
+// リポジトリへ差し替えられても、覚えている答えを返し続けてしまう。
 //
 // worktreeを一度も記録していないDeliveryは、worktree払い出し以前に始まった作業である。
 // これは共有ツリーが作業場所のまま従来どおり扱う。ここでfail-closeさせると、進行中の
@@ -216,13 +239,25 @@ function deliveryWorkspace(state, cwd = process.cwd()) {
   const recorded = state && state.delivery && state.delivery.worktree_path;
   if (!recorded) return fallback;
   const target = path.resolve(recorded);
-  if (target === fallback) return fallback;
   try {
     if (!fs.statSync(target).isDirectory()) return null;
   } catch {
     return null;
   }
-  return projectFingerprint(target) === projectFingerprint(fallback) ? target : null;
+  // 記録pathがcwdと同じでも検証は省けない。手順どおりworktreeの中で作業する通常経路では
+  // 常に一致するので、そこを素通りさせると「そのpathが今もこのリポジトリの作業ツリーか」を
+  // 誰も確かめないまま、Gate、Codexレビュー、完了Gate、受入監査がこの結果を信頼する。
+  const actual = repositoryFingerprint(target);
+  if (!actual) return null;
+  // 期待するリポジトリは、Deliveryを記録したときのproject識別子である。cwdと突き合わせる
+  // だけでは、cwdが記録path自身のときに同じものを二度測って必ず一致してしまう。記録が
+  // あるならそれが基準で、外れたときにcwd側のリポジトリへ逃がさない。
+  const expected = String((state && state.project) || '');
+  if (expected) return actual === expected ? target : null;
+  // project識別子を持たない移行期のstateだけ、cwdが記録pathと別の場所である場合に限って
+  // cwd側のリポジトリを拠り所にする。同じ場所どうしの比較は根拠にならない。
+  if (sameDirectory(target, fallback)) return null;
+  return actual === repositoryFingerprint(fallback) ? target : null;
 }
 
 function redactText(value) {
@@ -317,6 +352,7 @@ module.exports = {
   readState,
   recordIncident,
   redactText,
+  repositoryFingerprint,
   repositoryIdentity,
   resetState,
   resolveSessionId,
