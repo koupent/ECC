@@ -116,6 +116,23 @@ have run in the worktree:
   read-only subcommand also counts as a write as soon as an argument can create a file
   or start another program (`git diff --output=…`, `--ext-diff`, `git grep -O…`), so
   only arguments that are known to be side-effect-free pass in the shared tree.
+- A `git` write that lands in the shared common directory instead of the worktree, even
+  when it provably runs inside the worktree. Refs, remotes, notes and the configuration
+  are shared by the main working tree and every worktree, so `git update-ref`,
+  `git branch -f`/`-D`/`-M`, `git tag`, `git symbolic-ref`, `git remote`, `git notes`,
+  `git worktree`, `git gc` and `git config` could move the branch the shared tree has
+  checked out while it is running — exactly the collision this isolation exists to
+  prevent. Only writes that stay inside the worktree's own working tree, index and
+  current branch pass there (`git add`, `git commit`, `git mv`, `git rm`, `git restore`,
+  `git reset`, `git stash`, `git merge`, `git rebase`, `git cherry-pick`, `git revert`,
+  `git switch`/`git checkout`, `git fetch`, `git pull`, `git push`), and a subcommand the
+  gate does not know — an alias included — is rejected there as well. Two argument forms
+  of those allowed subcommands reach shared refs and are rejected too: `git checkout -B`
+  and `git switch -C` move an existing branch, and in `git push`/`git fetch`/`git pull`
+  any argument containing `:` — a `<src>:<dst>` refspec or a URL remote — is rejected,
+  because a refspec writes the named ref directly when the remote is this repository
+  (`git push . HEAD:main`, `git fetch . main:main`). Push with a named remote
+  (`git push -u origin HEAD`) stays available.
 - A path that stays inside the worktree only on paper: the gate resolves symbolic
   links, so `cd "<worktree_path>" && echo x > link-to-shared/src/product.ts` and an
   `Edit` of the same path are rejected.

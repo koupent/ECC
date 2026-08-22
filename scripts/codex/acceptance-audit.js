@@ -53,13 +53,19 @@ function audit(options = {}, dependencies = {}) {
   const state = entry.state;
   const delivery = state.delivery || {};
   const squashMerged = delivery.status === 'merged';
-  // Deliveryが払い出したworktreeを持つなら、Git側の証拠はそのツリーで確認する。
-  // worktreeが失われているDeliveryは、共有ツリーのcleanなHEADで合格させない。
-  const workspace = deliveryWorkspace(state, cwd);
+  // Git側の証拠は、Deliveryが払い出したworktreeでしか確認しない。worktree_pathを記録して
+  // いないDeliveryは、statusがdraft-prでもmergedでも共有ツリーで監査してはいけない。
+  // deliveryWorkspaceは進行中でないDeliveryにcwdを返すので、そのまま使うと隔離しないまま
+  // 進んだDeliveryが、たまたまcleanでbranchの合う共有ツリーの状態でPASSしてしまう。
+  // 記録が無い時点でGitを実行せず、証拠が無いものとしてFAILさせる。
+  const recorded = String(delivery.worktree_path || '');
+  const workspace = recorded ? deliveryWorkspace(state, cwd) : null;
   const unavailable = {
     ok: false,
     stdout: '',
-    stderr: `recorded delivery worktree ${delivery.worktree_path || '<none>'} is unavailable`
+    stderr: recorded
+      ? `recorded delivery worktree ${recorded} is unavailable`
+      : 'delivery recorded no worktree path'
   };
   const gitStatus = workspace ? execute('git', ['status', '--porcelain'], workspace, env) : unavailable;
   const branch = workspace ? execute('git', ['branch', '--show-current'], workspace, env) : unavailable;
@@ -92,6 +98,8 @@ function audit(options = {}, dependencies = {}) {
     check('delivery-pr-url', squashMerged ? Boolean(delivery.merged_pr_url) : Boolean(delivery.draft_pr_url),
       squashMerged ? 'non-empty merged PR URL' : 'non-empty Draft PR URL',
       squashMerged ? delivery.merged_pr_url : delivery.draft_pr_url),
+    check('delivery-worktree', Boolean(workspace), 'delivery worktree of this repository',
+      workspace || recorded || '<none>'),
     check('worktree-clean', gitStatus.ok && !gitStatus.stdout, 'clean', gitStatus.ok ? gitStatus.stdout || 'clean' : gitStatus.stderr),
     check('issue-branch', branch.ok && branch.stdout === delivery.branch, delivery.branch, branch.ok ? branch.stdout : branch.stderr),
     check('commit-bound-review', head.ok && state.review_status === 'ok' &&

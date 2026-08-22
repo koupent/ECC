@@ -15,6 +15,9 @@ node "$CLAUDE_PLUGIN_ROOT/scripts/codex/acceptance-audit.js" $ARGUMENTS
 Git evidence is read from the worktree recorded for the delivery, not from the
 shared working tree. When that worktree is gone or now belongs to another
 repository, the Git checks fail instead of auditing whatever the shared tree holds.
+A delivery that records no `worktree_path` at all fails the same way, whatever its
+status is: the audit runs no Git command and reports `delivery-worktree` as failed,
+so a delivery that stayed in the shared tree can never pass on that tree's state.
 
 Report the JSON result without changing product files, harness files, Git state,
 GitHub state, or ECC external state. Do not reinterpret a failed check as a pass.

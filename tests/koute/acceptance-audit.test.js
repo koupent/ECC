@@ -2,8 +2,20 @@
 'use strict';
 
 const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const { spawnSync } = require('child_process');
 const { audit, parseArgs } = require('../../scripts/codex/acceptance-audit');
+const { projectFingerprint } = require('../../scripts/codex/runtime-state');
+
+// 監査はDeliveryが記録したworktreeでしかGitを読まない。fixtureにも実在するリポジトリの
+// 作業ツリーを持たせる。process.cwd を記録pathにすると、testの起動場所によって同じstateの
+// 結果が変わってしまう。
+const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-audit-test-'));
+const worktree = path.join(temp, 'delivery-worktree');
+fs.mkdirSync(worktree, { recursive: true });
+assert.strictEqual(spawnSync('git', ['init', '--quiet'], { cwd: worktree }).status, 0);
 
 let passed = 0;
 let failed = 0;
@@ -42,7 +54,7 @@ function validEntry() {
     file: '/state/session.json',
     state: {
       session_id: 'session',
-      project: 'project',
+      project: projectFingerprint(worktree),
       context_status: 'ready',
       codex_calls: 2,
       codex_failures: 0,
@@ -59,6 +71,7 @@ function validEntry() {
         issue_number: 11,
         branch: 'codex/issue-11-lock',
         base_branch: 'main',
+        worktree_path: worktree,
         draft_pr_url: 'https://example.invalid/pull/24',
         completed_at: '2026-08-18T00:00:00.000Z'
       }
@@ -162,11 +175,36 @@ test('fails closed when the recorded delivery worktree is gone instead of auditi
   };
   const report = audit({ cwd: path.resolve('.'), issueNumber: 11 }, { entry, command: tracking });
   assert.strictEqual(report.status, 'FAIL');
-  for (const id of ['worktree-clean', 'issue-branch', 'commit-bound-review']) {
+  for (const id of ['delivery-worktree', 'worktree-clean', 'issue-branch', 'commit-bound-review']) {
     assert.strictEqual(report.checks.find(item => item.id === id).pass, false, id);
   }
   // 共有ツリーのGit状態は証拠として読まない。
   assert.ok(executed.every(command => !command.startsWith('git ')), executed.join(' | '));
+});
+
+test('fails closed when the delivery recorded no worktree at all, whatever its status is', () => {
+  for (const status of ['draft-pr', 'merged']) {
+    const entry = validEntry();
+    entry.state.delivery = {
+      ...entry.state.delivery,
+      status,
+      merged_pr_url: 'https://example.invalid/pull/24',
+      merged_head: 'abc123'
+    };
+    delete entry.state.delivery.worktree_path;
+    const executed = [];
+    const tracking = (binary, args, cwd) => {
+      executed.push(`${binary} ${args.join(' ')} @${cwd}`);
+      return executor(binary, args);
+    };
+    const report = audit({ cwd: path.resolve('.'), issueNumber: 11 }, { entry, command: tracking });
+    assert.strictEqual(report.status, 'FAIL', status);
+    for (const id of ['delivery-worktree', 'worktree-clean', 'issue-branch', 'commit-bound-review']) {
+      assert.strictEqual(report.checks.find(item => item.id === id).pass, false, `${status}/${id}`);
+    }
+    // 共有ツリーのGit状態は、監査の証拠として一度も読まない。
+    assert.ok(executed.every(command => !command.startsWith('git ')), `${status}: ${executed.join(' | ')}`);
+  }
 });
 
 test('parses the explicit issue argument', () => {

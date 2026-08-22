@@ -1601,9 +1601,10 @@ test('an isolated delivery only allows commands that provably act inside the wor
     'git stash list',
     // 設定は読み取る形だけ残す。
     'git config --list',
-    // 書き込みでも、worktreeを指していれば通る。
+    // 書き込みでも、そのworktreeの作業ツリー・index・現在のbranchに収まる形は通る。
     `git -C "${workspace}" mv src/product.ts src/renamed.ts`,
-    `git -C "${workspace}" branch -D codex/old`,
+    `cd "${workspace}" && git stash`,
+    `cd "${workspace}" && git switch -c codex/issue-79-follow-up`,
     // worktreeの中で走るcommandは、gitでなくてもファイルを作ってよい。
     `cd "${workspace}" && npm test`,
     `cd "${workspace}" && npm test > report.log`,
@@ -1665,6 +1666,29 @@ test('an isolated delivery only allows commands that provably act inside the wor
     'git submodule update --init',
     'git notes add -m "note"',
     'git worktree remove ../other',
+    // refと設定はgit common-dirにあり、worktreeごとに分かれていない。worktreeの中で
+    // 走らせても共有ツリーが今いるbranchを動かせるため、実行位置では正当化できない。
+    `git -C "${workspace}" update-ref refs/heads/main HEAD`,
+    `cd "${workspace}" && git update-ref refs/heads/main HEAD`,
+    `git -C "${workspace}" branch -f main HEAD`,
+    `git -C "${workspace}" branch -D codex/old`,
+    `cd "${workspace}" && git branch -M main`,
+    `git -C "${workspace}" tag -f v1.0.0 HEAD`,
+    `cd "${workspace}" && git symbolic-ref HEAD refs/heads/main`,
+    `git -C "${workspace}" remote add origin https://example.invalid/repo.git`,
+    `git -C "${workspace}" notes add -m "note"`,
+    `cd "${workspace}" && git worktree remove "${shared}"`,
+    `cd "${workspace}" && git gc --prune=now`,
+    // 許可したsubcommandでも、既にあるbranchを付け替える形と、書き込み先のrefを名指しする
+    // refspecは共有refへ届く。
+    `git -C "${workspace}" checkout -B main`,
+    `cd "${workspace}" && git switch -C main`,
+    `git -C "${workspace}" push . HEAD:refs/heads/main`,
+    `cd "${workspace}" && git push . HEAD:main`,
+    `git -C "${workspace}" fetch . main:main`,
+    `cd "${workspace}" && git pull . main:main`,
+    // aliasで別名を付けた操作も、Gateからは何をするか読めない。
+    `git -C "${workspace}" sync`,
     // cdの効果が次のcommandに届くのは `&&` のときだけ。cdが失敗しても、あるいは
     // 成否に関わらず先へ進む形は、共有ツリーで走りうる。
     `cd "${workspace}/missing" || git reset --hard`,
@@ -1808,6 +1832,54 @@ test('an isolated delivery only allows commands that provably act inside the wor
   ]) {
     assert.strictEqual(deliveryGate.targetsWorkspace(command, workspace, shared, { env: gateEnv }), false, command);
   }
+});
+
+test('an isolated delivery cannot move the branch the shared working tree has checked out', () => {
+  const fixture = createGitFixture('delivery-shared-ref-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  assert.strictEqual(spawnSync('git', ['add', '.ecc/config.json'], { cwd: fixture }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'require delivery workflow'], { cwd: fixture }).status, 0);
+  const baseBranch = spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  const branch = 'codex/issue-79-shared-ref';
+  const worktreePath = path.join(temp, 'delivery-shared-ref-worktree');
+  assert.strictEqual(
+    spawnSync('git', ['worktree', 'add', '--quiet', '-b', branch, worktreePath], { cwd: fixture }).status,
+    0
+  );
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-shared-ref-state') };
+  const input = { session_id: 'delivery-shared-ref', cwd: fixture };
+  writeState(input, {
+    project: projectFingerprint(fixture),
+    delivery: { status: 'ready', issue_number: 79, branch, base_branch: baseBranch, worktree_path: worktreePath }
+  }, fixtureEnv);
+
+  const bash = command => JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command } });
+  const sharedHead = spawnSync('git', ['rev-parse', baseBranch], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  // refはgit common-dirにあり、worktreeごとに分かれていない。worktreeの中で走る形でも、
+  // 共有ツリーがcheckoutしているbranchを動かすcommandは通さない。
+  for (const command of [
+    `git -C "${worktreePath}" update-ref refs/heads/${baseBranch} ${branch}`,
+    `cd "${worktreePath}" && git branch -f ${baseBranch} ${branch}`,
+    `git -C "${worktreePath}" checkout -B ${baseBranch}`,
+    `cd "${worktreePath}" && git push . HEAD:refs/heads/${baseBranch}`,
+    `git -C "${worktreePath}" tag -f release ${branch}`,
+    `git -C "${worktreePath}" symbolic-ref HEAD refs/heads/${baseBranch}`
+  ]) {
+    const denied = JSON.parse(deliveryGate.run(bash(command), { cwd: fixture, env: fixtureEnv }));
+    assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny', command);
+  }
+  // worktreeの中で完結する書き込みは、これまでどおり通る。
+  const allowed = bash(`git -C "${worktreePath}" commit -am "fix in the worktree"`);
+  assert.strictEqual(deliveryGate.run(allowed, { cwd: fixture, env: fixtureEnv }), allowed);
+  // 拒否している間、共有ツリーのbranchは一度も動いていない。
+  assert.strictEqual(
+    spawnSync('git', ['rev-parse', baseBranch], { cwd: fixture, encoding: 'utf8' }).stdout.trim(),
+    sharedHead
+  );
 });
 
 test('a delivery whose worktree is gone fails closed instead of falling back to the shared tree', () => {

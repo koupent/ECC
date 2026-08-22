@@ -69,10 +69,23 @@ const GIT_READ_SAFE_SHORT = /^-(?:\d+|[abcdefhilmnpqrstuvwxz]|[CEFGLMPSUW])\S*$/
 // gitの作業ツリーやgit dirを実行directoryから引き剥がすglobal option。どのツリーを
 // 書き換えるかコマンド文字列からは追えない。
 const GIT_UNTRACEABLE_OPTIONS = new Set(['--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env']);
-// 設定を書き換えるsubcommand。書き込み先はworktreeではなくリポジトリ共通の設定であり、
-// `alias.x=!<command>` や `include.path` を残せば、以降のgitが共有ツリーへ届くcommandを
-// 起動する。worktreeの中で走っても隔離の外に効くため、実行directoryでは正当化できない。
-const GIT_UNCONFINABLE_SUBCOMMANDS = new Set(['config']);
+// 書き込み先が、走らせたworktreeの作業ツリー・index・そのworktreeが今いるbranchに収まる
+// subcommand。refも設定もgit common-dirにあり、主作業ツリーと全worktreeで共有されるため、
+// 実行directoryをworktreeに限っても守れない書き込みがある（`git update-ref refs/heads/main`、
+// `git branch -f main`、`git tag -f`、`git notes`、`git remote`、`git config`）。共有ツリーが
+// 今いるbranchを実行中に動かせてしまい、Issue #79が報告した衝突がそのまま戻る。許可する形を
+// 列挙するfail-closeにして、ここにも読み取りの列挙にも無い名前（未知のsubcommandとalias）は
+// 実行directoryを問わず拒否する。
+const GIT_WORKTREE_LOCAL_SUBCOMMANDS = new Set([
+  'add', 'am', 'apply', 'checkout', 'cherry-pick', 'clean', 'commit', 'fetch', 'merge', 'mv',
+  'pull', 'push', 'rebase', 'reset', 'restore', 'revert', 'rm', 'stash', 'switch'
+]);
+// 許可した名前でも、引数次第で共有refへ書く形がある。`-B` と `-C` は既にあるbranchを強制的に
+// 付け替え（`git checkout -B main`）、`<src>:<dst>` のrefspecはremoteが自リポジトリなら
+// refs/heads/<dst> をそのまま書き換える（`git push . HEAD:main`）。remoteが何を指すかは
+// command文字列からは読めないので、refspecの形をまとめて拒否する。
+const GIT_FORCE_CREATE_SUBCOMMANDS = new Set(['checkout', 'switch']);
+const GIT_REFSPEC_SUBCOMMANDS = new Set(['fetch', 'pull', 'push']);
 // 別のcommandを間接的に起動できるcommand。実際に走るcommandも、その実行directoryも
 // コマンド文字列からは追跡できない。
 const COMMAND_WRAPPERS = new Set([
@@ -680,6 +693,25 @@ function isReadOnlyGitArgument(argument) {
   return GIT_READ_SAFE_SHORT.test(value);
 }
 
+// 実行directoryがworktreeの中でも通してはいけない書き込みか。gitのref領域と設定は
+// common-dirで共有されるため、worktreeの中から走らせても共有ツリーと兄弟worktreeに届く。
+function writesSharedGitState(subcommand, args) {
+  const name = String(subcommand || '');
+  // 読み取りsubcommandは、引数次第でファイルを作り外部programを起動することはあっても
+  // （`git diff --output=…`）、refや設定は書き換えない。その書き込み先は実行directoryと
+  // 引数の境界検査が守るので、ここでは共有領域への書き込みとして扱わない。
+  if (!GIT_WORKTREE_LOCAL_SUBCOMMANDS.has(name) && !GIT_READ_SUBCOMMANDS.has(name)) return true;
+  const values = args.map(argument => String(argument || ''));
+  if (
+    GIT_FORCE_CREATE_SUBCOMMANDS.has(name) &&
+    values.some(value => /^-[BC]/.test(value) || value.split('=')[0] === '--force-create')
+  ) return true;
+  // optionではない語の `:` は、書き込み先のrefを名指しするrefspecか、remoteをURLで直に
+  // 指す形である。どちらもremoteが自リポジトリかどうかをcommand文字列からは決められない。
+  return GIT_REFSPEC_SUBCOMMANDS.has(name) &&
+    values.some(value => !value.startsWith('-') && value.includes(':'));
+}
+
 function isReadOnlyGit(subcommand, args) {
   if (!subcommand) return false;
   if (GIT_READ_SUBCOMMANDS.has(subcommand)) return args.every(isReadOnlyGitArgument);
@@ -738,10 +770,12 @@ function gitInvocation(args, cwd) {
   const subcommand = args[index];
   const rest = args.slice(index + 1);
   if (!untraceable && isReadOnlyGit(subcommand, rest)) return { write: false, location, subcommand, args: rest };
-  // 設定への書き込みは、worktreeの中で走ってもリポジトリ共通の設定に残り、後から
-  // `alias.x=!<command>` や `include.path` として共有ツリーへ届くcommandを呼び出せる。
-  // 書き込んだ値が何をするかはこのGateでは読めないので、実行directoryを問わず拒否する。
-  if (GIT_UNCONFINABLE_SUBCOMMANDS.has(subcommand)) return { write: true, location: null, subcommand, args: rest };
+  // common-dirの共有領域への書き込みは、worktreeの中で走っても隔離の外に効く。refを直接
+  // 動かす形（`git update-ref`、`git branch -f`、`git tag -f`）は共有ツリーのHEADが指す
+  // branchを実行中に付け替え、設定への書き込みは `alias.x=!<command>` や `include.path` と
+  // して残り、後のgitに共有ツリーへ届くcommandを起動させる。実行directoryでは正当化
+  // できないので、locationを持たせずに拒否させる。
+  if (writesSharedGitState(subcommand, rest)) return { write: true, location: null, subcommand, args: rest };
   // subcommandより前の引数に展開が残っていると、どのツリーを書き換えるか決まらない。
   // subcommand以降はcommit messageなどが入るため、実行directoryの判定には使わない。
   if (args.slice(0, index + 1).some(arg => /[$`]/.test(arg))) {
@@ -1132,6 +1166,10 @@ function run(rawInput, options = {}) {
           'any `-c <key>=<value>`/`--config-env` override and `git config` itself (an alias or `include.path` can point Git back at the shared tree), ' +
           'a `cd` that is not chained with `&&`, ' +
           'and quoting the gate cannot parse (an unclosed quote or a trailing backslash). ' +
+          'Every Git write that lands in the shared common directory instead of this worktree is rejected as well, even from inside it, ' +
+          'because refs and configuration are shared with the tree that has another branch checked out: ' +
+          '`git update-ref`, `git branch -f`, `git tag`, `git symbolic-ref`, `git remote`, `git notes`, `git worktree`, ' +
+          '`git checkout -B`/`git switch -C`, a `<src>:<dst>` refspec (`git push . HEAD:main`) and any subcommand this gate does not know. ' +
           'The same boundary applies when this session already runs inside the worktree: the shared working tree and every sibling worktree stay protected.'
       );
     }
