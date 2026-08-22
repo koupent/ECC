@@ -225,7 +225,7 @@ function run(rawInput, options = {}) {
   const prs = execute('gh', [
     'pr', 'list', '--head', branch,
     '--state', config.deliveryCompletion === 'squash-merge' ? 'all' : 'open',
-    '--json', 'url,isDraft,number,body,baseRefName,headRefOid,state'
+    '--json', 'url,isDraft,number,title,body,baseRefName,headRefOid,state'
   ], cwd, env);
   if (!prs.ok) {
     recordIncident({ type: 'delivery_pr_lookup_failure', severity: 'minor', message: prs.stderr || 'gh pr list failed' }, { cwd, env });
@@ -253,6 +253,12 @@ function run(rawInput, options = {}) {
   }
   if (candidate.baseRefName !== delivery.base_branch) {
     return block(`Draft PR #${candidate.number} targets ${candidate.baseRefName || '<unknown>'}, but this delivery is based on ${delivery.base_branch}. Recreate or retarget the Draft PR without bypassing the gate.`);
+  }
+  if (config.deliveryNaming === 'meaningful') {
+    const expectedTitle = `Issue #${delivery.issue_number} - ${delivery.issue_title || delivery.title}`;
+    if (candidate.title !== expectedTitle) {
+      return block(`Draft PR #${candidate.number} title must be \`${expectedTitle}\` so the Delivery is traceable.`);
+    }
   }
   const issueLink = new RegExp(`(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\s+#${delivery.issue_number}\\b`, 'i');
   if (!issueLink.test(String(candidate.body || ''))) {
