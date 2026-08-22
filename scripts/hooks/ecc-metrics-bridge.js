@@ -18,7 +18,7 @@ const { getClaudeDir } = require('../lib/utils');
 
 const MAX_STDIN = 1024 * 1024;
 const MAX_FILES_TRACKED = 200;
-const RECENT_TOOLS_SIZE = 5;
+const RECENT_TOOLS_SIZE = 8;
 const HASH_INPUT_LIMIT = 2048;
 const WARNING_CACHE_PREFIX = 'ecc-metrics-cost-warnings-';
 
@@ -75,6 +75,22 @@ function hashToolCall(toolName, toolInput) {
     key = stableStringify(toolInput || {}).slice(0, HASH_INPUT_LIMIT);
   }
   return crypto.createHash('sha256').update(`${name}:${key}`).digest('hex').slice(0, 8);
+}
+
+function hashToolOutcome(input) {
+  const result = input && (input.tool_response || input.tool_result || input.tool_output || null);
+  return crypto.createHash('sha256').update(stableStringify(result)).digest('hex').slice(0, 12);
+}
+
+function madeProgress(toolName, toolInput, input) {
+  if (/^(Write|Edit|MultiEdit|NotebookEdit)$/.test(String(toolName || ''))) return true;
+  if (String(toolName || '') !== 'Bash') return false;
+  if (!/\bgit\s+(?:commit|switch|checkout|merge|rebase|reset)\b/i.test(String(toolInput && toolInput.command || ''))) return false;
+  const response = input && (input.tool_response || input.tool_result || {});
+  const code = response && typeof response === 'object'
+    ? [response.exit_code, response.exitCode, response.status, response.code].find(value => typeof value === 'number')
+    : null;
+  return code === null || code === undefined || code === 0;
 }
 
 /**
@@ -249,9 +265,16 @@ function run(rawInput) {
       bridge.files_modified_count = existing.size;
     }
 
-    // Ring buffer for loop detection
+    if (madeProgress(toolName, toolInput, input)) bridge.progress_counter = Number(bridge.progress_counter || 0) + 1;
+
+    // Ring buffer for loop detection. Raw tool results are never persisted.
     const recent = bridge.recent_tools || [];
-    recent.push({ tool: toolName, hash: hashToolCall(toolName, toolInput) });
+    recent.push({
+      tool: toolName,
+      hash: hashToolCall(toolName, toolInput),
+      outcome: hashToolOutcome(input),
+      progress: Number(bridge.progress_counter || 0)
+    });
     if (recent.length > RECENT_TOOLS_SIZE) recent.shift();
     bridge.recent_tools = recent;
 
@@ -281,4 +304,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { run, hashToolCall, extractFilePaths, readSessionCost, stableStringify };
+module.exports = { run, hashToolCall, hashToolOutcome, madeProgress, extractFilePaths, readSessionCost, stableStringify };
