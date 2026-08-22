@@ -2,9 +2,10 @@
 'use strict';
 
 const { spawnSync } = require('child_process');
+const fs = require('fs');
 const path = require('path');
 const { loadConfig } = require('../codex/config');
-const { isSafeGitRef } = require('../codex/delivery-lifecycle');
+const { isSafeGitRef, worktreeIdentity } = require('../codex/delivery-lifecycle');
 const { readState, recordIncident, resolveSessionId, writeState } = require('../codex/runtime-state');
 
 function deny(reason) {
@@ -24,6 +25,92 @@ function gitValue(cwd, env, args) {
 
 function branchAt(cwd, env) {
   return gitValue(cwd, env, ['branch', '--show-current']);
+}
+
+function canonicalMutationPath(value) {
+  const original = path.resolve(value);
+  let existing = original;
+  const missing = [];
+  while (!fs.existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) return original;
+    missing.unshift(path.basename(existing));
+    existing = parent;
+  }
+  try {
+    return path.join(fs.realpathSync.native(existing), ...missing);
+  } catch {
+    return original;
+  }
+}
+
+function shellWords(command) {
+  const words = [];
+  let value = '';
+  let quote = null;
+  let escaped = false;
+  const push = () => {
+    if (value) words.push(value);
+    value = '';
+  };
+  for (const character of String(command || '')) {
+    if (escaped) {
+      value += character;
+      escaped = false;
+    } else if (character === '\\' && quote !== "'") {
+      escaped = true;
+    } else if (quote) {
+      if (character === quote) quote = null;
+      else value += character;
+    } else if (character === '"' || character === "'") {
+      quote = character;
+    } else if (/\s|[;&|<>()[\]{}]/.test(character)) {
+      push();
+    } else {
+      value += character;
+    }
+  }
+  push();
+  return words;
+}
+
+function registeredWorktreeRoots(cwd, env) {
+  const output = gitValue(cwd, env, ['worktree', 'list', '--porcelain', '-z']);
+  return String(output || '').split('\0')
+    .filter(line => line.startsWith('worktree '))
+    .map(line => canonicalMutationPath(line.slice('worktree '.length)));
+}
+
+function bashEscapesRecordedWorktree(command, delivery, cwd, env) {
+  const recordedRoot = canonicalMutationPath(delivery.worktree || cwd);
+  const comparable = value => process.platform === 'win32'
+    ? value.replace(/\\/g, '/').toLowerCase()
+    : value;
+  const normalizedCommand = comparable(String(command || ''));
+  for (const root of registeredWorktreeRoots(cwd, env)) {
+    if (path.relative(recordedRoot, root) === '') continue;
+    if (normalizedCommand.includes(comparable(root))) return true;
+  }
+
+  const words = shellWords(command);
+  for (let index = 0; index < words.length; index += 1) {
+    const word = words[index];
+    if (/^--(?:work-tree|git-dir)(?:=|$)/.test(word)) return true;
+    if (word === '-C' && index > 0 && words[index - 1] === 'git') return true;
+    if (word === 'cd' || word === 'pushd') {
+      const destination = words[index + 1];
+      if (!destination || /[$`]/.test(destination)) return true;
+      const resolved = canonicalMutationPath(path.resolve(cwd, destination));
+      const relative = path.relative(recordedRoot, resolved);
+      if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return true;
+    }
+    if (word === '..' || word.startsWith(`..${path.sep}`) || word.startsWith('../')) {
+      const resolved = canonicalMutationPath(path.resolve(cwd, word));
+      const relative = path.relative(recordedRoot, resolved);
+      if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return true;
+    }
+  }
+  return false;
 }
 
 function hasExecutableShellControl(command) {
@@ -92,27 +179,62 @@ function run(rawInput, options = {}) {
   const env = options.env || process.env;
   const cwd = options.cwd || input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const config = loadConfig(cwd, env);
-  if (config.deliveryWorkflow !== 'required') return rawInput;
-
   const state = readState(input, env);
   if (!state.delivery) return rawInput;
+  const workflowMode = state.delivery.workflow_mode || config.deliveryWorkflow;
+  const worktreeMode = state.delivery.delivery_worktree || config.deliveryWorktree;
+  if (workflowMode !== 'required') return rawInput;
+  const toolName = String(input.tool_name || '');
+  const command = String(input.tool_input && input.tool_input.command || '');
+  // Worktree削除済みなどの旧stateでも、明示resetだけは復旧経路として常に許可する。
+  if (toolName === 'Bash' && isExactLifecycleCommand(command, 'reset')) return rawInput;
+  if (
+    worktreeMode === 'required' &&
+    toolName === 'ExitWorktree' &&
+    String(input.tool_input && input.tool_input.action || '').toLowerCase() === 'remove' &&
+    !['draft-pr', 'merged'].includes(state.delivery.status)
+  ) {
+    return deny(
+      '[ECC Delivery Gate] The active required Delivery worktree cannot be removed. ' +
+      'Exit with action keep until the Delivery reaches its configured completion state.'
+    );
+  }
+  const recordedWorktreePath = String(state.delivery.worktree || '');
+  const requestedWorktreePath = String(input.tool_input && input.tool_input.path || '');
+  const targetsRecordedPath = Boolean(recordedWorktreePath && requestedWorktreePath) &&
+    path.resolve(requestedWorktreePath) === path.resolve(recordedWorktreePath);
+  const targetsRecordedName = !recordedWorktreePath &&
+    Boolean(state.delivery.worktree_name) &&
+    String(input.tool_input && input.tool_input.name || '') === String(state.delivery.worktree_name);
+  const targetsRecordedWorktree = toolName === 'EnterWorktree' &&
+    (targetsRecordedPath || targetsRecordedName);
   if (state.delivery.status === 'draft-pr' || state.delivery.status === 'merged') return rawInput;
   if (state.delivery.status !== 'ready') {
-    const toolName = String(input.tool_name || '');
-    const command = String(input.tool_input && input.tool_input.command || '');
     const permissionMode = String(input.permission_mode || input.permissionMode || '').toLowerCase();
     // Plan mode中はClaude自身のread-only制約に任せて調査を許可する。承認後は同じ
     // deferred stateが残るため、最初のBash/Edit/Writeをprepare完了までfail-closeする。
     if (state.delivery.status === 'deferred' && permissionMode === 'plan') return rawInput;
     const isPrepareCommand = toolName === 'Bash' && isExactLifecycleCommand(command, 'prepare');
     const isResetCommand = toolName === 'Bash' && isExactLifecycleCommand(command, 'reset');
+    const isBootstrapRead = ['Read', 'Glob', 'Grep'].includes(toolName);
+    const isRecordedWorktreeEntry = state.delivery.status === 'awaiting-worktree' && targetsRecordedWorktree;
     // prepareが自動切替をやめた分、記録したbranchへの切替だけはエージェントに許可する。
     // ここを拒否すると、awaiting-branchのDeliveryはreadyへ進めないまま手詰まりになる。
     const isRecordedBranchSwitch = toolName === 'Bash' && isExactBranchSwitchCommand(command, state.delivery);
-    if (isPrepareCommand || isResetCommand || isRecordedBranchSwitch) return rawInput;
+    if (isPrepareCommand || isResetCommand || isRecordedBranchSwitch || isRecordedWorktreeEntry || isBootstrapRead) return rawInput;
     const sessionId = resolveSessionId(input, env);
     const prepareScript = path.resolve(__dirname, '../codex/delivery-lifecycle.js');
     const resetScript = path.resolve(__dirname, '../codex/reset.js');
+    if (state.delivery.status === 'awaiting-worktree') {
+      const entry = state.delivery.worktree
+        ? `path \`${state.delivery.worktree}\``
+        : `name \`${state.delivery.worktree_name}\``;
+      return deny(
+        `[ECC Delivery Gate] Issue #${state.delivery.issue_number} is recorded, but implementation must run in an isolated Claude Code worktree. ` +
+        `Call EnterWorktree with ${entry}, then run node "${prepareScript}" prepare --session "${sessionId}" again. ` +
+        'Do not emulate this with a custom git worktree command.'
+      );
+    }
     if (state.delivery.status === 'awaiting-branch' && state.delivery.branch_switch) {
       const actualBranch = branchAt(cwd, env);
       return deny(
@@ -129,6 +251,34 @@ function run(rawInput, options = {}) {
         'Preparation records that branch without switching to it; if the current branch differs, it will ask you to run one exact switch command yourself. ' +
         `Run node "${prepareScript}" prepare --session "${sessionId}" first, then retry the tool call. ` +
         `If the recorded Delivery is stale or unrecoverable, explicitly reset it with node "${resetScript}" "${sessionId}".`
+    );
+  }
+
+  if (worktreeMode === 'required') {
+    // ExitWorktree後も公式toolで記録済みworktreeへ戻れるようにする。
+    if (targetsRecordedWorktree) return rawInput;
+    let identity;
+    try {
+      identity = worktreeIdentity(cwd, env);
+    } catch {
+      return deny('[ECC Delivery Gate] The active Delivery worktree identity could not be verified.');
+    }
+    if (
+      !identity.isolated ||
+      path.resolve(identity.root) !== path.resolve(state.delivery.worktree || '') ||
+      path.resolve(identity.common_dir) !== path.resolve(state.delivery.git_common_dir || '')
+    ) {
+      return deny('[ECC Delivery Gate] Current repository is not the isolated worktree recorded for this Delivery. Return to the recorded Claude Code worktree before editing.');
+    }
+  }
+
+  if (
+    toolName === 'Bash' &&
+    worktreeMode === 'required' &&
+    bashEscapesRecordedWorktree(command, state.delivery, cwd, env)
+  ) {
+    return deny(
+      '[ECC Delivery Gate] Bash may not target another checkout or leave the isolated worktree recorded for this Delivery.'
     );
   }
 
@@ -169,8 +319,18 @@ function run(rawInput, options = {}) {
     }, env);
   }
 
-  const toolName = String(input.tool_name || '');
-  const isEdit = ['Edit', 'Write', 'MultiEdit'].includes(toolName);
+  const isEdit = ['Edit', 'Write', 'MultiEdit', 'NotebookEdit'].includes(toolName);
+  if (isEdit && worktreeMode === 'required') {
+    const target = String(
+      input.tool_input && (input.tool_input.file_path || input.tool_input.notebook_path) || ''
+    );
+    const recordedRoot = canonicalMutationPath(state.delivery.worktree || '');
+    const absoluteTarget = target ? canonicalMutationPath(path.resolve(cwd, target)) : '';
+    const relative = absoluteTarget ? path.relative(recordedRoot, absoluteTarget) : '..';
+    if (!absoluteTarget || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      return deny('[ECC Delivery Gate] Mutation target is outside the isolated worktree recorded for this Delivery.');
+    }
+  }
   const head = gitValue(cwd, env, ['rev-parse', 'HEAD']);
   if (
     isEdit &&
@@ -204,4 +364,12 @@ if (require.main === module) {
   process.stdin.on('end', () => process.stdout.write(run(raw)));
 }
 
-module.exports = { branchAt, gitValue, isExactBranchSwitchCommand, isExactLifecycleCommand, run };
+module.exports = {
+  branchAt,
+  bashEscapesRecordedWorktree,
+  canonicalMutationPath,
+  gitValue,
+  isExactBranchSwitchCommand,
+  isExactLifecycleCommand,
+  run
+};

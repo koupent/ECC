@@ -84,7 +84,7 @@ function ensureReviewFollowupIssue(execute, state, input, delivery, pr, cwd, env
   if (items.length === 0 || !delivery.issue_number) return { ok: true, skipped: true };
   if (state.review_followup_issue_url) return { ok: true, url: state.review_followup_issue_url, reused: true };
 
-  const marker = `<!-- ecc-review-followup:issue-${delivery.issue_number} -->`;
+  const marker = `<!-- ecc-review-followup:issue-${delivery.issue_number}:revision-${Number(delivery.revision || 1)} -->`;
   const existing = execute('gh', ['issue', 'list', '--state', 'all', '--limit', '200', '--json', 'number,url,body'], cwd, env);
   if (existing.ok) {
     try {
@@ -173,11 +173,10 @@ function run(rawInput, options = {}) {
   const env = options.env || process.env;
   const cwd = options.cwd || input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const config = loadConfig(cwd, env);
-  if (config.deliveryWorkflow !== 'required') return rawInput;
-
   const state = readState(input, env);
   const delivery = state.delivery;
   if (!delivery) return rawInput;
+  if ((delivery.workflow_mode || config.deliveryWorkflow) !== 'required') return rawInput;
   if (delivery.status === 'deferred') {
     const permissionMode = String(input.permission_mode || input.permissionMode || '').toLowerCase();
     if (permissionMode === 'plan') return rawInput;
@@ -191,6 +190,15 @@ function run(rawInput, options = {}) {
     return block(
       `Issue #${delivery.issue_number} is recorded, but the delivery is still waiting for the branch switch that preparation deliberately leaves to you. ` +
         `Run \`${handoff.command || `git switch ${delivery.branch}`}\` once no verification is running, then run \`/ecc:delivery-prepare\` again.`
+    );
+  }
+  if (delivery.status === 'awaiting-worktree') {
+    const entry = delivery.worktree
+      ? `path ${delivery.worktree}`
+      : `name ${delivery.worktree_name || '<issue-worktree>'}`;
+    return block(
+      `Issue #${delivery.issue_number} is recorded, but required Worktree isolation is not active. ` +
+        `Use Claude Code's EnterWorktree tool with the recorded ${entry}, then run \`/ecc:delivery-prepare\` again.`
     );
   }
   if (delivery.status !== 'ready') return rawInput;
@@ -282,6 +290,7 @@ function run(rawInput, options = {}) {
       delivery: {
         ...delivery,
         status: 'merged',
+        pr_number: Number(candidate.number),
         draft_pr_url: candidate.url,
         merged_pr_url: completion.pr.url || candidate.url,
         merged_head: head.stdout,
@@ -291,7 +300,15 @@ function run(rawInput, options = {}) {
     return rawInput;
   }
 
-  writeState(input, { delivery: { ...delivery, status: 'draft-pr', draft_pr_url: candidate.url, completed_at: new Date().toISOString() } }, env);
+  writeState(input, {
+    delivery: {
+      ...delivery,
+      status: 'draft-pr',
+      pr_number: Number(candidate.number),
+      draft_pr_url: candidate.url,
+      completed_at: new Date().toISOString()
+    }
+  }, env);
   return rawInput;
 }
 

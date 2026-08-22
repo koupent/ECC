@@ -17,6 +17,7 @@
     "codexSandbox": { "const": "required" },
     "legacyHarness": { "const": "replace" },
     "deliveryWorkflow": { "enum": ["advisory", "required"] },
+    "deliveryWorktree": { "enum": ["advisory", "required"] },
     "deliveryBaseBranch": { "type": "string", "minLength": 1 },
     "legacyPreserve": {
       "type": "array",
