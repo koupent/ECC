@@ -57,8 +57,10 @@ Worktree handling is deliberately fail-closed:
   into the new worktree, uncommitted changes stay behind.
 
 Once a delivery is bound to its own worktree, every later stage stays bound to it.
-The Delivery Gate, the commit observer, `/ecc:code-review`, the Completion Gate and
-the acceptance audit read that worktree only. If the recorded directory is gone or
+The Delivery Gate, the Context Builder, the commit observer, `/ecc:code-review`, the
+Completion Gate and the acceptance audit read that worktree only. Every Codex role
+resolves it from the recorded delivery, so the session itself may keep running in the
+shared working tree without pointing a role at it. If the recorded directory is gone or
 now belongs to another repository, they stop and ask you to restore it or reset the
 delivery; none of them falls back to the shared working tree. Recovery stays
 reachable while the gate is closed: the exact `delivery-lifecycle.js prepare` and

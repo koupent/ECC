@@ -111,7 +111,9 @@ function run(rawInput, options = {}) {
     role: 'context-builder',
     request: roleRequest,
     requestHash: delivery ? delivery.request_hash : hash(prompt, 32),
-    cwd,
+    // Hookが知っているのはSessionのproject directoryだけで、作業場所の指定ではない。
+    // 隔離済みDeliveryのContext Builderは、ここではなく記録済みworktreeで走る。
+    projectDir: cwd,
     sessionId: input.session_id,
     env: options.env || process.env
   });

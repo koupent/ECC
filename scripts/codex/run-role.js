@@ -291,7 +291,13 @@ function runRole(options) {
   // 通せないうえ、workspace-write roleなら共有ツリーを書き換えてしまう。
   const deliveryState = readState(input, env);
   const isolated = Boolean(deliveryState.delivery && deliveryState.delivery.worktree_path);
-  const workspace = deliveryWorkspace(deliveryState, options.cwd || process.cwd());
+  // projectDirはHookが走っているSessionのproject directoryであって、作業場所の指定では
+  // ない。これを明示的な --cwd と同じに扱うと、隔離済みDeliveryではHookがroleを起動する
+  // たびに拒否され、Context Builderを一度も走らせられなくなる。どちらもDeliveryが
+  // worktreeを記録していない場合の作業場所としてだけ使う。
+  const projectDir = path.resolve(options.projectDir || options.cwd || process.cwd());
+  const explicitCwd = options.projectDir ? '' : String(options.cwd || '');
+  const workspace = deliveryWorkspace(deliveryState, projectDir);
   if (isolated && !workspace) {
     throw new Error(
       'The worktree recorded for the active delivery is missing or belongs to another repository. ' +
@@ -300,9 +306,9 @@ function runRole(options) {
   }
   // 明示的な --cwd は、記録済みworktreeそのものを指す場合だけ受け付ける。ここでcwdを
   // 優先すると、role呼び出しに共有ツリーや兄弟worktreeを渡すだけで隔離を迂回できる。
-  if (isolated && options.cwd && path.resolve(options.cwd) !== workspace && realPath(options.cwd) !== realPath(workspace)) {
+  if (isolated && explicitCwd && path.resolve(explicitCwd) !== workspace && realPath(explicitCwd) !== realPath(workspace)) {
     throw new Error(
-      `Codex roles for the active delivery run in its worktree ${workspace}, but --cwd points at ${path.resolve(options.cwd)}. ` +
+      `Codex roles for the active delivery run in its worktree ${workspace}, but --cwd points at ${path.resolve(explicitCwd)}. ` +
         'Drop --cwd, or reset the delivery if the recorded worktree is no longer the right place to work.'
     );
   }

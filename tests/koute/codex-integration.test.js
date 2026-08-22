@@ -2532,6 +2532,45 @@ test('Codex roles refuse an explicit cwd that is not the recorded delivery workt
   );
 });
 
+test('the Context Builder runs in the delivery worktree instead of failing on the session project directory', () => {
+  const fixture = createGitFixture('context-builder-worktree-repo');
+  const fixtureEnv = {
+    ...env,
+    ECC_KOUTE_STATE_DIR: path.join(temp, 'context-builder-worktree-state'),
+    // shimはworktreeにも渡る必要があるため、払い出しの前にcommitしておく。
+    ECC_CODEX_BINARY: createCodexShim('context', fixture)
+  };
+  const branch = 'codex/issue-79-context-builder';
+  const worktreePath = path.join(temp, 'context-builder-worktree');
+  assert.strictEqual(
+    spawnSync('git', ['worktree', 'add', '--quiet', '-b', branch, worktreePath], { cwd: fixture }).status,
+    0
+  );
+  // 共有ツリーとHEADを分け、どちらで走ったかを記録された証拠から見分けられるようにする。
+  fs.writeFileSync(path.join(worktreePath, 'src', 'product.ts'), 'export const product = false;\n', 'utf8');
+  assert.strictEqual(spawnSync('git', ['add', 'src/product.ts'], { cwd: worktreePath }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'implement in worktree'], { cwd: worktreePath }).status, 0);
+  const worktreeHead = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: worktreePath, encoding: 'utf8' }).stdout.trim();
+  const sharedHead = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  assert.notStrictEqual(worktreeHead, sharedHead);
+
+  const session = { session_id: 'context-builder-worktree', cwd: fixture };
+  writeState(session, {
+    delivery: { status: 'ready', issue_number: 79, branch, base_branch: 'main', worktree_path: worktreePath }
+  }, fixtureEnv);
+
+  // HookがrunRoleへ渡すのはSessionのproject directoryであって、作業場所の指定ではない。
+  // 明示的な --cwd と同じに扱うと、隔離済みDeliveryではUserPromptSubmitが例外で落ちる。
+  const output = JSON.parse(contextBuilder.run(
+    JSON.stringify({ ...session, prompt: 'worktree隔離の続きを修正してください' }),
+    { cwd: fixture, env: fixtureEnv }
+  ));
+  assert.match(output.hookSpecificOutput.additionalContext, /fixture context/);
+  const state = readState(session, fixtureEnv);
+  assert.strictEqual(state.context_status, 'ready');
+  assert.strictEqual(state.context_head, worktreeHead);
+});
+
 test('distributed agent rules defer to runtime capabilities and do not claim automatic spawning', () => {
   const agentsRule = fs.readFileSync(path.join(__dirname, '..', '..', 'rules', 'common', 'agents.md'), 'utf8');
   const rootAgents = fs.readFileSync(path.join(__dirname, '..', '..', 'AGENTS.md'), 'utf8');
