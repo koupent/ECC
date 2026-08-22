@@ -2,7 +2,6 @@
 'use strict';
 
 const { loadConfig } = require('../codex/config');
-const { assertCentralRemediationAllowed } = require('../codex/incident-ownership');
 
 function deny(reason) {
   return JSON.stringify({
@@ -36,16 +35,10 @@ function run(rawInput, options = {}) {
   const cwd = options.cwd || input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const env = options.env || process.env;
   const config = loadConfig(cwd, env);
-  try {
-    assertCentralRemediationAllowed({
-      mode: config.incidentHandling.mode,
-      targetRepository: env.ECC_OPERATOR_TARGET_REPOSITORY,
-      env
-    });
-    return rawInput;
-  } catch (error) {
-    return deny(error.message || String(error));
-  }
+  return deny(
+    `incidentHandling.mode=${config.incidentHandling.mode}は中央Issueへの報告専用です。` +
+    'Kit／ECCの修正は対象repositoryを直接開いた対話セッションで行ってください。'
+  );
 }
 
 if (require.main === module) {

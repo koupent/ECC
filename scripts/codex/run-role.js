@@ -25,8 +25,7 @@ const ROLE_DEFS = {
   review: { model: 'review', schema: 'assessment-result.schema.json', sandbox: 'read-only' },
   'security-review': { model: 'review', schema: 'assessment-result.schema.json', sandbox: 'read-only' },
   'bug-reproduction-test': { model: 'review', schema: 'assessment-result.schema.json', sandbox: 'workspace-write', writePolicy: 'tests-only' },
-  'contract-test': { model: 'review', schema: 'assessment-result.schema.json', sandbox: 'workspace-write', writePolicy: 'tests-only' },
-  'harness-remediation': { model: 'review', schema: 'assessment-result.schema.json', sandbox: 'workspace-write', writePolicy: 'fork-only' }
+  'contract-test': { model: 'review', schema: 'assessment-result.schema.json', sandbox: 'workspace-write', writePolicy: 'tests-only' }
 };
 
 function git(cwd, args, options = {}) {
@@ -124,13 +123,6 @@ function roleInstructions(role, request) {
       'Write only independent tests: bug reproduction tests or public/API/acceptance contract tests.',
       'Do not edit product source, configuration, snapshots outside test trees, or existing implementation code.',
       'If a correct independent test cannot be written, return status=blocked without changing files.'
-    );
-  } else if (role === 'harness-remediation') {
-    common.push(
-      '',
-      'This is a sanitized defect in the public koupent/ECC fork.',
-      'Add a failing regression test first, implement the smallest generic fix, and run relevant tests.',
-      'Do not add private paths, repository names, prompts, or customer data.'
     );
   } else if (role === 'review' || role === 'security-review') {
     common.push(

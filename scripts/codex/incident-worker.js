@@ -155,23 +155,23 @@ function createCentralIssue(event, config, env) {
     return { ...existing[0], target, created: false };
   }
 
-  const title = `[ECC incident][${target}] ${event.type} (${event.fingerprint.slice(0, 10)})`;
+  const title = `[ECCインシデント][${target}] ${event.type} (${event.fingerprint.slice(0, 10)})`;
   const body = [
-    'This incident was promoted automatically from privacy-preserving local telemetry.',
+    'プライバシーを保護したローカル計測から、自動的に昇格したインシデントです。',
     '',
     `- Fingerprint: \`${event.fingerprint}\``,
-    `- Type: \`${event.type}\``,
-    `- Target: \`${target}\``,
-    `- Severity: \`${event.severity}\``,
-    `- Occurrences: ${event.count}`,
-    `- Project fingerprint: \`${event.project || 'unknown'}\``,
+    `- 種別: \`${event.type}\``,
+    `- 対象: \`${target}\``,
+    `- 重大度: \`${event.severity}\``,
+    `- 発生回数: ${event.count}`,
+    `- プロジェクトfingerprint: \`${event.project || 'unknown'}\``,
     '',
-    'Sanitized message:',
+    '匿名化済みメッセージ:',
     '',
     redactText(event.message || ''),
     '',
-    'Follow-up is owned by the dedicated central Operator. Product sessions report only and return to product work.',
-    'No source prompt, secret, absolute path, or product repository name is included.'
+    '製品セッションは報告だけを行って製品開発へ戻ります。修正方針は対象リポジトリの対話セッションで確認してください。',
+    '元のprompt、秘密情報、絶対path、製品リポジトリ名は含みません。'
   ].join('\n');
   const args = ['issue', 'create', '--repo', config.centralIncidentRepo, '--title', title, '--body', body];
   for (const label of labels) args.push('--label', label);

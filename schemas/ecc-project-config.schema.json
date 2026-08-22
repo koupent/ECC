@@ -39,7 +39,7 @@
       "additionalProperties": false,
       "required": ["mode", "repository"],
       "properties": {
-        "mode": { "enum": ["report-only", "central-remediate"] },
+        "mode": { "const": "report-only" },
         "repository": { "const": "koupent/engineering-environment-kit" }
       }
     },

@@ -53,7 +53,7 @@ function loadConfig(cwd = process.cwd(), env = process.env) {
     centralIncidentRepo: env.ECC_INCIDENT_REPOSITORY || incidentHandling.repository || codex.incidentRepository || 'koupent/engineering-environment-kit',
     forkRepo: env.ECC_FORK_REPOSITORY || codex.forkRepository || 'koupent/ECC',
     incidentHandling: {
-      mode: env.ECC_INCIDENT_HANDLING_MODE || incidentHandling.mode || 'report-only',
+      mode: 'report-only',
       repository: env.ECC_INCIDENT_REPOSITORY || incidentHandling.repository || codex.incidentRepository || 'koupent/engineering-environment-kit'
     },
     deliveryWorkflow: env.ECC_DELIVERY_WORKFLOW || project.value.deliveryWorkflow || 'advisory',
