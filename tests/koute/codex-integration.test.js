@@ -900,7 +900,23 @@ test('local merge policy blocks merge bypasses and direct success status publica
     // urlencoded field list cannot be cleared as non-success.
     'gh api -X POST repos/acme/example/statuses/abc -F state=@status.txt',
     'curl -X POST https://api.github.com/repos/acme/example/statuses/abc -d \'{"st\\u0061te":"success"}\'',
-    "curl -X POST https://api.github.com/repos/acme/example/statuses/abc -d 'context=ci&state=success'"
+    "curl -X POST https://api.github.com/repos/acme/example/statuses/abc -d 'context=ci&state=success'",
+    // A function body is a command list in both brace forms; the compact one
+    // writes no space between the definition and the opening brace.
+    'f(){ gh pr merge 12 --squash;}; f',
+    'f() { gh pr merge 12 --squash; }',
+    // A process substitution hands the caller a pipe whose content is generated,
+    // so a script read from it cannot be checked and fails closed.
+    "source <(printf '%s\\n' 'gh pr merge 12 --squash')",
+    ". <(printf '%s\\n' 'gh pr merge 12 --squash')",
+    "bash <(printf '%s\\n' 'gh pr merge 12 --squash')",
+    // `source` also runs the data written into it, like a shell does.
+    "source /dev/stdin <<'EOF'\ngh pr merge 12 --squash\nEOF",
+    // httpie turns the request into a POST as soon as a data item is present,
+    // so a status can be published without any method word.
+    'http https://api.github.com/repos/acme/example/statuses/abc state=success',
+    'https api.github.com/repos/acme/example/statuses/abc state=success',
+    'URL=https://api.github.com/repos/acme/example/statuses/abc; http "$URL" state:=success'
   ];
   for (const command of denied) {
     const decision = JSON.parse(localMergePolicy.run(bash(command), { cwd: fixture, env }));
@@ -962,7 +978,16 @@ test('local merge policy blocks merge bypasses and direct success status publica
     // even next to a value this gate cannot read.
     'gh api repos/acme/example/statuses/abc -f state=failure -f description="$SUMMARY"',
     // A shell given a script file runs that file: the heredoc is its input data.
-    "bash scripts/ci/project-verify.sh <<'EOF'\ngh pr merge 12 --squash\nEOF"
+    "bash scripts/ci/project-verify.sh <<'EOF'\ngh pr merge 12 --squash\nEOF",
+    // A process substitution is an ordinary way to feed a command: only what its
+    // body runs is executed, and the body here runs no merge.
+    'diff <(git show HEAD:notes.md) <(cat notes.md)',
+    // Sourcing a file on disk keeps the treatment a script operand already gets.
+    'source scripts/ci/env.sh',
+    // An httpie read publishes nothing: a query parameter and a header add no
+    // request body, so no implicit POST is sent.
+    'http https://api.github.com/repos/acme/example/statuses/abc',
+    'http https://api.github.com/repos/acme/example/statuses/abc per_page==1 Authorization:token'
   ];
   for (const command of allowedCommands) {
     const allowed = bash(command);

@@ -45,6 +45,11 @@ const SPLIT_STRING_OPTIONS = {
 // as its own command instead of being treated as inert text.
 const SHELL_BINARIES = new Set(['bash', 'busybox', 'dash', 'ksh', 'sh', 'zsh']);
 
+// Builtins that run the content of the file named by their first operand in the
+// current shell. A path on disk keeps the treatment a script operand already
+// gets — the file is not read here — but a generated script is denied.
+const SOURCE_BUILTINS = new Set(['.', 'source']);
+
 // Shell options that take a value of their own, so the word after them is not
 // the script operand (`bash --rcfile init.sh -s`).
 const SHELL_VALUE_OPTIONS = new Set(['-O', '+O', '--init-file', '--rcfile']);
@@ -213,6 +218,12 @@ const EXPANSION = /\$[A-Za-z_{]/;
 // The substitution body is parsed separately, but the surrounding token stays
 // marked as text this gate cannot resolve.
 const SUBSTITUTION = '$()';
+// Placeholder left in the word a process substitution produces. The body runs
+// and is parsed like any other substitution, while the word itself is a
+// `/dev/fd` path whose content this gate cannot read. It keeps a `$`, so the
+// word also stays unresolved text everywhere else.
+const PROCESS_SUBSTITUTION = '$<proc>';
+const PROCESS_SUBSTITUTION_TOKEN = /\$<proc>/;
 // Any expansion or substitution left in a token value. A command word or a
 // request body carrying one resolves to unknown text at run time, so both fail
 // closed rather than being read literally (`"$GH" pr merge`, `-f state="$S"`).
@@ -237,6 +248,15 @@ const STATUS_ENDPOINT = /(?:\/statuses\/|\/status$)/i;
 // `name=value` request field, used to tell a payload that could set the commit
 // status apart from one that writes another field (`-f body="$MSG"`).
 const REQUEST_FIELD = /^([A-Za-z_][A-Za-z0-9_.-]*)=([\s\S]*)$/;
+// httpie request items. A data item makes the call a POST on its own, so
+// `http <statuses URL> state=success` publishes a status with no method word:
+// `name=value` is a string field, `name:=value` a raw JSON one and `name@path`
+// an uploaded file. `name==value` is a query parameter and `Name:value` a
+// header, and neither adds a body, so a plain read stays allowed. The name
+// carries no path separator, so an endpoint operand is never read as a field.
+const HTTPIE_DATA_ITEM = /^[A-Za-z0-9_.+-]+(?::=|=|@)/;
+const HTTPIE_QUERY_ITEM = /^[A-Za-z0-9_.+-]+==/;
+const HTTPIE_RAW_ITEM = /^([A-Za-z0-9_.+-]+):=([\s\S]*)$/;
 const STATE_FIELD_NAME = /^state$/i;
 const SUCCESS_STATE = /^success$/i;
 const SUCCESS_FIELD = /(?:^|=)state=success$/i;
@@ -437,8 +457,12 @@ function skipHeredocBodies(source, start, pending, substitutions, bodies) {
   return index;
 }
 
+// `{` opens a group when it is a word of its own. The character before it also
+// closes a function definition in the compact form `f(){ gh pr merge 12;}`, so
+// `)` belongs here: without it the brace is read as part of the command word and
+// the body is never resolved as an execution.
 function isBraceGroupOpen(source, index) {
-  return /\s/.test(source[index + 1] || '') && (index === 0 || /[\s;|&(]/.test(source[index - 1]));
+  return /\s/.test(source[index + 1] || '') && (index === 0 || /[\s;|&()]/.test(source[index - 1]));
 }
 
 function isBraceGroupClose(source, index) {
@@ -629,6 +653,19 @@ function tokenizeScript(source) {
       i += 1;
       continue;
     }
+    // A process substitution runs its body and hands the caller a `/dev/fd` path.
+    // The body is parsed like any other substitution; the word it leaves behind
+    // is an argument, so `source <(printf 'gh pr merge 12')` keeps its operand
+    // instead of losing it to the redirection scan.
+    if ((ch === '<' || ch === '>') && source[i + 1] === '(') {
+      const span = readParenSpan(source, i + 1);
+      substitutions.push(span.body);
+      token += PROCESS_SUBSTITUTION;
+      started = true;
+      tokenExpanded = true;
+      i = span.next;
+      continue;
+    }
     // `<<<` is a here-string, not a heredoc: its operand is data on the same line.
     if (ch === '<' && source[i + 1] === '<' && source[i + 2] === '<') {
       endToken();
@@ -696,7 +733,7 @@ function tokenizeScript(source) {
     nested.push(...shellScriptArguments(detail.tokens, delegatedScripts));
     const stdin = shellStdinScripts(detail);
     nested.push(...stdin.scripts);
-    if (stdin.unresolved || executesDynamicScript(detail)) unresolved = true;
+    if (stdin.unresolved || executesDynamicScript(detail) || executesGeneratedScript(detail)) unresolved = true;
     for (const delegation of delegatedScripts) {
       nested.push(delegatedScriptLine(delegation));
       // `env -S "$CMD"` runs a command line this gate cannot read.
@@ -944,16 +981,16 @@ function shellScriptFlagIndex(args) {
 }
 
 /**
- * True when a shell invocation takes its script from stdin instead of from a
- * script file: it has no operand at all, `-s` turns every operand into a
- * positional parameter (`bash -s marker <<EOF`), or the first operand names
- * stdin itself (`bash - <<EOF`, `bash /dev/stdin <<EOF`). Any other first
- * operand is a script file, which is not read here.
+ * Where a shell invocation takes its script from: `stdin` when it has no operand
+ * at all, when `-s` turns every operand into a positional parameter (`bash -s
+ * marker <<EOF`), or when the first operand names stdin itself (`bash - <<EOF`,
+ * `bash /dev/stdin <<EOF`). Any other first operand is the script file, which is
+ * not read here.
  *
  * @param {string[]} args
- * @returns {boolean}
+ * @returns {{ stdin: boolean, operand: string }}
  */
-function shellReadsStdin(args) {
+function shellScriptSource(args) {
   let optionsEnded = false;
   for (let index = 0; index < args.length; index += 1) {
     // The word-splitting marker is not part of the option letters.
@@ -964,23 +1001,59 @@ function shellReadsStdin(args) {
     }
     if (!optionsEnded && argument.length > 1 && (argument[0] === '-' || argument[0] === '+')) {
       // `-s` reads the script from stdin, on its own or inside a group (`-es`).
-      if (!argument.startsWith('--') && argument.includes('s')) return true;
+      if (!argument.startsWith('--') && argument.includes('s')) return { stdin: true, operand: '' };
       const separator = argument.indexOf('=');
       const flag = separator === -1 ? argument : argument.slice(0, separator);
       if (separator === -1 && SHELL_VALUE_OPTIONS.has(flag)) index += 1;
       continue;
     }
-    return STDIN_OPERANDS.has(argument);
+    return { stdin: STDIN_OPERANDS.has(argument), operand: argument };
   }
-  return true;
+  return { stdin: true, operand: '' };
+}
+
+function shellReadsStdin(args) {
+  return shellScriptSource(args).stdin;
+}
+
+// The file `source` and `.` execute: their first operand, options aside.
+function sourceScriptOperand(args) {
+  for (const argument of args) {
+    if (argument === '--') continue;
+    return argument;
+  }
+  return '';
+}
+
+/**
+ * True when a command executes a script whose text comes from a process
+ * substitution: `source <(printf 'gh pr merge 12 --squash')` and `bash <(...)`
+ * run words this gate never sees, since the body only prints them. Such input is
+ * unresolved and denied. A plain path keeps its previous treatment — the file is
+ * not read here — so `source .venv/bin/activate` stays allowed.
+ *
+ * @param {{ tokens: string[] }} detail
+ * @returns {boolean}
+ */
+function executesGeneratedScript({ tokens }) {
+  return resolveExecutions(tokens).some(execution => {
+    if (SOURCE_BUILTINS.has(execution.name)) {
+      return PROCESS_SUBSTITUTION_TOKEN.test(sourceScriptOperand(execution.args));
+    }
+    if (!runsShellScripts(execution.name)) return false;
+    // A `-c` script is read directly; the operands after it are not executed.
+    if (shellScriptFlagIndex(execution.args) !== -1) return false;
+    return PROCESS_SUBSTITUTION_TOKEN.test(shellScriptSource(execution.args).operand);
+  });
 }
 
 /**
  * Scripts a shell reads from stdin instead of from `-c`: `bash <<'EOF' ... EOF`
  * and `bash <<< "gh pr merge 12"` both execute their data, so it is parsed as a
- * command. When the same shell is fed by a pipe or a file redirection the
- * script text is unknown and the input is unresolved. A shell given a script
- * file operand keeps its previous treatment: the file is not read here.
+ * command. `source /dev/stdin <<EOF` runs its data the same way. When the same
+ * shell is fed by a pipe or a file redirection the script text is unknown and
+ * the input is unresolved. A shell given a script file operand keeps its
+ * previous treatment: the file is not read here.
  *
  * @param {{ tokens: string[], stdin: string[], inputFromUnknown: boolean }} detail
  * @returns {{ scripts: string[], unresolved: boolean }}
@@ -989,13 +1062,18 @@ function shellStdinScripts({ tokens, stdin, inputFromUnknown }) {
   const scripts = [];
   let unresolved = false;
   for (const execution of resolveExecutions(tokens)) {
-    if (!runsShellScripts(execution.name)) continue;
-    if (shellScriptFlagIndex(execution.args) !== -1) continue;
+    // `source /dev/stdin <<EOF` runs its heredoc just as a shell does.
+    const sourcing = SOURCE_BUILTINS.has(execution.name);
+    if (!sourcing && !runsShellScripts(execution.name)) continue;
+    if (!sourcing && shellScriptFlagIndex(execution.args) !== -1) continue;
     // A script operand this gate cannot read could name stdin itself, so data
     // written into the command is parsed as well. A file or a pipe behind such
     // an operand stays the caller's own script and is not guessed at.
     const opaqueOperand = stdin.length > 0 && execution.args.some(argument => UNRESOLVED_TEXT.test(argument));
-    if (!shellReadsStdin(execution.args) && !opaqueOperand) continue;
+    const readsStdin = sourcing
+      ? STDIN_OPERANDS.has(sourceScriptOperand(execution.args))
+      : shellReadsStdin(execution.args);
+    if (!readsStdin && !opaqueOperand) continue;
     if (stdin.length) scripts.push(...stdin);
     else if (inputFromUnknown) unresolved = true;
   }
@@ -1289,17 +1367,31 @@ function clientPublishesSuccessStatus(name, args) {
   const methods = optionValues(args, METHOD_OPTIONS[name] || NO_OPTIONS);
   // httpie takes the method and `key=value` items as operands.
   const operands = args.filter(argument => !argument.startsWith('-'));
+  const items = operands.filter(operand => !HTTPIE_QUERY_ITEM.test(operand) && HTTPIE_DATA_ITEM.test(operand));
   const mutating = bodies.length > 0
     || files.length > 0
     || methods.some(method => MUTATING_METHOD.test(method))
-    || operands.some(operand => MUTATING_METHOD.test(operand));
+    || operands.some(operand => MUTATING_METHOD.test(operand))
+    // A data item is a request body, and httpie sends it as a POST without any
+    // method word of its own. A command word this gate cannot resolve can name
+    // httpie, so the same reading applies to it (central Issue #75).
+    || (mayBeHttpie(name) && items.length > 0);
   if (!mutating) return false;
   if (operands.some(valueCarriesSuccess)) return true;
   // An httpie item can also be the field that sets the state.
-  const items = reach === 'definite'
-    ? []
-    : operands.filter(operand => REQUEST_FIELD.test(operand)).map(value => ({ value, literal: false, form: false }));
-  return publishesToStatusEndpoint(reach, bodies, files) || items.some(bodyMayCarrySuccess);
+  const fields = reach === 'definite' ? [] : items.map(httpieItemBody);
+  return publishesToStatusEndpoint(reach, bodies, files) || fields.some(bodyMayCarrySuccess);
+}
+
+function mayBeHttpie(name) {
+  return name === 'http' || name === 'https' || name === UNRESOLVED_BINARY;
+}
+
+// An httpie data item read as a request body. `state:=success` is the raw JSON
+// form of `state=success`, and a value written `@path` is read from that file.
+function httpieItemBody(item) {
+  const raw = HTTPIE_RAW_ITEM.exec(item);
+  return { value: raw ? `${raw[1]}=${raw[2]}` : item, literal: false, form: false };
 }
 
 /**
@@ -1401,7 +1493,7 @@ function run(rawInput, options = {}) {
     return deny('success commit statusの直接投稿は禁止です。engineering-kit-merge-gateが検査結果に基づいて投稿します。');
   }
   if (unresolved) {
-    return deny('生成した文字列をそのままscriptとして実行するコマンドは、実行内容を確認できないため許可できません。eval・sh -c・shellへのpipeに渡さず、実行するコマンドを直接記述してください。');
+    return deny('生成した文字列をそのままscriptとして実行するコマンドは、実行内容を確認できないため許可できません。eval・sh -c・shellへのpipe・process substitutionのsourceに渡さず、実行するコマンドを直接記述してください。');
   }
   return rawInput;
 }
