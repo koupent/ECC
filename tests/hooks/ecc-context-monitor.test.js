@@ -205,16 +205,17 @@ function runTests() {
   console.log('\ndetectLoop:');
 
   if (
-    test('3 identical entries returns detected true', () => {
+    test('4 identical input/outcome entries without progress returns detected true', () => {
       const entries = [
-        { tool: 'Bash', hash: 'aabbccdd' },
-        { tool: 'Bash', hash: 'aabbccdd' },
-        { tool: 'Bash', hash: 'aabbccdd' }
+        { tool: 'Bash', hash: 'aabbccdd', outcome: 'same', progress: 0 },
+        { tool: 'Bash', hash: 'aabbccdd', outcome: 'same', progress: 0 },
+        { tool: 'Bash', hash: 'aabbccdd', outcome: 'same', progress: 0 },
+        { tool: 'Bash', hash: 'aabbccdd', outcome: 'same', progress: 0 }
       ];
       const result = detectLoop(entries);
       assert.strictEqual(result.detected, true);
       assert.strictEqual(result.tool, 'Bash');
-      assert.ok(result.count >= 3);
+      assert.ok(result.count >= 4);
     })
   )
     passed++;
@@ -223,9 +224,9 @@ function runTests() {
   if (
     test('all different entries returns detected false', () => {
       const entries = [
-        { tool: 'Bash', hash: '11111111' },
-        { tool: 'Edit', hash: '22222222' },
-        { tool: 'Write', hash: '33333333' }
+        { tool: 'Bash', hash: '11111111', outcome: 'a', progress: 0 },
+        { tool: 'Edit', hash: '22222222', outcome: 'b', progress: 1 },
+        { tool: 'Write', hash: '33333333', outcome: 'c', progress: 2 }
       ];
       const result = detectLoop(entries);
       assert.strictEqual(result.detected, false);

@@ -22,7 +22,7 @@ const COST_NOTICE_USD = 5;
 const COST_WARNING_USD = 10;
 const COST_CRITICAL_USD = 50;
 const FILES_WARNING_COUNT = 20;
-const LOOP_THRESHOLD = 3;
+const LOOP_THRESHOLD = 4;
 const STALE_SECONDS = 60;
 
 function isEnabledEnv(value, defaultValue = true) {
@@ -57,7 +57,7 @@ function readWarnState(sessionId) {
   try {
     return JSON.parse(fs.readFileSync(getWarnPath(sessionId), 'utf8'));
   } catch {
-    return { callsSinceWarn: 0, lastSeverity: null, lastMessage: null };
+    return { callsSinceWarn: 0, lastSeverity: null, lastMessage: null, lastIncidentFingerprint: null };
   }
 }
 
@@ -95,19 +95,20 @@ function writeWarnState(sessionId, state) {
  */
 function detectLoop(recentTools) {
   if (!Array.isArray(recentTools) || recentTools.length < LOOP_THRESHOLD) {
-    return { detected: false, tool: '', count: 0 };
+    return { detected: false, tool: '', count: 0, fingerprint: '' };
   }
   const counts = {};
   for (const entry of recentTools) {
-    const key = `${entry.tool}:${entry.hash}`;
+    if (!entry || !entry.outcome || !Number.isInteger(entry.progress)) continue;
+    const key = `${entry.tool}:${entry.hash}:${entry.outcome}:${entry.progress}`;
     counts[key] = (counts[key] || 0) + 1;
   }
   for (const [key, count] of Object.entries(counts)) {
     if (count >= LOOP_THRESHOLD) {
-      return { detected: true, tool: key.split(':')[0], count };
+      return { detected: true, tool: key.split(':')[0], count, fingerprint: crypto.createHash('sha256').update(key).digest('hex').slice(0, 16) };
     }
   }
-  return { detected: false, tool: '', count: 0 };
+  return { detected: false, tool: '', count: 0, fingerprint: '' };
 }
 
 /**
@@ -178,6 +179,7 @@ function evaluateConditions(bridge, options = {}) {
     warnings.push({
       severity: 2,
       type: 'loop',
+      fingerprint: loop.fingerprint,
       message: `LOOP WARNING: Tool '${loop.tool}' called ${loop.count} times ` + 'with same parameters in last 5 calls. This may indicate a stuck loop.'
     });
   }
@@ -226,7 +228,7 @@ function run(rawInput) {
       // have no warning, and this keeps the common path free of disk writes.
       const prior = readWarnState(sessionId);
       if (prior.lastMessage) {
-        writeWarnState(sessionId, { callsSinceWarn: 0, lastSeverity: null, lastMessage: null });
+        writeWarnState(sessionId, { ...prior, callsSinceWarn: 0, lastSeverity: null, lastMessage: null });
       }
       return rawInput;
     }
@@ -258,14 +260,16 @@ function run(rawInput) {
     writeWarnState(sessionId, warnState);
 
     const loopWarning = warnings.find(warning => warning.type === 'loop');
-    if (loopWarning) {
+    if (loopWarning && warnState.lastIncidentFingerprint !== loopWarning.fingerprint) {
       recordIncident({
         type: 'repeated_tool_call',
         severity: 'minor',
         hook_id: 'post:ecc-context-monitor',
         message: loopWarning.message,
-        metadata: { session_id: sessionId }
+        metadata: { session_id: sessionId, fingerprint: loopWarning.fingerprint }
       });
+      warnState.lastIncidentFingerprint = loopWarning.fingerprint;
+      writeWarnState(sessionId, warnState);
     }
 
     const output = {
