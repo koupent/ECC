@@ -118,6 +118,9 @@ function createCodexShim(mode, fixture) {
       "  fs.writeFileSync(path.join(process.cwd(), 'tests', 'contract.test.ts'), 'test placeholder\\n');",
       "  fs.writeFileSync(path.join(process.cwd(), 'src', 'forbidden.ts'), 'forbidden\\n');",
       "}",
+      "if (mode === 'read-only-drift') {",
+      "  fs.appendFileSync(path.join(process.cwd(), 'src', 'product.ts'), '// external drift\\n');",
+      "}",
       "if (mode === 'assert-workspace-args') {",
       "  if (!args.includes('--approve-for-me') || args.includes('--sandbox')) process.exit(23);",
       "  fs.mkdirSync(path.join(process.cwd(), 'tests'), { recursive: true });",
@@ -1178,6 +1181,29 @@ test('read-only role signature detects changes inside an already-dirty path', ()
   const before = workingTreeSignature(signatureRepo);
   fs.writeFileSync(file, 'after', 'utf8');
   assert.notStrictEqual(workingTreeSignature(signatureRepo), before);
+});
+
+test('read-only workspace drift is audited without falsely reporting a Codex role failure', () => {
+  const fixture = createGitFixture('read-only-workspace-drift-repo');
+  const fixtureEnv = {
+    ...env,
+    ECC_KOUTE_STATE_DIR: path.join(temp, 'read-only-workspace-drift-state'),
+    ECC_CODEX_BINARY: createCodexShim('read-only-drift', fixture)
+  };
+  const input = { session_id: 'read-only-workspace-drift' };
+  const result = runRole({
+    role: 'review',
+    request: 'review while an external process changes the worktree',
+    cwd: fixture,
+    sessionId: input.session_id,
+    env: fixtureEnv
+  });
+  const state = readState(input, fixtureEnv);
+  assert.strictEqual(result.ok, true, JSON.stringify(result));
+  assert.strictEqual(state.codex_failures || 0, 0);
+  assert.strictEqual(state.role_workspace_changed, true);
+  assert.strictEqual(state.review_worktree_clean, false);
+  assert.ok(readEvents(fixtureEnv, 20).some(event => event.kind === 'read_only_workspace_drift'));
 });
 
 test('role result validator rejects malformed output', () => {

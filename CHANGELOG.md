@@ -19,6 +19,7 @@
 
 ### Fixed
 
+- 標準read-only sandbox内のCodex role実行中に外部processがlive worktreeを更新した場合、その変化をCodex自身の書込と誤認して失敗・中央インシデント化しないようにしました。作業ツリーの揺れは監査イベントへ記録し、review証拠はdirtyとしてfail-closeします。HEADが変わった場合は結果を無効化します。
 - plan modeではContext Builderだけを実行し、Issue作成やbranch切替を開始しないようにしました。
 - 同じHEAD、base、worktree差分へ独立Codexレビューを繰り返さず、外部所有者作業だけが残るレビューを閉じられない修正ループへ入れないようにしました。CRITICAL指摘を`owner-action`へ分類することは拒否します。
 - 必須Codex roleをBash backgroundで起動すると非対話Claude Code終了時に証拠が失われるため、PreToolUseで拒否してforeground完了を強制するようにしました。

@@ -259,6 +259,20 @@ function recordDuplicateFindings(role, result, cwd, env) {
 
 function failureState(role, input, error, cwd, env) {
   const state = readState(input, env);
+  if (error && error.code === 'READ_ONLY_SNAPSHOT_CHANGED') {
+    writeState(
+      input,
+      {
+        context_status: role === 'context-builder' ? 'fallback' : state.context_status,
+        role_snapshot_invalidations: (state.role_snapshot_invalidations || 0) + 1,
+        last_role: role,
+        last_error: String(error.message || error).slice(0, 500)
+      },
+      env
+    );
+    appendEvent({ kind: 'read_only_snapshot_invalidated', role, project: projectFingerprint(cwd) }, env);
+    return;
+  }
   writeState(
     input,
     {
@@ -293,6 +307,7 @@ function runRole(options) {
 
   const before = workingTreePaths(cwd);
   const beforeSignature = workingTreeSignature(cwd);
+  const beforeHead = gitOutput(cwd, ['rev-parse', 'HEAD']);
   if (def.writePolicy && before.length > 0) {
     throw new Error(`Codex write role requires a clean working tree; found ${before.length} changed path(s)`);
   }
@@ -410,11 +425,26 @@ function runRole(options) {
       validateResult(JSON.parse(fs.readFileSync(outputPath, 'utf8')), def.schema)
     );
     const after = workingTreePaths(cwd);
+    const afterHead = gitOutput(cwd, ['rev-parse', 'HEAD']);
+    const workspaceChanged = !def.writePolicy && workingTreeSignature(cwd) !== beforeSignature;
 
-    if (!def.writePolicy && workingTreeSignature(cwd) !== beforeSignature) {
+    if (!def.writePolicy && afterHead !== beforeHead) {
       const changedPaths = [...new Set([...before, ...after])].slice(0, 20);
       const detail = changedPaths.length > 0 ? `: ${changedPaths.join(', ')}` : '';
-      throw new Error(`read-only Codex role changed the working tree${detail}`);
+      const error = new Error(`repository HEAD changed while the read-only Codex role was running${detail}`);
+      error.code = 'READ_ONLY_SNAPSHOT_CHANGED';
+      throw error;
+    }
+    if (workspaceChanged) {
+      // Codexは標準read-only sandbox内で実行されるため、live worktreeの変化を
+      // Codex自身の書込と断定できない。外部processとの競合として監査し、
+      // reviewの場合はreview_worktree_clean=falseにしてCompletion Gateで止める。
+      appendEvent({
+        kind: 'read_only_workspace_drift',
+        role,
+        project: projectFingerprint(cwd),
+        changed_path_count: [...new Set([...before, ...after])].length
+      }, env);
     }
     if (def.writePolicy === 'tests-only') {
       const violations = after.filter(file => !isTestPath(file));
@@ -471,7 +501,7 @@ function runRole(options) {
       nextPatch.review_status = parsed.status;
       nextPatch.review_complete = parsed.review_complete;
       nextPatch.review_head = gitOutput(cwd, ['rev-parse', 'HEAD']);
-      nextPatch.review_worktree_clean = after.length === 0;
+      nextPatch.review_worktree_clean = after.length === 0 && workspaceChanged === false;
       nextPatch.review_blocking_findings = releaseBlockers.length;
       nextPatch.review_owner_actions = ownerActions;
       nextPatch.review_result = parsed;
@@ -515,6 +545,7 @@ function runRole(options) {
         };
       }
     }
+    nextPatch.role_workspace_changed = workspaceChanged;
     writeState(input, nextPatch, env);
     appendEvent(
       {
