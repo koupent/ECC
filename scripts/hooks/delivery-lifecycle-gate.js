@@ -78,9 +78,44 @@ const READ_ONLY_COMMANDS = new Set([
   'readlink', 'realpath', 'rg', 'sha1sum', 'sha256sum', 'sort', 'stat', 'tail', 'tree', 'true',
   'uname', 'uniq', 'wc', 'which', 'whoami'
 ]);
+// 読み取りcommandも、引数次第でファイルを作り、外部programを起動する
+// （`sort -o <path>`、`tree -o <path>`、`rg --pre <prog>`、`sort --compress-program=<prog>`）。
+// command名だけで通すと隔離が成立しないので、optionは値を取らないと確認できた名前だけを
+// 認めるfail-closeにする。ここに並ぶ名前はいずれも出力先も外部programも指さないため、
+// `--name=value` の値はそのまま通してよい。
+const SHELL_READ_SAFE_OPTIONS = new Set([
+  '--', '--all', '--almost-all', '--apparent-size', '--binary', '--brief', '--bytes',
+  '--canonicalize', '--check', '--classify', '--color', '--column', '--count', '--dereference',
+  '--directory', '--exclude', '--exclude-dir', '--expand-tabs', '--files-with-matches',
+  '--files-without-match', '--fixed-strings', '--full-time', '--glob',
+  '--group-directories-first', '--heading', '--help', '--hidden', '--human-readable',
+  '--ignore-all-space', '--ignore-blank-lines', '--ignore-case', '--include', '--inode',
+  '--invert-match', '--json', '--line-number', '--line-regexp', '--lines', '--long',
+  '--max-count', '--max-depth', '--null', '--null-data', '--numeric-sort', '--one-file-system',
+  '--only-matching', '--perl-regexp', '--quiet', '--raw-output', '--recursive', '--regexp',
+  '--reverse', '--si', '--silent', '--size', '--sort', '--stats', '--summarize', '--text',
+  '--time', '--total', '--type', '--unified', '--verbose', '--version', '--version-sort',
+  '--with-filename', '--word-regexp', '--zero'
+]);
+// `--no-…` はいずれも機能を止める向きで、ファイルを作らない。
+const SHELL_READ_SAFE_NEGATION = /^--no-[a-z][a-z0-9-]*$/;
+// 短いoptionは、出力先を取る `-o` と外部programを取る `-O` を除いた文字の組み合わせだけを
+// 認める。数字はheadやtailの行数指定。`-o/tmp/x` のように値が続く形は文字集合から外れる。
+const SHELL_READ_SAFE_SHORT = /^-[a-np-zA-NP-Z0-9]+$/;
+// 形としては読み取りでも、このcommandのこのoptionだけは書き込みや実行になる。
+const SHELL_UNSAFE_OPTIONS = new Map([
+  ['date', new Set(['-s', '--set'])],
+  ['file', new Set(['-C', '--compile'])]
+]);
+// operandが出力先や状態変更になるcommand。`uniq <in> <out>` は二つ目にファイルを作る。
+const SHELL_MAX_OPERANDS = new Map([['hostname', 0], ['uniq', 1]]);
 // ECC自身のcommandは記録済みのDeliveryからworktreeを解決して、そこだけを読み書きする。
-// 共有ツリーのcwdから起動されても共有ツリーを変更しないので、隔離中でも通す。
-const WORKTREE_AWARE_TOOL = /(?:^|[\\/])scripts[\\/]codex[\\/](?:acceptance-audit|delivery-lifecycle|doctor|record-event|reset|run-role)\.js$/i;
+// 共有ツリーのcwdから起動されても共有ツリーを変更しないので、隔離中でも通す。ただし
+// 「scripts/codex/run-role.js で終わるpath」を名前だけで信用すると、worktreeの中に同じ
+// 名前で置いた任意のscriptもECC自身として通ってしまう。実体pathがこのplugin自身の
+// scriptと一致する場合だけECCのcommandと認める。
+const PLUGIN_ROOT = path.resolve(__dirname, '..', '..');
+const WORKTREE_AWARE_TOOLS = ['acceptance-audit', 'delivery-lifecycle', 'doctor', 'record-event', 'reset', 'run-role'];
 // 展開してからでないと中身が決まらない記法。
 const UNTRACEABLE_EXPANSION = /\$\(|\$\{|`|<\(|>\(/;
 const SEGMENT_SEPARATORS = ';&|\n\r';
@@ -129,6 +164,15 @@ function gitValue(cwd, env, args) {
 
 function branchAt(cwd, env) {
   return gitValue(cwd, env, ['branch', '--show-current']);
+}
+
+// 共有ツリーとして守る範囲は、その作業ツリーの根までである。hookに渡されたcwdを境界に
+// すると、リポジトリのsubdirectoryから起動されたときに、`../../src/x` のような同じ
+// リポジトリ内のpathが境界の外に見え、共有ツリーへの書き込みが通ってしまう。
+// Gitが答えられない場所だけ、projectRootへ落とす。
+function sharedRoot(cwd, env, fallback) {
+  const toplevel = gitValue(cwd, env, ['rev-parse', '--show-toplevel']);
+  return path.resolve(toplevel || fallback || cwd);
 }
 
 function hasExecutableShellControl(command) {
@@ -189,6 +233,10 @@ function realPath(target) {
   }
   return absolute;
 }
+
+const WORKTREE_AWARE_TOOL_PATHS = new Set(
+  WORKTREE_AWARE_TOOLS.map(tool => realPath(path.join(PLUGIN_ROOT, 'scripts', 'codex', `${tool}.js`)))
+);
 
 // worktreeの中のsymlinkが共有ツリーを指していると、字面のpathだけではworktreeの中に
 // 見える。書き込み先は字面と実体の両方で判定し、どちらかが共有ツリーへ抜けるなら拒否する。
@@ -365,17 +413,72 @@ function resolveDirectory(base, target) {
   return base ? path.resolve(base, value) : null;
 }
 
-// `/usr/bin/git` や `"git.exe"` も同じgitである。判定はcommand名だけで行う。
+// `"git.exe"` も同じgitである。判定はcommand名だけで行う。
 function commandName(token) {
   const value = String(token || '').replace(/^[({]+/, '');
   return String(value.split(/[\\/]/).pop() || '').replace(/\.exe$/i, '').toLowerCase();
 }
 
+// 名前で許すのは、PATHから解決される素のcommand名だけにする。`<worktree>/git` や
+// `./sort` のようにpathを付けて起動するprogramは、worktreeの中に同じ名前で置ける。
+// 名前だけを見ると、共有ツリーのcwdで任意のprogramが読み取りcommandとして通ってしまう。
+function isBareCommand(token) {
+  const value = String(token || '').replace(/^[({]+/, '');
+  return value !== '' && !/[\\/]/.test(value) && !/[$`]/.test(value);
+}
+
+// `node <plugin>/scripts/codex/run-role.js ...` のscript pathを実体で解決する。
+// hook自身が同じ値を持つ `$CLAUDE_PLUGIN_ROOT` だけは展開できる。他の変数は展開結果が
+// 決まらないので、ECCのcommandとは認めない。
+function eccScriptPath(token, base, env) {
+  let value = String(token || '');
+  if (!value) return '';
+  const variable = /^\$([A-Za-z_][A-Za-z0-9_]*)/.exec(value);
+  if (variable) {
+    const replacement = String((env || process.env)[variable[1]] || '');
+    if (!replacement) return '';
+    value = replacement + value.slice(variable[0].length);
+  }
+  if (/[$`~*?]/.test(value)) return '';
+  if (!path.isAbsolute(value) && !base) return '';
+  return realPath(path.isAbsolute(value) ? value : path.resolve(base, value));
+}
+
 // `node <plugin>/scripts/codex/run-role.js ...` のような、ECC自身のworktree対応command。
 // `node -e "..."` や `node --require x -e "..."` は任意のcodeを実行するので、node自身の
-// optionを挟まず、最初の引数がそのままscript pathである形だけを認める。
-function isWorktreeAwareTool(name, tokens) {
-  return name === 'node' && WORKTREE_AWARE_TOOL.test(String(tokens[1] || ''));
+// optionを挟まず、最初の引数がそのままscript pathである形だけを認める。script pathは
+// 名前が一致するだけでは足りず、このplugin自身のscriptの実体と一致する必要がある。
+function isWorktreeAwareTool(tokens, base, env) {
+  if (commandName(tokens[0]) !== 'node' || !isBareCommand(tokens[0])) return false;
+  const script = eccScriptPath(tokens[1], base, env);
+  return script !== '' && WORKTREE_AWARE_TOOL_PATHS.has(script);
+}
+
+// 共有ツリーのcwdで通す読み取りcommandは、引数まで読んで初めて読み取りだと言える。
+function isReadOnlyShellCommand(name, args) {
+  if (!READ_ONLY_COMMANDS.has(name)) return false;
+  const unsafe = SHELL_UNSAFE_OPTIONS.get(name);
+  const limit = SHELL_MAX_OPERANDS.has(name) ? SHELL_MAX_OPERANDS.get(name) : Infinity;
+  let operands = 0;
+  for (const argument of args) {
+    const value = String(argument || '');
+    // operandはpathやpatternであり、それ自体ではファイルを作らない。
+    if (!value.startsWith('-') || value === '-') {
+      operands += 1;
+      if (operands > limit) return false;
+      continue;
+    }
+    if (unsafe && (unsafe.has(value.split('=')[0]) || (!value.startsWith('--') && [...value.slice(1)].some(letter => unsafe.has(`-${letter}`))))) {
+      return false;
+    }
+    if (value.startsWith('--')) {
+      const option = value.split('=')[0];
+      if (!SHELL_READ_SAFE_OPTIONS.has(option) && !SHELL_READ_SAFE_NEGATION.test(option)) return false;
+      continue;
+    }
+    if (!SHELL_READ_SAFE_SHORT.test(value)) return false;
+  }
+  return true;
 }
 
 // revisionやpathspecのようなoperandは、それ自体ではファイルを作らない。optionは
@@ -451,11 +554,16 @@ function gitInvocation(args, cwd) {
 // 指しているcommandだけを書き込みとして許可する。commandの中にworktree pathの文字列が
 // 現れるだけでは、そのcommandが共有ツリーを書き換えないことの証明にならない。
 // 共有ツリーのcwdで残せるのは、ファイルを作らない読み取りcommandとgitの読み取り
-// subcommandだけである。追跡できない起動の仕方（wrapper、command置換、展開、`||` を
-// 挟んだcd）は、共有ツリーを書き換えないと言い切れないので拒否する。
-function targetsWorkspace(command, workspace, cwd = process.cwd()) {
-  const shared = path.resolve(cwd || process.cwd());
-  let current = shared;
+// subcommandだけである。読み取りかどうかはcommand名では決まらず、引数まで読んで判定する。
+// 追跡できない起動の仕方（wrapper、command置換、展開、`||` を挟んだcd、pathを付けた
+// 実行ファイル、環境変数の前置き）は、共有ツリーを書き換えないと言い切れないので拒否する。
+function targetsWorkspace(command, workspace, cwd = process.cwd(), options = {}) {
+  const env = options.env || process.env;
+  const start = path.resolve(cwd || process.cwd());
+  // 共有ツリーの境界はGitの主作業ツリーの根であって、hookに渡されたcwdではない。
+  // subdirectoryを実行directoryにすると、`../../src/x` が境界の外に見えてしまう。
+  const shared = path.resolve(options.shared || start);
+  let current = start;
   for (const { text, separator } of splitCommand(command)) {
     // 展開してからでないと、何がどのdirectoryで走るか決まらない。
     if (UNTRACEABLE_EXPANSION.test(text)) return false;
@@ -466,12 +574,18 @@ function targetsWorkspace(command, workspace, cwd = process.cwd()) {
       if (!resolved) return false;
       if (escapesWorktree(workspace, shared, resolved)) return false;
     }
+    // 環境変数の前置きは、gitの書き込み先も、commandがどのprogramに解決されるかも
+    // 差し替える（`PATH=<worktree> cat …`）。GIT_* は実行directoryに関わらず拒否し、
+    // それ以外はworktreeの中で走ることが読み取れる場合だけ通す。
+    let overridesEnvironment = false;
     while (tokens.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) {
       // GIT_DIR や GIT_WORK_TREE はgit自身の書き込み先を差し替える。
       if (/^GIT_/i.test(tokens[0])) return false;
+      overridesEnvironment = true;
       tokens.shift();
     }
-    const name = commandName(tokens[0]);
+    const executable = tokens[0];
+    const name = commandName(executable);
     if (!name) continue;
     if (name === 'cd' || name === 'pushd') {
       // subshellの中のcdは呼び出し元のdirectoryを動かさない。
@@ -488,14 +602,18 @@ function targetsWorkspace(command, workspace, cwd = process.cwd()) {
     }
     if (COMMAND_WRAPPERS.has(name)) return false;
     const inWorktree = confinedToWorktree(workspace, current);
-    if (name === 'git') {
+    if (overridesEnvironment && !inWorktree) return false;
+    if (name === 'git' && isBareCommand(executable)) {
       const { write, location } = gitInvocation(tokens.slice(1), current);
       if (write && !confinedToWorktree(workspace, location)) return false;
       continue;
     }
+    if (inWorktree) continue;
     // git以外のcommandも共有ツリーのファイルを書き換える。worktreeの中で走ることが
-    // 読み取れないなら、副作用を持たない読み取りcommandとECC自身のcommandだけを通す。
-    if (!inWorktree && !READ_ONLY_COMMANDS.has(name) && !isWorktreeAwareTool(name, tokens)) return false;
+    // 読み取れないなら、引数まで見て副作用がないと言える読み取りcommandと、実体が
+    // このplugin自身のscriptであるECCのcommandだけを通す。
+    if (isWorktreeAwareTool(tokens, current, env)) continue;
+    if (!isBareCommand(executable) || !isReadOnlyShellCommand(name, tokens.slice(1))) return false;
   }
   return true;
 }
@@ -641,11 +759,12 @@ function run(rawInput, options = {}) {
   const isEdit = WRITE_TOOLS.has(toolName);
   const isolated = workspace !== path.resolve(cwd);
   if (isolated) {
-    const shared = path.resolve(cwd);
+    const shared = sharedRoot(cwd, env, config.projectRoot);
     if (isEdit) {
       // 払い出したworktreeの外へ書くと、隔離したはずの共有ツリーを再び変更してしまう。
       // 共有ツリー配下だけを拒否し、リポジトリ外のファイルは従来どおり素通しする。
-      const targets = writeTargets(input.tool_input).map(target => path.resolve(shared, target));
+      // 相対pathはtoolの実行directoryから解決し、境界は共有ツリーの根で判定する。
+      const targets = writeTargets(input.tool_input).map(target => path.resolve(cwd, target));
       if (targets.length === 0) {
         return deny(
           `[ECC Delivery Gate] ${toolName} did not name a file to write, so this gate cannot tell whether it stays inside the delivery worktree ${workspace}. ` +
@@ -667,12 +786,14 @@ function run(rawInput, options = {}) {
         );
       }
     }
-    if (toolName === 'Bash' && !targetsWorkspace(input.tool_input && input.tool_input.command, workspace, cwd)) {
+    if (toolName === 'Bash' && !targetsWorkspace(input.tool_input && input.tool_input.command, workspace, cwd, { shared, env })) {
       return deny(
         `[ECC Delivery Gate] This delivery is isolated in the worktree ${workspace}, but the command is not provably confined to that worktree. ` +
           `Write it as \`cd "${workspace}" && ...\` or \`git -C "${workspace}" ...\`. ` +
-          'In the shared working tree only side-effect-free inspection is allowed (read-only `git` subcommands, `ls`, `cat`, `grep`, …) ' +
-          "and ECC's own worktree-aware commands (`scripts/codex/run-role.js`, …), with no output redirection into that tree. " +
+          'In the shared working tree only side-effect-free inspection is allowed (read-only `git` subcommands, `ls`, `cat`, `grep`, …), ' +
+          'checked argument by argument, so an option that writes a file or starts another program (`sort -o …`, `rg --pre …`) is rejected, ' +
+          "and ECC's own worktree-aware commands (`scripts/codex/run-role.js`, …) only when the script is this plugin's own file, " +
+          'with no output redirection into that tree. ' +
           'Forms whose working tree cannot be read from the command itself are rejected: wrappers such as `sh -c` or `xargs`, ' +
           'command substitution and `${...}` expansion, `--git-dir`/`--work-tree`/`GIT_*` overrides, and a `cd` that is not chained with `&&`.'
       );

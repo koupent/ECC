@@ -76,6 +76,8 @@ function test(name, fn) {
 }
 
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-koute-test-'));
+// Delivery Gateは、ECC自身のcommandをplugin本体のscriptの実体pathで見分ける。
+const pluginRoot = path.resolve(__dirname, '..', '..');
 const repo = path.join(temp, 'repo');
 const stateDir = path.join(temp, 'state');
 fs.mkdirSync(path.join(repo, '.git'), { recursive: true });
@@ -493,7 +495,11 @@ test('preparation issues an Issue worktree instead of switching the shared worki
   assert.strictEqual(spawnSync('git', ['add', '.ecc/config.json'], { cwd: fixture }).status, 0);
   assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'require delivery workflow'], { cwd: fixture }).status, 0);
   const baseBranch = spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
-  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-worktree-state') };
+  const fixtureEnv = {
+    ...env,
+    ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-worktree-state'),
+    CLAUDE_PLUGIN_ROOT: pluginRoot
+  };
   const input = { session_id: 'delivery-worktree', cwd: fixture };
   const branch = 'codex/issue-79-worktree-isolation';
   writeState(input, {
@@ -637,7 +643,26 @@ test('preparation issues an Issue worktree instead of switching the shared worki
     'node -e "require(\'fs\').writeFileSync(\'src/product.ts\', \'\')"',
     'echo bypass > src/product.ts',
     'git status --porcelain > src/status.txt',
-    `cd "${ready.worktree_path}" && echo bypass > "${path.join(fixture, 'src', 'product.ts')}"`
+    `cd "${ready.worktree_path}" && echo bypass > "${path.join(fixture, 'src', 'product.ts')}"`,
+    // 読み取り扱いのcommandでも、引数次第で共有ツリーへ書き、外部programを起動する。
+    'sort -o src/product.ts src/product.ts',
+    'sort --output=src/product.ts src/product.ts',
+    'sort --compress-program=./evil src/product.ts',
+    'diff --output=src/product.ts src/product.ts src/product.ts',
+    'tree -o src/product.ts',
+    'uniq src/product.ts src/product.ts',
+    'rg --pre ./evil pattern',
+    'rg --pre=./evil pattern',
+    // 環境変数の前置きは、commandがどのprogramに解決されるかを差し替える。
+    `PATH="${ready.worktree_path}" cat src/product.ts`,
+    // pathを付けた実行ファイルは、名前が同じでもPATHのcommandとは限らない。
+    `"${path.join(ready.worktree_path, 'sort')}" src/product.ts`,
+    './sort src/product.ts',
+    `"${path.join(ready.worktree_path, 'git')}" commit -am "fix"`,
+    // ECCのcommandは名前ではなくplugin本体のscriptの実体で見分ける。
+    'node /tmp/evil/scripts/codex/run-role.js review --session test',
+    `node "${path.join(ready.worktree_path, 'scripts', 'codex', 'run-role.js')}" review --session test`,
+    'node "$ECC_UNKNOWN_ROOT/scripts/codex/run-role.js" review --session test'
   ]) {
     const bypass = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command } });
     const denied = JSON.parse(deliveryGate.run(bypass, { cwd: fixture, env: fixtureEnv }));
@@ -648,9 +673,14 @@ test('preparation issues an Issue worktree instead of switching the shared worki
   for (const command of [
     'git status --porcelain',
     'cat src/product.ts',
+    'sort src/product.ts',
+    'uniq -c src/product.ts',
+    'grep -rn "product" src',
     `cd "${ready.worktree_path}" && npm test`,
     `cd "${ready.worktree_path}" && npm test > report.log`,
-    'node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --request "Review" --session test'
+    `cd "${ready.worktree_path}" && sort -o sorted.txt src/product.ts`,
+    'node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --request "Review" --session test',
+    `node "${path.join(pluginRoot, 'scripts', 'codex', 'acceptance-audit.js')}" --issue 79`
   ]) {
     const allowed = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command } });
     assert.strictEqual(deliveryGate.run(allowed, { cwd: fixture, env: fixtureEnv }), allowed, command);
@@ -752,6 +782,89 @@ test('isolation holds against attached redirections, writing Git arguments, and 
     tool_input: { file_path: path.join(worktreePath, 'src', 'product.ts') }
   });
   assert.strictEqual(deliveryGate.run(worktreeEdit, { cwd: fixture, env: fixtureEnv }), worktreeEdit);
+});
+
+test('isolation holds when the session runs from a subdirectory of the shared working tree', () => {
+  const fixture = createGitFixture('delivery-subdirectory-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  // 単一リポジトリの中にpackageを抱える構成では、cwdがリポジトリの根とは限らない。
+  const subdirectory = path.join(fixture, 'packages', 'app');
+  fs.mkdirSync(subdirectory, { recursive: true });
+  const baseBranch = spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  const branch = 'codex/issue-79-subdirectory';
+  const worktreePath = path.join(temp, 'delivery-subdirectory-worktree');
+  assert.strictEqual(
+    spawnSync('git', ['worktree', 'add', '--quiet', '-b', branch, worktreePath], { cwd: fixture }).status,
+    0
+  );
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-subdirectory-state') };
+  const input = { session_id: 'delivery-subdirectory', cwd: subdirectory };
+  writeState(input, {
+    delivery: {
+      status: 'ready',
+      request_hash: 'subdirectory-fixture',
+      title: 'the shared tree boundary is the repository root',
+      base_branch: baseBranch,
+      issue_number: 79,
+      issue_url: 'https://example.invalid/issues/79',
+      branch,
+      worktree_path: worktreePath,
+      worktree_shared: false,
+      draft_pr_url: null
+    }
+  }, fixtureEnv);
+
+  const decide = payload => JSON.parse(deliveryGate.run(JSON.stringify(payload), { cwd: subdirectory, env: fixtureEnv }));
+  // cwdを境界にすると、`../../src/product.ts` は共有ツリーの外に見えてしまう。
+  for (const toolCall of [
+    { tool_name: 'Edit', tool_input: { file_path: path.join('..', '..', 'src', 'product.ts') } },
+    { tool_name: 'Edit', tool_input: { file_path: path.join(fixture, 'src', 'product.ts') } },
+    { tool_name: 'Write', tool_input: { file_path: path.join(fixture, 'README.md'), content: 'x' } },
+    {
+      tool_name: 'MultiEdit',
+      tool_input: {
+        file_path: path.join(worktreePath, 'src', 'product.ts'),
+        edits: [{ file_path: path.join('..', '..', 'src', 'product.ts'), old_string: 'a', new_string: 'b' }]
+      }
+    },
+    { tool_name: 'NotebookEdit', tool_input: { notebook_path: path.join('..', '..', 'src', 'analysis.ipynb') } }
+  ]) {
+    const denied = decide({ ...input, ...toolCall });
+    assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny', JSON.stringify(toolCall.tool_input));
+    assert.match(denied.hookSpecificOutput.permissionDecisionReason, /delivery worktree/);
+  }
+  // 共有ツリーの根を基準に、worktree側の対応pathを案内する。
+  assert.match(
+    decide({ ...input, tool_name: 'Edit', tool_input: { file_path: path.join('..', '..', 'src', 'product.ts') } })
+      .hookSpecificOutput.permissionDecisionReason,
+    new RegExp(path.join(worktreePath, 'src', 'product.ts').replace(/[\\^$*+?.()|[\]{}]/g, '\\$&'))
+  );
+
+  for (const command of [
+    'echo bypass > ../../src/product.ts',
+    'cd ../.. && git commit -am "fix"',
+    'cd ../.. && touch src/product.ts'
+  ]) {
+    const denied = decide({ ...input, tool_name: 'Bash', tool_input: { command } });
+    assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny', command);
+    assert.match(denied.hookSpecificOutput.permissionDecisionReason, /isolated in the worktree/);
+  }
+
+  // worktreeの中の作業と、共有ツリーの読み取りは、subdirectoryからでも通り続ける。
+  const worktreeEdit = JSON.stringify({
+    ...input,
+    tool_name: 'Edit',
+    tool_input: { file_path: path.join(worktreePath, 'src', 'product.ts') }
+  });
+  assert.strictEqual(deliveryGate.run(worktreeEdit, { cwd: subdirectory, env: fixtureEnv }), worktreeEdit);
+  for (const command of ['git status --porcelain', `cd "${worktreePath}" && npm test`]) {
+    const allowed = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command } });
+    assert.strictEqual(deliveryGate.run(allowed, { cwd: subdirectory, env: fixtureEnv }), allowed, command);
+  }
 });
 
 test('an existing linked worktree is reused, and the shared working tree is never adopted', () => {
@@ -1002,6 +1115,7 @@ test('completion accepts review evidence bound to the delivery worktree, not the
 test('an isolated delivery only allows commands that provably act inside the worktree', () => {
   const shared = path.join(temp, 'targets-shared');
   const workspace = path.join(temp, 'targets-shared-worktrees', 'codex-issue-79');
+  const gateEnv = { CLAUDE_PLUGIN_ROOT: pluginRoot };
   for (const command of [
     `cd "${workspace}" && git commit -am "fix"`,
     `cd "${workspace}" && cd src && git add .`,
@@ -1028,11 +1142,17 @@ test('an isolated delivery only allows commands that provably act inside the wor
     'ls -la src',
     `git diff > "${path.join(workspace, 'delivery.diff')}"`,
     'git log --oneline -5 | head -3',
+    // 読み取りcommandは、引数まで見て副作用がないと言える形なら通り続ける。
+    'sort src/product.ts',
+    'uniq -c src/product.ts',
+    'diff -u src/product.ts src/renamed.ts',
+    'rg --line-number --hidden pattern src',
+    'wc -l src/product.ts',
     // ECC自身のcommandは記録済みDeliveryのworktreeを解決して動く。
     'node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --session delivery',
-    'node /plugin/scripts/codex/acceptance-audit.js --issue 79'
+    `node "${path.join(pluginRoot, 'scripts', 'codex', 'acceptance-audit.js')}" --issue 79`
   ]) {
-    assert.strictEqual(deliveryGate.targetsWorkspace(command, workspace, shared), true, command);
+    assert.strictEqual(deliveryGate.targetsWorkspace(command, workspace, shared, { env: gateEnv }), true, command);
   }
   for (const command of [
     'git commit -am "fix"',
@@ -1099,9 +1219,34 @@ test('an isolated delivery only allows commands that provably act inside the wor
     // worktreeの中に見えても、cdが効いていなければ共有ツリーで走る。
     `cd "${workspace}"; npm test`,
     // ECCのcommandに見せかけた任意のcode実行は通さない。
-    'node --require /plugin/scripts/codex/run-role.js -e "process.exit(0)"'
+    'node --require /plugin/scripts/codex/run-role.js -e "process.exit(0)"',
+    // 名前がECCのscriptと同じでも、plugin本体のscriptでなければECCのcommandではない。
+    'node /plugin/scripts/codex/run-role.js review --session delivery',
+    `node "${path.join(workspace, 'scripts', 'codex', 'run-role.js')}" review --session delivery`,
+    `node "${path.join(pluginRoot, 'scripts', 'codex', 'run-role.js')}.bak" review`,
+    'node "$ECC_UNKNOWN_ROOT/scripts/codex/run-role.js" review',
+    // 読み取り扱いのcommandでも、出力先を指すoptionはファイルを作る。
+    'sort -o src/product.ts src/product.ts',
+    'sort --output=src/product.ts src/product.ts',
+    'sort -osrc/product.ts src/product.ts',
+    'diff --output=src/product.ts src/a src/b',
+    'tree -o src/product.ts',
+    // 二つ目のoperandが出力先になる形も同じ。
+    'uniq src/product.ts src/product.ts',
+    // 外部programを起動するoptionは、読み取りcommandでも任意のcodeを走らせる。
+    'rg --pre ./evil pattern',
+    'rg --pre=./evil pattern',
+    'sort --compress-program=./evil src/product.ts',
+    'file -C -m src/magic',
+    // 環境変数の前置きは、commandがどのprogramに解決されるかを差し替える。
+    `PATH="${workspace}" cat src/product.ts`,
+    'LD_PRELOAD=./evil.so grep pattern src',
+    // pathを付けた実行ファイルは、名前が同じでもPATHのcommandとは限らない。
+    `"${path.join(workspace, 'sort')}" src/product.ts`,
+    './grep pattern src',
+    `"${path.join(workspace, 'git')}" commit -am "fix"`
   ]) {
-    assert.strictEqual(deliveryGate.targetsWorkspace(command, workspace, shared), false, command);
+    assert.strictEqual(deliveryGate.targetsWorkspace(command, workspace, shared, { env: gateEnv }), false, command);
   }
 });
 
