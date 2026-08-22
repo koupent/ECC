@@ -4,7 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
-const { projectFingerprint, readJson, stateRoot } = require('./runtime-state');
+const { projectFingerprintCandidates, projectStateMatches, readJson, stateRoot } = require('./runtime-state');
 
 function command(binary, args, cwd, env) {
   const result = spawnSync(binary, args, {
@@ -23,13 +23,13 @@ function command(binary, args, cwd, env) {
 
 function latestState(cwd, issueNumber, env) {
   const sessionsDir = path.join(stateRoot(env), 'sessions');
-  const project = projectFingerprint(cwd);
+  const projectCandidates = projectFingerprintCandidates(cwd);
   let entries = [];
   try {
     entries = fs.readdirSync(sessionsDir)
       .filter(file => file.endsWith('.json'))
       .map(file => ({ file: path.join(sessionsDir, file), state: readJson(path.join(sessionsDir, file)) }))
-      .filter(entry => entry.state && entry.state.project === project && entry.state.delivery)
+      .filter(entry => entry.state && projectStateMatches(entry.state, cwd, projectCandidates) && entry.state.delivery)
       .filter(entry => !issueNumber ||
         entry.state.delivery.requested_issue_number === issueNumber ||
         entry.state.delivery.issue_number === issueNumber)

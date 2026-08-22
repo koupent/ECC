@@ -57,6 +57,7 @@ function loadConfig(cwd = process.cwd(), env = process.env) {
       repository: env.ECC_INCIDENT_REPOSITORY || incidentHandling.repository || codex.incidentRepository || 'koupent/engineering-environment-kit'
     },
     deliveryWorkflow: env.ECC_DELIVERY_WORKFLOW || project.value.deliveryWorkflow || 'advisory',
+    deliveryWorktree: env.ECC_DELIVERY_WORKTREE || project.value.deliveryWorktree || 'advisory',
     deliveryBaseBranch: env.ECC_DELIVERY_BASE_BRANCH || project.value.deliveryBaseBranch || 'main',
     deliveryCompletion: env.ECC_DELIVERY_COMPLETION || project.value.deliveryCompletion || 'draft-pr',
     mergeGate: {

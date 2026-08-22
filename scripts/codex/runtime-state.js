@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { spawnSync } = require('child_process');
 
 const MAX_LOG_BYTES = 8 * 1024 * 1024;
 
@@ -96,8 +97,58 @@ function contextReady(input = {}, env = process.env) {
   return state.context_status === 'ready' && state.context && typeof state.context === 'object';
 }
 
+function projectRootFromCommonDir(commonDir) {
+  const absolute = path.resolve(commonDir);
+  return path.basename(absolute).toLowerCase() === '.git' ? path.dirname(absolute) : absolute;
+}
+
 function projectFingerprint(cwd = process.cwd()) {
-  return hash(path.resolve(cwd));
+  const root = path.resolve(cwd);
+  const runGit = args => spawnSync('git', args, {
+    cwd: root,
+    encoding: 'utf8',
+    timeout: 5000,
+    windowsHide: true
+  });
+  const worktrees = runGit(['worktree', 'list', '--porcelain']);
+  if (!worktrees.error && worktrees.status === 0) {
+    const primary = String(worktrees.stdout || '').split(/\r?\n/)
+      .find(line => line.startsWith('worktree '));
+    if (primary) return hash(path.resolve(primary.slice('worktree '.length)));
+  }
+  const top = runGit(['rev-parse', '--show-toplevel']);
+  if (!top.error && top.status === 0 && String(top.stdout || '').trim()) {
+    return hash(path.resolve(String(top.stdout).trim()));
+  }
+  return hash(root);
+}
+
+function projectFingerprintCandidates(cwd = process.cwd()) {
+  const root = path.resolve(cwd);
+  const candidates = new Set([projectFingerprint(root), hash(root)]);
+  const top = spawnSync('git', ['rev-parse', '--show-toplevel'], {
+    cwd: root,
+    encoding: 'utf8',
+    timeout: 5000,
+    windowsHide: true
+  });
+  if (!top.error && top.status === 0 && String(top.stdout || '').trim()) {
+    candidates.add(hash(path.resolve(String(top.stdout).trim())));
+  }
+  return candidates;
+}
+
+function projectStateMatches(state, cwd = process.cwd(), preparedCandidates = null) {
+  if (!state || !state.project) return false;
+  const candidates = preparedCandidates || projectFingerprintCandidates(cwd);
+  if (candidates.has(state.project)) return true;
+  const recordedWorktree = state.delivery && state.delivery.worktree;
+  if (!recordedWorktree || state.project !== hash(path.resolve(recordedWorktree))) return false;
+  try {
+    return projectFingerprint(recordedWorktree) === projectFingerprint(cwd);
+  } catch {
+    return false;
+  }
 }
 
 function redactText(value) {
@@ -181,7 +232,10 @@ module.exports = {
   hash,
   incidentFingerprint,
   logPath,
+  projectRootFromCommonDir,
   projectFingerprint,
+  projectFingerprintCandidates,
+  projectStateMatches,
   readEvents,
   readJson,
   readState,

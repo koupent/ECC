@@ -5,15 +5,28 @@ const { spawnSync } = require('child_process');
 const { loadConfig } = require('./config');
 const fs = require('fs');
 const path = require('path');
-const { hash, projectFingerprint, readJson, readState, recordIncident, resolveSessionId, stateRoot, writeState } = require('./runtime-state');
+const {
+  hash,
+  projectFingerprint,
+  projectFingerprintCandidates,
+  projectStateMatches,
+  readJson,
+  readState,
+  recordIncident,
+  resolveSessionId,
+  stateRoot,
+  writeState
+} = require('./runtime-state');
 
 const DELIVERY_REQUEST = /(?:\b(?:implement|fix|change|add|remove|refactor|build|create|update)\b|実装|修正|変更|追加|削除|作成|更新|直して)/i;
 const DELIVERY_COMPLETION_REQUEST = /(?:\b(?:complete|finish|finalize|deliver)\b|\bmerge\s+(?:it|the\s+pr|pr\s*#?\d+)\b|完遂|完了まで|仕上げて|マージまで)/i;
 const NEGATED_DELIVERY_REQUEST = /(?:\b(?:do\s+not|don't|without)\s+(?:implement(?:ing)?|fix(?:ing)?|chang(?:e|ing)|add(?:ing)?|remov(?:e|ing)|refactor(?:ing)?|build(?:ing)?|creat(?:e|ing)|updat(?:e|ing))\b|(?:実装|修正|変更|追加|削除|作成|更新)(?:は)?(?:しないで|しない|しなくてよい|せず|不要)|直さない)/gi;
 const DIAGNOSTIC_REQUEST = /(?:\b(?:investigate|review|analy[sz]e|diagnose|inspect|check)\b|調査|確認|レビュー|分析|診断|調べて|教えて)/i;
 const EXPLICIT_MUTATION_REQUEST = /(?:\b(?:implement|fix|add|remove|refactor|build|create|update)\b|(?:実装|修正|変更|追加|削除|作成|更新|直)(?:を)?(?:して|する|してください|してほしい|したい|せよ))/i;
-const ACTIVE_DELIVERY_STATUSES = new Set(['deferred', 'pending', 'awaiting-branch', 'ready']);
-const PREPARABLE_DELIVERY_STATUSES = new Set(['deferred', 'pending', 'awaiting-branch']);
+const ACTIVE_DELIVERY_CONTINUATION = /(?:\b(?:continue|resume)\b|(?:続けて|継続|再開)(?:ください|して)?)/i;
+const ACTIVE_DELIVERY_REFERENCE = /(?:\b(?:continue|resume)\b|\b(?:this|the|current|same)\s+(?:pr|pull\s+request|issue|delivery)\b|\b(?:review|codex)\s+(?:finding|feedback|comment)s?\b|この(?:PR|プルリクエスト|Issue|イシュー|Delivery)|同じ(?:PR|プルリクエスト|Issue|イシュー|Delivery)|(?:続けて|継続|再開)(?:ください|して)?|(?:レビュー|Codex)の?指摘(?:を)?修正)/i;
+const ACTIVE_DELIVERY_STATUSES = new Set(['deferred', 'pending', 'awaiting-branch', 'awaiting-worktree', 'ready', 'draft-pr']);
+const PREPARABLE_DELIVERY_STATUSES = new Set(['deferred', 'pending', 'awaiting-branch', 'awaiting-worktree']);
 // Gitは `;` `&` `$()` を含むrefを有効と認めるが、そのrefを手渡しの切替コマンドへ
 // 埋めると複数のshell commandとして解釈されうる。この文字集合はshellのmetacharacterを
 // 一切含まないので、通過したrefは追加の引用なしでコマンド文字列へ入れて安全である。
@@ -48,14 +61,96 @@ function slug(value) {
   return ascii || 'task';
 }
 
+function worktreeIdentity(cwd, env = process.env, execute = runCommand) {
+  const root = execute('git', ['rev-parse', '--show-toplevel'], { cwd, env });
+  const resolveGitDir = flag => {
+    try {
+      return path.resolve(execute('git', ['rev-parse', '--path-format=absolute', flag], { cwd, env }));
+    } catch {
+      // --path-format はGit 2.31以降。既存のadvisory環境まで止めないため、
+      // 古いGitではrepo root基準で従来出力を絶対化する。
+      const legacy = execute('git', ['rev-parse', flag], { cwd, env });
+      return path.resolve(cwd, legacy);
+    }
+  };
+  const gitDir = resolveGitDir('--git-dir');
+  const commonDir = resolveGitDir('--git-common-dir');
+  return {
+    root: path.resolve(root),
+    git_dir: gitDir,
+    common_dir: commonDir,
+    isolated: gitDir !== commonDir
+  };
+}
+
 function explicitIssueNumber(request) {
   const match = String(request || '').match(/\bissue\s*#?\s*(\d+)\b/i);
   return match ? Number(match[1]) : null;
 }
 
 function explicitPrNumber(request) {
-  const match = String(request || '').match(/\bpr\s*#?\s*(\d+)\b/i);
+  const value = String(request || '');
+  const match = value.match(/\b(?:pr|pull\s+request)\s*#?\s*(\d+)\b/i) ||
+    value.match(/\/pull\/(\d+)(?:\D|$)/i);
   return match ? Number(match[1]) : null;
+}
+
+function referencesActiveDelivery(delivery, request) {
+  if (!delivery || delivery.status !== 'draft-pr') return false;
+  const requestedIssue = explicitIssueNumber(request);
+  const requestedPr = explicitPrNumber(request);
+  const recordedPrMatch = String(delivery.draft_pr_url || '').match(/\/pull\/(\d+)(?:\D|$)/);
+  const activePr = Number(
+    delivery.pr_number || recordedPrMatch && recordedPrMatch[1] || delivery.requested_pr_number || 0
+  ) || null;
+  const value = String(request || '');
+  if (requestedIssue || requestedPr) {
+    const identityMatches =
+      (!requestedIssue || requestedIssue === Number(delivery.issue_number)) &&
+      (!requestedPr || requestedPr === activePr);
+    return Boolean(identityMatches && (ACTIVE_DELIVERY_CONTINUATION.test(value) || isDeliveryRequest(value)));
+  }
+  if (ACTIVE_DELIVERY_CONTINUATION.test(value)) return true;
+  if (!isDeliveryRequest(value)) return false;
+  return Boolean(
+    (requestedIssue && requestedIssue === Number(delivery.issue_number)) ||
+    (requestedPr && requestedPr === activePr) ||
+    (!requestedIssue && !requestedPr && ACTIVE_DELIVERY_REFERENCE.test(value))
+  );
+}
+
+function worktreeForBranch(branch, cwd, env = process.env, execute = runCommand) {
+  if (!branch) return null;
+  let raw;
+  let nulDelimited = true;
+  try {
+    raw = execute('git', ['worktree', 'list', '--porcelain', '-z'], { cwd, env });
+  } catch {
+    nulDelimited = false;
+    raw = execute('git', ['-c', 'core.quotePath=false', 'worktree', 'list', '--porcelain'], { cwd, env });
+  }
+  const records = nulDelimited
+    ? String(raw || '').split('\0\0').map(block => block.split('\0'))
+    : String(raw || '').split(/\r?\n\r?\n/).map(block => block.split(/\r?\n/));
+  const entries = records.map(lines => {
+    const worktree = lines.find(line => line.startsWith('worktree '));
+    const branchLine = lines.find(line => line.startsWith('branch '));
+    return {
+      worktree: worktree ? worktree.slice('worktree '.length) : '',
+      branch: branchLine ? branchLine.slice('branch refs/heads/'.length) : ''
+    };
+  });
+  return entries.find(entry => entry.worktree && entry.branch === branch) || null;
+}
+
+function claudeWorktreeName(worktreePath) {
+  const parts = path.resolve(worktreePath).split(path.sep);
+  for (let index = parts.length - 3; index >= 0; index -= 1) {
+    if (parts[index] === '.claude' && parts[index + 1] === 'worktrees' && parts[index + 2]) {
+      return parts[index + 2];
+    }
+  }
+  return '';
 }
 
 function normalizeIssueTitle(value) {
@@ -116,18 +211,67 @@ function initializeDelivery(input, request, options = {}) {
     writeState(input, { delivery: deferred, project: projectFingerprint(cwd) }, env);
     return deferred;
   }
-  if (!isDeliveryRequest(request)) return null;
-  if (current.delivery && current.delivery.request_hash === requestHash) return current.delivery;
+  const explicitContinuation = ACTIVE_DELIVERY_CONTINUATION.test(String(request || '')) &&
+    Boolean(explicitIssueNumber(request) || explicitPrNumber(request));
+  if (
+    !isDeliveryRequest(request) &&
+    !referencesActiveDelivery(current.delivery, request) &&
+    !explicitContinuation
+  ) return null;
+  if (
+    current.delivery &&
+    current.delivery.status !== 'draft-pr' &&
+    current.delivery.request_hash === requestHash
+  ) return current.delivery;
   // Claude Code の継続turnでは、ユーザーの追記文面が変わっても同じDeliveryである。
   // 進行中Deliveryを本文ハッシュだけで上書きすると、Context Builder、Issue、branchが
   // 二重に作られるため、完了または明示的な新規Sessionまでは既存Deliveryを維持する。
-  if (isActiveDelivery(current.delivery)) return current.delivery;
+  if (isActiveDelivery(current.delivery)) {
+    const positivelyReferencesActive = referencesActiveDelivery(current.delivery, request);
+    if (
+      current.delivery.status === 'draft-pr' &&
+      positivelyReferencesActive
+    ) {
+      const resumed = {
+        ...current.delivery,
+        // 現在位置が記録済みbranch/worktreeと異なる場合に復旧コマンドを許可できるよう、
+        // prepare可能な状態へ戻す。prepareが同一性を確認してからreadyへ進める。
+        status: options.deferred ? 'deferred' : 'awaiting-branch',
+        branch_switch: null,
+        revision: Number(current.delivery.revision || 1) + 1,
+        review_cycle: null,
+        completed_at: null,
+        committed_head: null,
+        committed_at: null,
+        completion_stage: null,
+        resumed_at: new Date().toISOString()
+      };
+      writeState(input, {
+        delivery: resumed,
+        review_role: null,
+        review_status: null,
+        review_complete: null,
+        review_head: null,
+        review_worktree_clean: false,
+        review_blocking_findings: null,
+        review_round: 0,
+        review_limit_reached: false,
+        review_followups: [],
+        review_followup_issue_url: null
+      }, env);
+      return resumed;
+    }
+    if (current.delivery.status !== 'draft-pr') return current.delivery;
+  }
 
   const delivery = {
     // Plan modeではIssueやbranchをまだ変更しない一方、承認後の同じturnで
     // 実装へ移っても必須Deliveryを迂回できないよう意図だけを先に記録する。
     status: options.deferred ? 'deferred' : 'pending',
+    workflow_mode: 'required',
+    delivery_worktree: config.deliveryWorktree,
     request_hash: requestHash,
+    revision: 1,
     title: titleFromRequest(request, requestHash),
     requested_issue_number: explicitIssueNumber(request),
     requested_pr_number: explicitPrNumber(request),
@@ -152,13 +296,13 @@ function initializeDelivery(input, request, options = {}) {
 
 function pendingSessionForProject(cwd, env = process.env) {
   const sessionsDir = path.join(stateRoot(env), 'sessions');
-  const project = projectFingerprint(cwd);
+  const projectCandidates = projectFingerprintCandidates(cwd);
   let candidates = [];
   try {
     candidates = fs.readdirSync(sessionsDir)
       .filter(file => file.endsWith('.json'))
       .map(file => readJson(path.join(sessionsDir, file)))
-      .filter(state => state && state.project === project && state.delivery &&
+      .filter(state => state && projectStateMatches(state, cwd, projectCandidates) && state.delivery &&
         PREPARABLE_DELIVERY_STATUSES.has(state.delivery.status))
       .sort((left, right) => String(right.updated_at || '').localeCompare(String(left.updated_at || '')));
   } catch {
@@ -264,11 +408,13 @@ function branchSwitchPlan(delivery, branch, currentBranch, options = {}) {
 function prepareDelivery(input = {}, options = {}) {
   const env = options.env || process.env;
   const cwd = options.cwd || input.cwd || process.cwd();
+  const config = loadConfig(cwd, env);
   const state = readState(input, env);
   const delivery = state.delivery;
   if (!delivery || !PREPARABLE_DELIVERY_STATUSES.has(delivery.status)) {
     throw new Error('No pending required delivery task. Submit the implementation request first.');
   }
+  const worktreeMode = delivery.delivery_worktree || config.deliveryWorktree;
 
   try {
     const dirty = runCommand('git', ['status', '--porcelain'], { cwd, env });
@@ -277,7 +423,8 @@ function prepareDelivery(input = {}, options = {}) {
     const currentBranch = runCommand('git', ['branch', '--show-current'], { cwd, env });
     // 手動切替を待っているDeliveryはIssueとbranchを確定済みである。再実行のたびに
     // GitHubへ問い合わせ直すと、切替待ちの間だけ重複探索とIssue作成の副作用が増える。
-    const resumed = delivery.status === 'awaiting-branch' && Boolean(delivery.issue_number) && Boolean(delivery.branch);
+    const resumed = ['deferred', 'awaiting-branch', 'awaiting-worktree'].includes(delivery.status) &&
+      Boolean(delivery.issue_number && delivery.branch);
     let issue = { number: delivery.issue_number, url: delivery.issue_url };
     let branch = delivery.branch;
     let draftPrUrl = delivery.draft_pr_url;
@@ -314,12 +461,90 @@ function prepareDelivery(input = {}, options = {}) {
       draftPrUrl = existingPr ? existingPr.url : delivery.draft_pr_url;
     }
 
+    const identity = worktreeIdentity(cwd, env);
+    const currentWorktreeName = identity.isolated ? claudeWorktreeName(identity.root) : '';
+    if (worktreeMode === 'required' && identity.isolated && !currentWorktreeName) {
+      throw new Error(
+        `Required Delivery is running in a non-Claude linked worktree (${identity.root}); ` +
+        'use EnterWorktree or Claude Code --worktree before continuing.'
+      );
+    }
+    const occupied = worktreeForBranch(branch, cwd, env);
+    const occupiedElsewhere = occupied && path.resolve(occupied.worktree) !== path.resolve(identity.root);
+    const occupiedName = occupiedElsewhere ? claudeWorktreeName(occupied.worktree) : '';
+    if (occupiedElsewhere && !occupiedName) {
+      throw new Error(
+        `Delivery branch ${branch} is checked out in a non-Claude worktree (${occupied.worktree}); ` +
+        'remove that worktree or return the branch to the primary checkout before continuing.'
+      );
+    }
+    const worktreeName = occupiedName || currentWorktreeName || delivery.worktree_name ||
+      `issue-${Number(issue.number)}-${slug(issue.title || delivery.title)}`;
+    if (worktreeMode === 'required' && occupiedElsewhere) {
+      const waiting = {
+        ...delivery,
+        status: 'awaiting-worktree',
+        issue_number: Number(issue.number),
+        issue_url: issue.url,
+        worktree_name: worktreeName,
+        worktree: path.resolve(occupied.worktree),
+        branch,
+        draft_pr_url: draftPrUrl,
+        prepared_at: new Date().toISOString()
+      };
+      writeState(input, { delivery: waiting }, env);
+      return waiting;
+    }
+    if (worktreeMode === 'required' && !identity.isolated) {
+      // 選択済みIssue branchを現在のmain worktreeが保持したままEnterWorktreeすると、
+      // 新worktree側で同じbranchへ切り替えられない。まずbaseへ戻してbranchを解放し、
+      // 次のprepareでawaiting-worktreeへ進める。
+      if (currentBranch === branch && currentBranch !== delivery.base_branch) {
+        const releasing = {
+          ...delivery,
+          status: 'awaiting-branch',
+          issue_number: Number(issue.number),
+          issue_url: issue.url,
+          worktree_name: worktreeName,
+          branch,
+          draft_pr_url: draftPrUrl,
+          branch_switch: branchSwitchPlan(delivery, delivery.base_branch, currentBranch, { cwd, env }),
+          branch_switch_purpose: 'release-for-worktree',
+          prepared_at: new Date().toISOString()
+        };
+        writeState(input, { delivery: releasing }, env);
+        return releasing;
+      }
+      const waiting = {
+        ...delivery,
+        status: 'awaiting-worktree',
+        issue_number: Number(issue.number),
+        issue_url: issue.url,
+        worktree_name: worktreeName,
+        worktree: occupiedName ? path.resolve(occupied.worktree) : null,
+        // EnterWorktree は独自branchを作るため、選択済みIssue branchを失わずに保持する。
+        // Worktreeへ入った後、通常のbranch switch gateでこのbranchへ揃える。
+        branch,
+        draft_pr_url: draftPrUrl,
+        prepared_at: new Date().toISOString()
+      };
+      writeState(input, { delivery: waiting }, env);
+      return waiting;
+    }
+
+    if (worktreeMode === 'required') {
+      if (!currentBranch) throw new Error('Delivery worktree must have a branch; detached HEAD is not allowed.');
+    }
+
     const prepared = {
       ...delivery,
       issue_number: Number(issue.number),
       issue_url: issue.url,
       branch,
       draft_pr_url: draftPrUrl,
+      worktree_name: worktreeName,
+      worktree: identity.root,
+      git_common_dir: identity.common_dir,
       prepared_at: new Date().toISOString()
     };
     // prepareはbranchを切り替えない。生成物が無視される限り `git status --porcelain` は
@@ -374,6 +599,7 @@ if (require.main === module) {
 
 module.exports = {
   branchSwitchPlan,
+  claudeWorktreeName,
   explicitIssueNumber,
   explicitPrNumber,
   deliveryBranch,
@@ -387,8 +613,11 @@ module.exports = {
   parseIssueNumber,
   pendingSessionForProject,
   prepareDelivery,
+  referencesActiveDelivery,
   runCommand,
   selectDeliveryBranch,
   slug,
-  titleFromRequest
+  titleFromRequest,
+  worktreeForBranch,
+  worktreeIdentity
 };

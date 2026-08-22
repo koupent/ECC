@@ -739,6 +739,7 @@ test('delivery completion gate rejects a review that is not bound to the current
   }), rawInput);
   const completed = readState(input, fixtureEnv);
   assert.strictEqual(completed.delivery.status, 'draft-pr');
+  assert.strictEqual(completed.delivery.pr_number, 2);
   assert.strictEqual(completed.delivery.draft_pr_url, 'https://example.invalid/pr/2');
 });
 
