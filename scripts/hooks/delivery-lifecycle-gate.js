@@ -7,13 +7,38 @@ const { loadConfig } = require('../codex/config');
 const { deliveryWorkspace, readState, recordIncident, resolveSessionId, writeState } = require('../codex/runtime-state');
 
 // worktreeの外で走らせるとDeliveryのbranchではなく共有ツリーを変更してしまうGit操作。
-// 読み取りだけのsubcommandは対象にせず、誤検知で調査を止めない。
-const GIT_WRITE_SUBCOMMANDS = new Set([
-  'add', 'am', 'apply', 'checkout', 'cherry-pick', 'clean', 'commit', 'merge',
-  'rebase', 'reset', 'restore', 'revert', 'rm', 'stash', 'switch', 'push', 'worktree'
+// 判定は読み取り側を列挙するfail-closeにする。書き込み側を列挙すると、列挙から漏れた
+// `git mv` のようなsubcommandがそのまま共有ツリーへ届いてしまう。
+const GIT_READ_SUBCOMMANDS = new Set([
+  'blame', 'cat-file', 'check-attr', 'check-ignore', 'check-mailmap', 'check-ref-format',
+  'count-objects', 'describe', 'diff', 'diff-files', 'diff-index', 'diff-tree', 'for-each-ref',
+  'grep', 'help', 'log', 'ls-files', 'ls-remote', 'ls-tree', 'merge-base', 'name-rev',
+  'rev-list', 'rev-parse', 'shortlog', 'show', 'show-branch', 'show-ref', 'status', 'var',
+  'verify-commit', 'verify-tag', 'version', 'whatchanged'
 ]);
-// 値を伴うgitのglobal option。読み飛ばさないとその値をsubcommandと取り違える。
-const GIT_VALUE_OPTIONS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix']);
+// subcommand単位では書き込みもするが、引数がこの列挙だけなら一覧表示しかしない形。
+// 引数にoperandを取る形は読み取りだと確認できないので対象にしない。
+const GIT_READ_ONLY_FORMS = new Map([
+  ['branch', new Set(['', '-a', '--all', '-r', '--remotes', '-l', '--list', '-v', '-vv', '--verbose', '--show-current'])],
+  ['config', new Set(['-l', '--list'])],
+  ['reflog', new Set(['show'])],
+  ['remote', new Set(['', '-v', '--verbose'])],
+  ['stash', new Set(['list'])],
+  ['submodule', new Set(['', 'status'])],
+  ['tag', new Set(['', '-l', '--list', '-n'])],
+  ['worktree', new Set(['list', '--porcelain'])]
+]);
+// gitの作業ツリーやgit dirを実行directoryから引き剥がすglobal option。どのツリーを
+// 書き換えるかコマンド文字列からは追えない。
+const GIT_UNTRACEABLE_OPTIONS = new Set(['--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env']);
+// gitを間接的に起動できるcommand。実際に走るgitのdirectoryもsubcommandも追跡できない。
+const GIT_WRAPPERS = new Set([
+  'bash', 'busybox', 'command', 'dash', 'doas', 'env', 'eval', 'exec', 'find', 'fish', 'ionice', 'ksh',
+  'nice', 'nohup', 'parallel', 'script', 'setsid', 'sh', 'stdbuf', 'sudo', 'time', 'timeout',
+  'watch', 'xargs', 'zsh'
+]);
+// 展開してからでないと中身が決まらない記法。
+const UNTRACEABLE_EXPANSION = /\$\(|\$\{|`|<\(|>\(/;
 const SEGMENT_SEPARATORS = ';&|\n\r';
 
 function deny(reason) {
@@ -75,11 +100,15 @@ function isInside(root, target) {
 }
 
 // commandをshellの区切り文字で分ける。引用符の中の区切り文字はコマンド境界ではない。
-function splitSegments(command) {
+// 各segmentには後続の区切り演算子を添える。`&&` と `||` は `&` `|` と意味が違い、
+// 直前のcommandが成功したかどうかで次のcommandの実行directoryが変わる。
+function splitCommand(command) {
+  const value = String(command || '');
   const segments = [];
   let current = '';
   let quote = null;
-  for (const character of String(command || '')) {
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
     if (quote) {
       current += character;
       if (character === quote) quote = null;
@@ -91,14 +120,20 @@ function splitSegments(command) {
       continue;
     }
     if (SEGMENT_SEPARATORS.includes(character)) {
-      segments.push(current);
+      const doubled = value[index + 1] === character;
+      segments.push({ text: current, separator: doubled ? character + character : character });
+      if (doubled) index += 1;
       current = '';
       continue;
     }
     current += character;
   }
-  segments.push(current);
-  return segments.filter(segment => segment.trim());
+  segments.push({ text: current, separator: '' });
+  return segments.filter(segment => segment.text.trim());
+}
+
+function splitSegments(command) {
+  return splitCommand(command).map(segment => segment.text);
 }
 
 function tokenize(segment) {
@@ -136,51 +171,103 @@ function resolveDirectory(base, target) {
   return base ? path.resolve(base, value) : null;
 }
 
-function gitWriteLocation(args, cwd) {
+function mentionsGit(text) {
+  return /\bgit\b/i.test(String(text || ''));
+}
+
+// `/usr/bin/git` や `"git.exe"` も同じgitである。判定はcommand名だけで行う。
+function commandName(token) {
+  const value = String(token || '').replace(/^[({]+/, '');
+  return String(value.split(/[\\/]/).pop() || '').replace(/\.exe$/i, '').toLowerCase();
+}
+
+function isReadOnlyGit(subcommand, args) {
+  if (!subcommand) return false;
+  if (GIT_READ_SUBCOMMANDS.has(subcommand)) return true;
+  const forms = GIT_READ_ONLY_FORMS.get(subcommand);
+  if (!forms) return false;
+  return args.length === 0 ? forms.has('') : args.every(arg => forms.has(arg));
+}
+
+// gitの実行directoryと、そのsubcommandが書き込むかどうかを読む。追跡できない指定が
+// 混じった書き込みはlocationをnullにして、呼び出し側でfail-closeさせる。
+function gitInvocation(args, cwd) {
   let location = cwd;
-  for (let index = 0; index < args.length; index += 1) {
+  let index = 0;
+  while (index < args.length && args[index].startsWith('-')) {
     const arg = args[index];
     // `-C <path>` と `-C<path>` はどちらもgitの実行directoryを移す。複数指定は累積する。
     if (arg === '-C') {
       location = resolveDirectory(location, args[index + 1]);
-      index += 1;
+      index += 2;
       continue;
     }
     if (arg.startsWith('-C') && arg.length > 2) {
       location = resolveDirectory(location, arg.slice(2));
-      continue;
-    }
-    if (GIT_VALUE_OPTIONS.has(arg)) {
       index += 1;
       continue;
     }
-    if (arg.startsWith('-')) continue;
-    return GIT_WRITE_SUBCOMMANDS.has(arg) ? { write: true, location } : { write: false, location };
+    // `-c core.worktree=...` はgitの書き込み先を実行directoryから引き剥がせる。
+    if (arg === '-c' || arg === '--config-env') {
+      if (/^core\./i.test(String(args[index + 1] || ''))) location = null;
+      index += 2;
+      continue;
+    }
+    if (arg.startsWith('-c') && arg.length > 2) {
+      if (/^core\./i.test(arg.slice(2))) location = null;
+      index += 1;
+      continue;
+    }
+    if (GIT_UNTRACEABLE_OPTIONS.has(arg.split('=')[0])) {
+      location = null;
+      index += arg.includes('=') ? 1 : 2;
+      continue;
+    }
+    index += 1;
   }
-  return { write: false, location };
+  const subcommand = args[index];
+  const rest = args.slice(index + 1);
+  if (isReadOnlyGit(subcommand, rest)) return { write: false, location };
+  // subcommandより前の引数に展開が残っていると、どのツリーを書き換えるか決まらない。
+  // subcommand以降はcommit messageなどが入るため、実行directoryの判定には使わない。
+  if (args.slice(0, index + 1).some(arg => /[$`]/.test(arg))) return { write: true, location: null };
+  return { write: true, location };
 }
 
 // worktreeを払い出しても、親CLIのcwdは共有ツリーのままである。書き込み系のGit操作は、
 // 実行directoryがworktreeへ移っているか（`cd <worktree> && git ...`）、git自身が
 // `-C <worktree>` でそこを指しているときだけ許可する。commandの中にworktree pathの
 // 文字列が現れるだけでは、そのgitが共有ツリーを書き換えないことの証明にならない。
+// 追跡できない起動の仕方（wrapper、command置換、`||` を挟んだcd）は、共有ツリーを
+// 書き換えないと言い切れないので拒否する。
 function targetsWorkspace(command, workspace, cwd = process.cwd()) {
   let current = path.resolve(cwd || process.cwd());
-  for (const segment of splitSegments(command)) {
-    const tokens = tokenize(segment);
-    while (tokens.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) tokens.shift();
-    const name = String(tokens[0] || '').replace(/^[({]+/, '');
+  for (const { text, separator } of splitCommand(command)) {
+    const tokens = tokenize(text);
+    while (tokens.length > 0 && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0]) || /^\d*[<>]/.test(tokens[0]))) {
+      // GIT_DIR や GIT_WORK_TREE はgit自身の書き込み先を差し替える。
+      if (/^GIT_/i.test(tokens[0]) && mentionsGit(text)) return false;
+      tokens.shift();
+    }
+    const name = commandName(tokens[0]);
     if (!name) continue;
+    if (UNTRACEABLE_EXPANSION.test(text) && mentionsGit(text)) return false;
     if (name === 'cd' || name === 'pushd') {
-      current = resolveDirectory(current, tokens[1]);
+      // subshellの中のcdは呼び出し元のdirectoryを動かさない。
+      const target = /[(){}]/.test(text) ? null : resolveDirectory(current, tokens[1]);
+      // cdの結果を次のcommandへ引き継げるのは `&&` のときだけ。`||` は cd が失敗した
+      // 経路なので直前のdirectoryのまま、`;` `|` `&` は成否が分からず追跡不能になる。
+      if (separator === '&&') current = target;
+      else if (separator !== '||') current = null;
       continue;
     }
     if (name === 'popd') {
       current = null;
       continue;
     }
-    if (name !== 'git' && !/[\\/]git(?:\.exe)?$/i.test(name)) continue;
-    const { write, location } = gitWriteLocation(tokens.slice(1), current);
+    if (GIT_WRAPPERS.has(name) && mentionsGit(text)) return false;
+    if (name !== 'git') continue;
+    const { write, location } = gitInvocation(tokens.slice(1), current);
     if (write && !(location && isInside(workspace, location))) return false;
   }
   return true;
@@ -304,8 +391,10 @@ function run(rawInput, options = {}) {
     }
     if (toolName === 'Bash' && !targetsWorkspace(input.tool_input && input.tool_input.command, workspace, cwd)) {
       return deny(
-        `[ECC Delivery Gate] This delivery is isolated in the worktree ${workspace}, but the command would run against the shared working tree. ` +
-          `Run it inside that path, for example \`cd "${workspace}" && ...\` or \`git -C "${workspace}" ...\`.`
+        `[ECC Delivery Gate] This delivery is isolated in the worktree ${workspace}, but the command is not provably a Git operation on that worktree. ` +
+          `Write it as \`cd "${workspace}" && git ...\` or \`git -C "${workspace}" ...\`. ` +
+          'Forms whose target working tree cannot be read from the command itself are rejected: wrappers such as `sh -c` or `xargs`, ' +
+          'command substitution, `--git-dir`/`--work-tree`/`GIT_DIR` overrides, and a `cd` that is not chained with `&&`.'
       );
     }
   }

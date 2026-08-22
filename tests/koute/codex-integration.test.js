@@ -585,6 +585,18 @@ test('preparation issues an Issue worktree instead of switching the shared worki
     JSON.parse(deliveryGate.run(mentionOnly, { cwd: fixture, env: fixtureEnv })).hookSpecificOutput.permissionDecision,
     'deny'
   );
+  // 列挙漏れのsubcommandや、cdの成否に依存する形での共有ツリー書き込みも止める。
+  for (const command of [
+    'git mv src/product.ts src/renamed.ts',
+    `cd "${ready.worktree_path}/missing" || git reset --hard`,
+    'sh -c "git reset --hard"',
+    `git --work-tree "${fixture}" checkout -- .`
+  ]) {
+    const bypass = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command } });
+    const denied = JSON.parse(deliveryGate.run(bypass, { cwd: fixture, env: fixtureEnv }));
+    assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny', command);
+    assert.match(denied.hookSpecificOutput.permissionDecisionReason, /isolated in the worktree/);
+  }
   const readOnly = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: 'git status --porcelain' } });
   assert.strictEqual(deliveryGate.run(readOnly, { cwd: fixture, env: fixtureEnv }), readOnly);
 });
@@ -791,8 +803,17 @@ test('an isolated delivery only allows Git writes that actually run in the workt
     'git -C ../targets-shared-worktrees/codex-issue-79 commit -m "fix"',
     'git status --porcelain',
     'git log --oneline -5',
+    // 一覧表示しかしない形は共有ツリーでも読み取りとして通す。
+    'git branch --show-current',
+    'git worktree list',
+    'git stash list',
+    // 書き込みでも、worktreeを指していれば通る。
+    `git -C "${workspace}" mv src/product.ts src/renamed.ts`,
+    `git -C "${workspace}" branch -D codex/old`,
     `cd "${workspace}" && npm test`,
-    'npm test'
+    'npm test',
+    // gitを起動しないcommandは、文字列にgitが出てきても素通しする。
+    'grep -r "git" docs'
   ]) {
     assert.strictEqual(deliveryGate.targetsWorkspace(command, workspace, shared), true, command);
   }
@@ -805,7 +826,40 @@ test('an isolated delivery only allows Git writes that actually run in the workt
     // 展開が必要なcd先は追跡できないので、worktreeの中だと決めつけない。
     'cd "$DELIVERY_WORKTREE" && git commit -m "fix"',
     `cd "${workspace}" && git -C "${shared}" reset --hard`,
-    `git -C "${workspace}" commit -m "fix"; git reset --hard`
+    `git -C "${workspace}" commit -m "fix"; git reset --hard`,
+    // 列挙していないsubcommandは読み取りだと決めつけず、書き込みとして扱う。
+    'git mv src/product.ts src/renamed.ts',
+    'git branch -D main',
+    'git tag v1.0.0',
+    'git update-ref refs/heads/main HEAD',
+    'git config user.email attacker@example.invalid',
+    'git submodule update --init',
+    'git notes add -m "note"',
+    'git worktree remove ../other',
+    // cdの効果が次のcommandに届くのは `&&` のときだけ。cdが失敗しても、あるいは
+    // 成否に関わらず先へ進む形は、共有ツリーで走りうる。
+    `cd "${workspace}/missing" || git reset --hard`,
+    `cd "${workspace}"; git reset --hard`,
+    `cd "${workspace}" & git reset --hard`,
+    `cd "${workspace}" | git reset --hard`,
+    // subshellのcdは呼び出し元のdirectoryを動かさない。
+    `(cd "${workspace}") && git reset --hard`,
+    // gitを間接的に起動する形は、実際の実行directoryを追跡できない。
+    `sh -c "cd ${workspace} && git reset --hard"`,
+    'eval "git reset --hard"',
+    `env GIT_WORK_TREE="${shared}" git reset --hard`,
+    'echo src/product.ts | xargs git checkout --',
+    `cd "${workspace}" && $(echo git) reset --hard`,
+    'cd "${DELIVERY}" && git reset --hard',
+    '`git reset --hard`',
+    `cd "${workspace}" && git commit -m "$(git -C ${shared} reset --hard)"`,
+    // 作業ツリーやgit dirの差し替えは、cdやpathからは追えない。
+    `GIT_WORK_TREE="${shared}" GIT_DIR="${shared}/.git" git reset --hard`,
+    `cd "${workspace}" && git --git-dir="${shared}/.git" --work-tree="${shared}" reset --hard`,
+    `cd "${workspace}" && git --work-tree "${shared}" checkout -- .`,
+    `cd "${workspace}" && git -c core.worktree="${shared}" reset --hard`,
+    // 絶対pathでgitを呼んでも同じgitである。
+    '/usr/bin/git reset --hard'
   ]) {
     assert.strictEqual(deliveryGate.targetsWorkspace(command, workspace, shared), false, command);
   }

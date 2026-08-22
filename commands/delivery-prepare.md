@@ -45,9 +45,24 @@ The Delivery Gate, the commit observer, `/ecc:code-review`, the Completion Gate 
 the acceptance audit read that worktree only. If the recorded directory is gone or
 now belongs to another repository, they stop and ask you to restore it or reset the
 delivery; none of them falls back to the shared working tree. While the delivery is
-isolated, a write-capable `git` command is allowed only when it actually runs in the
-worktree (`cd "<worktree_path>" && git ...` or `git -C "<worktree_path>" ...`);
-mentioning the path elsewhere in the command line is not enough.
+isolated, a `git` command is allowed only when the gate can read the working tree it
+acts on out of the command line itself, and that tree is the worktree
+(`cd "<worktree_path>" && git ...` or `git -C "<worktree_path>" ...`); mentioning the
+path elsewhere in the command line is not enough. The gate fails closed, so these
+forms are rejected even when they would have run in the worktree:
+
+- A subcommand that is not on the read-only list counts as a write, so a `git`
+  subcommand the gate does not know is never allowed against the shared tree.
+- Indirect invocations (`sh -c`, `eval`, `env`, `xargs`, `find -exec`, `sudo`, …),
+  command substitution and unexpanded variables.
+- `--git-dir`, `--work-tree`, `--namespace`, `-c core.*`, and `GIT_DIR` or
+  `GIT_WORK_TREE` in the command's environment prefix.
+- A `cd` that is not chained to the `git` command with `&&`, or that happens inside
+  a subshell; `cd <worktree>; git ...` and `cd <worktree> || git ...` both run `git`
+  in the shared tree when the `cd` fails.
+
+Read-only inspection of the shared tree (`git status`, `git log`, `git diff`,
+`git branch --show-current`, `git worktree list`, …) stays available.
 
 The branch and base refs must be shell-safe (letters, digits, `.`, `_`, `/`, `-`,
 no leading `-` and no `..`). Git also accepts refs containing `;`, `&` or `$()`,
