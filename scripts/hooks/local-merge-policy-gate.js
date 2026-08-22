@@ -123,6 +123,10 @@ const SUBSTITUTION = '$()';
 // closed rather than being read literally (`"$GH" pr merge`, `-f state="$S"`).
 const UNRESOLVED_TEXT = /\$\S|`/;
 const WRAPPER_OPERAND = /^\d+(?:\.\d+)?[smhd]?$/i;
+// The Codex role runner, matched against a resolved command word or argument.
+// Text that only mentions the path — a heredoc body, a note, a commit message —
+// starts no role, so it must not be read as one (central Issue #75).
+const ROLE_RUNNER = /(?:^|[\\/])run-role\.js$/i;
 const STATUS_ENDPOINT = /(?:\/statuses\/|\/status$)/i;
 const SUCCESS_FIELD = /(?:^|=)state=success$/i;
 const SUCCESS_JSON = /["']state["']\s*:\s*["']success["']/i;
@@ -892,8 +896,22 @@ function isDirectSuccessStatus(command) {
   return executedCommands(command).some(publishesSuccessStatus);
 }
 
+/**
+ * True only when the token list actually starts the Codex role runner, whether
+ * the script is the command word (`scripts/codex/run-role.js review`) or an
+ * argument of an interpreter (`node "$ROOT/scripts/codex/run-role.js" review`).
+ *
+ * @param {string[]} tokens
+ * @returns {boolean}
+ */
+function runsCodexRole(tokens) {
+  return resolveExecutions(tokens).some(execution => (
+    ROLE_RUNNER.test(execution.name) || execution.args.some(argument => ROLE_RUNNER.test(argument))
+  ));
+}
+
 function isCodexRoleRunner(command) {
-  return /(?:^|[\\/])run-role\.js(?:["']?\s|$)/i.test(String(command || ''));
+  return executedCommands(command).some(runsCodexRole);
 }
 
 function run(rawInput, options = {}) {
@@ -911,10 +929,10 @@ function run(rawInput, options = {}) {
   if (config.deliveryCompletion !== 'squash-merge') return rawInput;
 
   const command = String(input.tool_input && input.tool_input.command || '');
-  if (input.tool_input && input.tool_input.run_in_background === true && isCodexRoleRunner(command)) {
+  const { commands, unresolved } = analyzeCommand(command);
+  if (input.tool_input && input.tool_input.run_in_background === true && commands.some(runsCodexRole)) {
     return deny('必須Codex roleはforegroundで完了させてください。backgroundではClaude CLI終了時に子processと外部state証拠が失われます。');
   }
-  const { commands, unresolved } = analyzeCommand(command);
   if (commands.some(mergesPullRequest)) {
     return deny('PRのmergeはCompletion Gateだけが実行できます。Local Merge Gateを通し、通常のStopフローへ戻ってください。');
   }
@@ -945,5 +963,6 @@ module.exports = {
   publishesSuccessStatus,
   resolveExecution,
   resolveExecutions,
-  run
+  run,
+  runsCodexRole
 };

@@ -934,6 +934,29 @@ test('local merge policy blocks merge bypasses and direct success status publica
     }
   });
   assert.strictEqual(localMergePolicy.run(foregroundReview, { cwd: fixture, env }), foregroundReview);
+
+  // A background command that only writes the runner path as text starts no
+  // role, so it must stay allowed (central Issue #75).
+  const backgroundNote = JSON.stringify({
+    cwd: fixture,
+    tool_name: 'Bash',
+    tool_input: {
+      command: "python3 - <<'PY'\nnote = \"scripts/codex/run-role.js must run in the foreground\"\nopen('memory.md', 'w').write(note)\nPY",
+      run_in_background: true
+    }
+  });
+  assert.strictEqual(localMergePolicy.run(backgroundNote, { cwd: fixture, env }), backgroundNote);
+
+  // The runner is still recognized when it is the command word itself.
+  const backgroundDirect = JSON.stringify({
+    cwd: fixture,
+    tool_name: 'Bash',
+    tool_input: { command: 'scripts/codex/run-role.js review --request test', run_in_background: true }
+  });
+  assert.match(
+    JSON.parse(localMergePolicy.run(backgroundDirect, { cwd: fixture, env })).hookSpecificOutput.permissionDecisionReason,
+    /foreground/
+  );
 });
 
 test('delivery completion gate does not allow a required pending delivery to stop silently', () => {
