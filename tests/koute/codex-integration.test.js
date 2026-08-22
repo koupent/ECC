@@ -1502,7 +1502,6 @@ test('an isolated delivery only allows commands that provably act inside the wor
     `cd "${workspace}" && git commit -am "fix"`,
     `cd "${workspace}" && cd src && git add .`,
     `git -C "${workspace}" push origin HEAD`,
-    `git -C "${workspace}" -c user.name=ECC commit -m "fix"`,
     `git -C"${workspace}" restore src/product.ts`,
     'git -C ../targets-shared-worktrees/codex-issue-79 commit -m "fix"',
     'git status --porcelain',
@@ -1511,6 +1510,8 @@ test('an isolated delivery only allows commands that provably act inside the wor
     'git branch --show-current',
     'git worktree list',
     'git stash list',
+    // 設定は読み取る形だけ残す。
+    'git config --list',
     // 書き込みでも、worktreeを指していれば通る。
     `git -C "${workspace}" mv src/product.ts src/renamed.ts`,
     `git -C "${workspace}" branch -D codex/old`,
@@ -1590,6 +1591,23 @@ test('an isolated delivery only allows commands that provably act inside the wor
     `cd "${workspace}" && git --git-dir="${shared}/.git" --work-tree="${shared}" reset --hard`,
     `cd "${workspace}" && git --work-tree "${shared}" checkout -- .`,
     `cd "${workspace}" && git -c core.worktree="${shared}" reset --hard`,
+    // 設定の上書きは、実行directoryがworktreeのままでも共有ツリーへ届くcommandを
+    // gitに起動させる。鍵の名前では安全だと言えない。
+    `git -C "${workspace}" -c alias.destroy="!rm -rf ${shared}/src" destroy`,
+    `git -C "${workspace}" -c alias.destroy="!rm -rf ${shared}/src" status`,
+    `cd "${workspace}" && git -c include.path="${shared}/.git/evil-config" status`,
+    `git -C "${workspace}" -c diff.external=./evil diff`,
+    `git -C "${workspace}" -c core.pager=./evil log --oneline -5`,
+    `git -C "${workspace}" -calias.destroy="!rm -rf ${shared}/src" destroy`,
+    `git -C "${workspace}" --config-env alias.destroy=EVIL destroy`,
+    `git -C "${workspace}" --config-env=alias.destroy=EVIL status`,
+    `git -C "${workspace}" -c user.name=ECC commit -m "fix"`,
+    // gitが起動するprogramの置き場所を差し替える形も、読み取りsubcommandを名乗れる。
+    `git -C "${workspace}" --exec-path=./evil status`,
+    // 設定への書き込みはリポジトリ共通の設定に残り、後のgitを共有ツリーへ向ける。
+    `git -C "${workspace}" config alias.destroy "!rm -rf ${shared}/src"`,
+    `cd "${workspace}" && git config include.path ../evil-config`,
+    `cd "${workspace}" && git config --worktree core.worktree "${shared}"`,
     // 絶対pathでgitを呼んでも同じgitである。
     '/usr/bin/git reset --hard',
     // Gitを使わなくても共有ツリーは書き換えられる。worktreeの中で走ると読み取れない

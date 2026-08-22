@@ -62,6 +62,10 @@ const GIT_READ_SAFE_SHORT = /^-(?:\d+|[abcdefhilmnpqrstuvwxz]|[CEFGLMPSUW])\S*$/
 // gitの作業ツリーやgit dirを実行directoryから引き剥がすglobal option。どのツリーを
 // 書き換えるかコマンド文字列からは追えない。
 const GIT_UNTRACEABLE_OPTIONS = new Set(['--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env']);
+// 設定を書き換えるsubcommand。書き込み先はworktreeではなくリポジトリ共通の設定であり、
+// `alias.x=!<command>` や `include.path` を残せば、以降のgitが共有ツリーへ届くcommandを
+// 起動する。worktreeの中で走っても隔離の外に効くため、実行directoryでは正当化できない。
+const GIT_UNCONFINABLE_SUBCOMMANDS = new Set(['config']);
 // 別のcommandを間接的に起動できるcommand。実際に走るcommandも、その実行directoryも
 // コマンド文字列からは追跡できない。
 const COMMAND_WRAPPERS = new Set([
@@ -629,7 +633,7 @@ function isReadOnlyGit(subcommand, args) {
 // 混じった書き込みはlocationをnullにして、呼び出し側でfail-closeさせる。
 function gitInvocation(args, cwd) {
   let location = cwd;
-  let configOverride = false;
+  let untraceable = false;
   let index = 0;
   while (index < args.length && args[index].startsWith('-')) {
     const arg = args[index];
@@ -644,23 +648,29 @@ function gitInvocation(args, cwd) {
       index += 1;
       continue;
     }
-    // `-c core.worktree=...` はgitの書き込み先を実行directoryから引き剥がせる。
-    // `-c diff.external=...` のような指定は、読み取りsubcommandでも任意のprogramを
-    // 走らせるので、読み取り扱いをやめてworktreeの中だけで通す。
-    if (arg === '-c' || arg === '--config-env') {
-      if (/^core\./i.test(String(args[index + 1] || ''))) location = null;
-      configOverride = true;
-      index += 2;
+    // 設定の上書きは、実行directoryがworktreeのままでもgitの書き込み先と、gitが起動する
+    // programを差し替える（`core.worktree`、`alias.x=!<command>`、`include.path`、
+    // `diff.external`）。安全な鍵を列挙しても、aliasやincludeが指す先の中身までは
+    // command文字列から読めない。鍵を問わず追跡不能として扱い、読み取りsubcommandでも
+    // 通さない。
+    if (arg === '-c' || arg.split('=')[0] === '--config-env') {
+      location = null;
+      untraceable = true;
+      index += arg.includes('=') ? 1 : 2;
       continue;
     }
     if (arg.startsWith('-c') && arg.length > 2) {
-      if (/^core\./i.test(arg.slice(2))) location = null;
-      configOverride = true;
+      location = null;
+      untraceable = true;
       index += 1;
       continue;
     }
+    // 作業ツリーやgit dir、gitが起動するprogramの置き場所を差し替えるglobal optionも、
+    // 読み取りsubcommandを名乗る形（`git --exec-path=<dir> status`）で任意のprogramを
+    // 走らせられる。読み取り扱いをやめて追跡不能にする。
     if (GIT_UNTRACEABLE_OPTIONS.has(arg.split('=')[0])) {
       location = null;
+      untraceable = true;
       index += arg.includes('=') ? 1 : 2;
       continue;
     }
@@ -668,7 +678,11 @@ function gitInvocation(args, cwd) {
   }
   const subcommand = args[index];
   const rest = args.slice(index + 1);
-  if (!configOverride && isReadOnlyGit(subcommand, rest)) return { write: false, location, args: rest };
+  if (!untraceable && isReadOnlyGit(subcommand, rest)) return { write: false, location, args: rest };
+  // 設定への書き込みは、worktreeの中で走ってもリポジトリ共通の設定に残り、後から
+  // `alias.x=!<command>` や `include.path` として共有ツリーへ届くcommandを呼び出せる。
+  // 書き込んだ値が何をするかはこのGateでは読めないので、実行directoryを問わず拒否する。
+  if (GIT_UNCONFINABLE_SUBCOMMANDS.has(subcommand)) return { write: true, location: null, args: rest };
   // subcommandより前の引数に展開が残っていると、どのツリーを書き換えるか決まらない。
   // subcommand以降はcommit messageなどが入るため、実行directoryの判定には使わない。
   if (args.slice(0, index + 1).some(arg => /[$`]/.test(arg))) return { write: true, location: null, args: rest };
@@ -983,7 +997,9 @@ function run(rawInput, options = {}) {
           "and ECC's own worktree-aware commands (`scripts/codex/run-role.js`, …) only when the script is this plugin's own file, " +
           'with no output redirection into that tree and no `--cwd` outside the delivery worktree. ' +
           'Forms whose working tree cannot be read from the command itself are rejected: wrappers such as `sh -c` or `xargs`, ' +
-          'command substitution and `${...}` expansion, `--git-dir`/`--work-tree`/`GIT_*` overrides, a `cd` that is not chained with `&&`, ' +
+          'command substitution and `${...}` expansion, `--git-dir`/`--work-tree`/`GIT_*` overrides, ' +
+          'any `-c <key>=<value>`/`--config-env` override and `git config` itself (an alias or `include.path` can point Git back at the shared tree), ' +
+          'a `cd` that is not chained with `&&`, ' +
           'and quoting the gate cannot parse (an unclosed quote or a trailing backslash). ' +
           'The same boundary applies when this session already runs inside the worktree: the shared working tree and every sibling worktree stay protected.'
       );

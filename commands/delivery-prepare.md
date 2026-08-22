@@ -107,9 +107,15 @@ have run in the worktree:
   `Edit` of the same path are rejected.
 - Indirect invocations (`sh -c`, `eval`, `env`, `xargs`, `find -exec`, `sudo`, …),
   command substitution and `${...}` expansion.
-- `--git-dir`, `--work-tree`, `--namespace`, any `-c <key>=<value>` override (it can
-  point Git at another tree or at an external program), and any `GIT_*` variable in
-  the command's environment prefix.
+- `--git-dir`, `--work-tree`, `--namespace`, `--exec-path`, any `-c <key>=<value>` or
+  `--config-env` override, and any `GIT_*` variable in the command's environment
+  prefix. A configuration override is rejected whatever its key and whatever the
+  subcommand is, including a read-only one: `core.worktree` points Git at another
+  tree, and `alias.…=!<command>`, `include.path` or `diff.external` make Git start a
+  program the gate cannot read. `git config` itself is rejected for the same reason,
+  in the worktree as well: it writes to the repository-wide configuration, so an
+  alias or an `include.path` stored there outlives the command that stored it.
+  `git config --list` stays available as a read.
 - A tool call whose hook payload exceeds the 1 MiB limit and is truncated: the gate
   cannot read the call, so it is denied instead of passed through. Reissue it in
   smaller pieces.
