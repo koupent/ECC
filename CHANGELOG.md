@@ -34,6 +34,8 @@
 - Workspace-write Codex roles no longer pass the mutually exclusive `--sandbox` and `--approve-for-me` flags together.
 - Context Builder now treats explicit operational or acceptance commands that need no repository exploration as valid context-free handoffs instead of recording a false Codex failure.
 - Delivery classification now ignores negated mutation constraints such as "do not change" or `変更せず`, preventing diagnostic and acceptance commands from entering the Issue/branch workflow.
+- python rule packがblackとisortを固定で要求していたため、ruffへ統一したプロジェクトで依存関係に存在しないツールの実行を指示していました。フォーマッター、インポート整列ツール、リンターを役割ごとに設定と依存関係から解決するようにしました。`ruff`は3役割すべてを担えるため、依存関係に`ruff`があるだけでは役割を決めず、その役割の設定が無い場合は単機能ツール（`black`／`isort`／`flake8`／`pylint`）を優先します。`ruff format`とflake8、ruff lintとblackのような混在構成の具体例を決定表として明記しました。
+- `rules/python/fastapi.md`のpath globが`app/`前提で、一般的な`api/main.py`／`api/routers/*.py`レイアウトに一致していませんでした。`api/`、トップレベルの`routers/`、`routes/`を対象に追加しました。
 
 ## 2.0.0 - 2026-06-09
 

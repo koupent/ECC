@@ -11,7 +11,9 @@ paths:
 
 `~/.claude/settings.json` で設定:
 
-- **black/ruff**: 編集後に `.py` ファイルを自動フォーマット
+- **フォーマッター**: 編集後に `.py` ファイルをプロジェクトが設定したフォーマッターで
+  自動フォーマット（`ruff format` と `black` の判別は
+  [coding-style.md](./coding-style.md#フォーマット) を参照）
 - **mypy/pyright**: `.py` ファイル編集後に型チェックを実行
 
 ## 警告

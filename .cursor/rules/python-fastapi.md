@@ -1,16 +1,12 @@
 ---
-paths:
-  - "**/api/**/*.py"
-  - "**/app/**/*.py"
-  - "**/fastapi/**/*.py"
-  - "**/routers/**/*.py"
-  - "**/routes/**/*.py"
-  - "**/*_api.py"
+description: "FastAPI rules extending the Python rules"
+globs: ["**/api/**/*.py", "**/app/**/*.py", "**/fastapi/**/*.py", "**/routers/**/*.py", "**/routes/**/*.py", "**/*_api.py"]
+alwaysApply: false
 ---
 # FastAPI Rules
 
 Use these rules for FastAPI projects alongside the general Python rules. The
-path globs above cover the common FastAPI layouts (`api/`, `app/`, top-level
+glob list above covers the common FastAPI layouts (`api/`, `app/`, top-level
 `routers/` or `routes/`); if the project does not depend on `fastapi`, these
 rules do not apply even when a file matches.
 
@@ -60,5 +56,7 @@ Do not create `SessionLocal()` or long-lived clients inside route handlers.
 - Override the exact dependency used by `Depends`.
 - Clear `app.dependency_overrides` after tests.
 - Prefer async test clients for async applications.
+
+## Reference
 
 See skill: `fastapi-patterns`.

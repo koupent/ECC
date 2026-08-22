@@ -540,7 +540,8 @@ from fastapi import FastAPI
 from mypackage.models import User
 from mypackage.utils import format_name
 
-# Bien: Usar isort para ordenar importaciones automáticamente
+# Bien: Ordenar imports con la herramienta de la que el proyecto ya depende
+# ruff check --select I --fix .   (o, en un proyecto isort: isort .)
 ```
 
 ### __init__.py para Exportaciones del Paquete
@@ -609,14 +610,21 @@ result = "".join(str(item) for item in items)
 
 ### Comandos Esenciales
 
+El formateador, el ordenador de imports y el linter los decide el proyecto, no
+esta skill: resuelve cada uno por separado a partir de `pyproject.toml` y de las
+dependencias declaradas (ver `rules/python/coding-style.md`, Formateo). Los
+comandos siguientes muestran el stack de ruff con los equivalentes para un
+proyecto black/isort en comentarios: ejecuta uno de cada, nunca ambos.
+
 ```bash
 # Formateo de código
-black .
-isort .
+ruff format .                    # o: black .
+
+# Ordenación de imports
+ruff check --select I --fix .    # o: isort .
 
 # Linting
-ruff check .
-pylint mypackage/
+ruff check .                     # o: flake8 . / pylint mypackage/
 
 # Verificación de tipos
 mypy .
@@ -648,18 +656,19 @@ dependencies = [
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
-    "black>=23.0.0",
+    # Un solo stack de formateo: ruff (abajo), o black + isort en su lugar.
     "ruff>=0.1.0",
     "mypy>=1.5.0",
 ]
 
-[tool.black]
-line-length = 88
-target-version = ['py39']
-
 [tool.ruff]
 line-length = 88
+
+[tool.ruff.lint]
 select = ["E", "F", "I", "N", "W"]
+
+[tool.ruff.format]
+docstring-code-format = true
 
 [tool.mypy]
 python_version = "3.9"

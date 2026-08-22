@@ -33,7 +33,7 @@ TypeScript ve JavaScript projeleri için özel kurallar:
 Python projeleri için özel kurallar:
 
 - **coding-style.md** - PEP 8, type annotation'lar, immutability, formatlama araçları
-- **hooks.md** - black/ruff formatlama, mypy/pyright tip kontrolü
+- **hooks.md** - Projenin yapılandırdığı formatlayıcı, mypy/pyright tip kontrolü
 - **patterns.md** - Protocol (duck typing), dataclass'lar, context manager'lar
 - **security.md** - Secret yönetimi, bandit güvenlik taraması
 - **testing.md** - pytest framework, coverage, test organizasyonu

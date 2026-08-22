@@ -542,8 +542,8 @@ from fastapi import FastAPI
 from mypackage.models import User
 from mypackage.utils import format_name
 
-# Good: Use isort for automatic import sorting
-# pip install isort
+# Good: Sort imports with the tool the project already depends on
+# ruff check --select I --fix .   (or, for an isort project: isort .)
 ```
 
 ### __init__.py for Package Exports
@@ -620,14 +620,21 @@ result = buffer.getvalue()
 
 ### Essential Commands
 
+Formatter, import sorter, and linter follow the project, not this skill: resolve
+each one separately from `pyproject.toml` and the declared dependencies (see
+`rules/python/coding-style.md`, Formatting). The commands below show the ruff
+stack with the equivalents for a black/isort project in comments — run one of
+each, never both.
+
 ```bash
 # Code formatting
-black .
-isort .
+ruff format .                    # or: black .
+
+# Import sorting
+ruff check --select I --fix .    # or: isort .
 
 # Linting
-ruff check .
-pylint mypackage/
+ruff check .                     # or: flake8 . / pylint mypackage/
 
 # Type checking
 mypy .
@@ -659,18 +666,19 @@ dependencies = [
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
-    "black>=23.0.0",
+    # One formatter stack only: ruff (below), or black + isort instead.
     "ruff>=0.1.0",
     "mypy>=1.5.0",
 ]
 
-[tool.black]
-line-length = 88
-target-version = ['py39']
-
 [tool.ruff]
 line-length = 88
+
+[tool.ruff.lint]
 select = ["E", "F", "I", "N", "W"]
+
+[tool.ruff.format]
+docstring-code-format = true
 
 [tool.mypy]
 python_version = "3.9"

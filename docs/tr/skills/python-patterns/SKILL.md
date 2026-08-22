@@ -541,8 +541,8 @@ from fastapi import FastAPI
 from mypackage.models import User
 from mypackage.utils import format_name
 
-# İyi: Otomatik import sıralama için isort kullanın
-# pip install isort
+# İyi: Import'ları projenin zaten bağımlı olduğu araçla sıralayın
+# ruff check --select I --fix .   (isort projesinde: isort .)
 ```
 
 ### Paket Export'ları için __init__.py
@@ -619,14 +619,21 @@ result = buffer.getvalue()
 
 ### Temel Komutlar
 
+Formatlayıcı, import sıralayıcı ve linter'ı bu skill değil proje belirler: her
+birini `pyproject.toml` ve bildirilen bağımlılıklardan ayrı ayrı çözün (bkz.
+`rules/python/coding-style.md`, Formatlama). Aşağıdaki komutlar ruff stack'ini,
+yorumlarda da black/isort projeleri için karşılıklarını gösterir — her satırdan
+yalnızca birini çalıştırın.
+
 ```bash
 # Kod formatlama
-black .
-isort .
+ruff format .                    # ya da: black .
+
+# Import sıralama
+ruff check --select I --fix .    # ya da: isort .
 
 # Linting
-ruff check .
-pylint mypackage/
+ruff check .                     # ya da: flake8 . / pylint mypackage/
 
 # Type checking
 mypy .
@@ -658,18 +665,19 @@ dependencies = [
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
-    "black>=23.0.0",
+    # Tek bir formatlama stack'i: ruff (aşağıda) ya da onun yerine black + isort.
     "ruff>=0.1.0",
     "mypy>=1.5.0",
 ]
 
-[tool.black]
-line-length = 88
-target-version = ['py39']
-
 [tool.ruff]
 line-length = 88
+
+[tool.ruff.lint]
 select = ["E", "F", "I", "N", "W"]
+
+[tool.ruff.format]
+docstring-code-format = true
 
 [tool.mypy]
 python_version = "3.9"
