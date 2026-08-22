@@ -80,10 +80,134 @@ const GIT_UNTRACEABLE_OPTIONS = new Set(['--git-dir', '--work-tree', '--namespac
 // 全worktreeで一つしかなく、worktreeの中で走らせた `git stash drop` や `git stash clear` が
 // 別のworktreeや共有ツリーの退避データを消す。Issueが報告した衝突と同じ「他の作業を
 // 巻き添えにする」経路なので、書き込む形は通さず、`git stash list` だけを読み取りとして残す。
-const GIT_WORKTREE_LOCAL_SUBCOMMANDS = new Set([
-  'add', 'am', 'apply', 'checkout', 'cherry-pick', 'clean', 'commit', 'fetch', 'merge', 'mv',
-  'pull', 'push', 'rebase', 'reset', 'restore', 'revert', 'rm', 'switch'
-]);
+// 許可する名前と、その名前で通すoptionは一つの表にまとめる。名前だけを許しても隔離は
+// 成立しない。値に渡した文字列をgitがそのまま実行する形（`git rebase --exec <command>`、
+// `git push --receive-pack=<command>`、`git fetch --upload-pack=<command>`）は、pathではない
+// ので引数の境界検査に掛からず、worktreeの中で走ったまま共有ツリーへ届くcommandを起動する。
+// worktreeの外のrefを動かす形（`git push --delete`、`--mirror`、`git rebase --update-refs`）と、
+// 共有の `refs/stash` を使う `--autostash`、外部の `git-merge-<name>` を呼ぶ `--strategy` も
+// 実行directoryでは正当化できない。subcommandごとに、外部programを起動せず、そのworktreeの
+// 作業ツリー・index・現在のbranchの外へ書かないと確認できたoptionだけを列挙する。
+//   long:   `--name` の形。`--name=<value>` の値はpathとして引数の境界検査が見る。
+//   flags:  値を取らない短いoption。`-am` のようなまとめ書きは1文字ずつ照合する。
+//   values: 値を取る短いoption。その文字から後ろは値なので照合しない（`-m<message>`）。
+const GIT_WRITE_OPTIONS = new Map([
+  ['add', {
+    long: ['--all', '--chmod', '--dry-run', '--force', '--ignore-errors', '--ignore-missing',
+      '--ignore-removal', '--intent-to-add', '--patch', '--pathspec-file-nul', '--pathspec-from-file',
+      '--refresh', '--renormalize', '--sparse', '--update', '--verbose'],
+    flags: 'AfNnpuv',
+    values: ''
+  }],
+  ['am', {
+    long: ['--3way', '--abort', '--continue', '--directory', '--exclude', '--include', '--keep',
+      '--keep-cr', '--message-id', '--quiet', '--quit', '--reject', '--signoff', '--skip', '--whitespace'],
+    flags: '3kqsv',
+    values: 'p'
+  }],
+  ['apply', {
+    long: ['--3way', '--allow-empty', '--binary', '--cached', '--check', '--directory', '--exclude',
+      '--include', '--index', '--numstat', '--quiet', '--recount', '--reject', '--reverse', '--stat',
+      '--summary', '--unidiff-zero', '--verbose', '--whitespace'],
+    flags: '3Rqvz',
+    values: 'Cp'
+  }],
+  ['checkout', {
+    long: ['--conflict', '--detach', '--force', '--guess', '--merge', '--orphan', '--ours', '--patch',
+      '--pathspec-file-nul', '--pathspec-from-file', '--progress', '--quiet', '--recurse-submodules',
+      '--theirs', '--track'],
+    flags: 'fmpq',
+    values: 'bt'
+  }],
+  ['cherry-pick', {
+    long: ['--abort', '--allow-empty', '--allow-empty-message', '--continue', '--ff',
+      '--keep-redundant-commits', '--quit', '--signoff', '--skip'],
+    flags: 'nsx',
+    values: 'm'
+  }],
+  ['clean', { long: ['--dry-run', '--force', '--quiet'], flags: 'dfnqxX', values: 'e' }],
+  ['commit', {
+    long: ['--all', '--allow-empty', '--allow-empty-message', '--amend', '--author', '--branch',
+      '--cleanup', '--date', '--dry-run', '--file', '--fixup', '--include', '--long', '--message',
+      '--only', '--patch', '--porcelain', '--quiet', '--reedit-message', '--reset-author',
+      '--reuse-message', '--short', '--signoff', '--squash', '--status', '--untracked-files', '--verbose'],
+    flags: 'anopqsv',
+    values: 'CFcmtu'
+  }],
+  ['fetch', {
+    long: ['--all', '--atomic', '--deepen', '--depth', '--dry-run', '--force', '--multiple',
+      '--porcelain', '--progress', '--prune', '--quiet', '--recurse-submodules', '--set-upstream',
+      '--shallow-since', '--tags', '--unshallow', '--update-shallow', '--verbose'],
+    flags: 'fnpqtv',
+    values: 'j'
+  }],
+  ['merge', {
+    long: ['--abort', '--allow-unrelated-histories', '--continue', '--edit', '--ff', '--ff-only',
+      '--into-name', '--log', '--message', '--quiet', '--quit', '--signoff', '--squash', '--stat',
+      '--verbose', '--verify-signatures'],
+    flags: 'enqv',
+    values: 'm'
+  }],
+  ['mv', { long: ['--dry-run', '--force', '--verbose'], flags: 'fknv', values: '' }],
+  ['pull', {
+    long: ['--all', '--allow-unrelated-histories', '--deepen', '--depth', '--ff', '--ff-only',
+      '--force', '--log', '--prune', '--quiet', '--rebase', '--set-upstream', '--shallow-since',
+      '--squash', '--stat', '--tags', '--unshallow', '--verbose', '--verify-signatures'],
+    flags: 'fnqrtv',
+    values: 'j'
+  }],
+  ['push', {
+    long: ['--atomic', '--dry-run', '--follow-tags', '--force', '--force-if-includes',
+      '--force-with-lease', '--porcelain', '--progress', '--quiet', '--set-upstream', '--tags',
+      '--thin', '--verbose'],
+    flags: 'fnqtuv',
+    values: ''
+  }],
+  ['rebase', {
+    long: ['--abort', '--committer-date-is-author-date', '--continue', '--ff', '--fork-point',
+      '--ignore-date', '--keep-base', '--onto', '--quiet', '--quit', '--reapply-cherry-picks',
+      '--root', '--signoff', '--skip', '--stat', '--verbose'],
+    flags: 'qv',
+    values: ''
+  }],
+  ['reset', {
+    long: ['--hard', '--keep', '--merge', '--mixed', '--patch', '--pathspec-file-nul',
+      '--pathspec-from-file', '--quiet', '--recurse-submodules', '--soft'],
+    flags: 'pq',
+    values: ''
+  }],
+  ['restore', {
+    long: ['--conflict', '--merge', '--ours', '--overlay', '--patch', '--pathspec-file-nul',
+      '--pathspec-from-file', '--progress', '--quiet', '--recurse-submodules', '--source',
+      '--staged', '--theirs', '--worktree'],
+    flags: 'SWpq',
+    values: 's'
+  }],
+  ['revert', {
+    long: ['--abort', '--continue', '--edit', '--ff', '--mainline', '--quit', '--signoff', '--skip'],
+    flags: 'ens',
+    values: 'm'
+  }],
+  ['rm', {
+    long: ['--cached', '--dry-run', '--force', '--ignore-unmatch', '--pathspec-file-nul',
+      '--pathspec-from-file', '--quiet', '--sparse'],
+    flags: 'fnqr',
+    values: ''
+  }],
+  ['switch', {
+    long: ['--conflict', '--create', '--detach', '--discard-changes', '--force', '--guess', '--merge',
+      '--orphan', '--progress', '--quiet', '--recurse-submodules', '--track'],
+    flags: 'dfmq',
+    values: 'ct'
+  }]
+].map(([name, spec]) => [name, { long: new Set(spec.long), flags: spec.flags, values: spec.values }]));
+// 書き込みとして通す名前は、optionを列挙したこの表の鍵そのものである。
+const GIT_WORKTREE_LOCAL_SUBCOMMANDS = new Set(GIT_WRITE_OPTIONS.keys());
+// 読み取りsubcommandが書き込みの判定へ回るのは、読み取りだと確認できない引数が混じった
+// ときである。その引数で通すのは、作るものが出力先のファイルだけだと言える形に限る。
+// pagerやexternal driverを起動する形（`git grep -O<command>`、`--ext-diff`、`--textconv`）は、
+// worktreeの中で走っていても共有ツリーへ届くcommandを起動するので、ここには並べない。
+const GIT_READ_WRITE_OPTIONS = new Set(['--output']);
 // 許可した名前でも、引数次第で共有refへ書く形がある。`-B` と `-C` は既にあるbranchを強制的に
 // 付け替え（`git checkout -B main`）、`<src>:<dst>` のrefspecはremoteが自リポジトリなら
 // refs/heads/<dst> をそのまま書き換える（`git push . HEAD:main`）。remoteが何を指すかは
@@ -716,6 +840,74 @@ function writesSharedGitState(subcommand, args) {
     values.some(value => !value.startsWith('-') && value.includes(':'));
 }
 
+// 許可した名前でも、optionまで確認しないと隔離は成立しない。列挙にないoptionは、外部
+// programを起動しないともworktreeの外へ書かないとも言えないので通さない。
+function hasAllowedGitOptions(name, args) {
+  const spec = GIT_WRITE_OPTIONS.get(name);
+  const values = args.map(argument => String(argument || ''));
+  if (!spec) {
+    return values.every(value => isReadOnlyGitArgument(value) || GIT_READ_WRITE_OPTIONS.has(value.split('=')[0]));
+  }
+  // `--` から後ろはpathspecであり、`-` で始まっていてもoptionではない。
+  let operandsOnly = false;
+  for (const value of values) {
+    if (operandsOnly || !value.startsWith('-') || value === '-') continue;
+    if (value === '--') {
+      operandsOnly = true;
+      continue;
+    }
+    if (value.startsWith('--')) {
+      const option = value.split('=')[0];
+      // `--no-…` はいずれも機能を止める向きで、外部programも起動しない。
+      if (spec.long.has(option) || GIT_READ_SAFE_NEGATION.test(option)) continue;
+      return false;
+    }
+    const letters = value.slice(1);
+    for (let index = 0; index < letters.length; index += 1) {
+      // 値を取る文字に当たったら、その後ろは値であって、まとめ書きのoptionではない。
+      if (spec.values.includes(letters[index])) break;
+      if (!spec.flags.includes(letters[index])) return false;
+    }
+  }
+  return true;
+}
+
+// remoteをpathで書くと、`<src>:<dst>` を書かなくても既定のrefspecがcommon-dirのrefを
+// そのまま書き換える（`git push .`、`git push ../<共有ツリー>`、`git push /abs/repo main`）。
+// 名前で書かれたremoteの実体はcommand文字列からは読めないが、pathで書かれた形は読めるので、
+// pathに見える語と、実際にファイルとして存在する語を拒否する。branch名（`main`、
+// `codex/issue-79-x`）はどちらにも当たらない。展開しないと実体が決まらない語も、どこへ
+// pushするか読めないので同じく拒否する。
+function namesLocalRepository(base, value) {
+  const text = String(value || '');
+  if (!text) return false;
+  if (text === '.' || text === '..' || text.startsWith('~')) return true;
+  if (path.isAbsolute(text) || /^\.{1,2}[\\/]/.test(text)) return true;
+  const resolved = resolveDirectory(base, text);
+  if (!resolved) return true;
+  try {
+    return fs.existsSync(resolved);
+  } catch {
+    return true;
+  }
+}
+
+function reachesLocalRepository(name, args, location) {
+  if (!GIT_REFSPEC_SUBCOMMANDS.has(name)) return false;
+  return args.some(argument => {
+    const value = String(argument || '');
+    return value !== '' && !value.startsWith('-') && namesLocalRepository(location, value);
+  });
+}
+
+// 実行directoryがworktreeの中でも、このgitがworktreeの外に効くか。共有refと設定への
+// 書き込み、外部programを起動しうるoption、自リポジトリを指すremoteをまとめて見る。
+function leavesWorktreeBoundary(subcommand, args, location) {
+  return writesSharedGitState(subcommand, args) ||
+    !hasAllowedGitOptions(subcommand, args) ||
+    reachesLocalRepository(subcommand, args, location);
+}
+
 function isReadOnlyGit(subcommand, args) {
   if (!subcommand) return false;
   if (GIT_READ_SUBCOMMANDS.has(subcommand)) return args.every(isReadOnlyGitArgument);
@@ -778,8 +970,10 @@ function gitInvocation(args, cwd) {
   // 動かす形（`git update-ref`、`git branch -f`、`git tag -f`）は共有ツリーのHEADが指す
   // branchを実行中に付け替え、設定への書き込みは `alias.x=!<command>` や `include.path` と
   // して残り、後のgitに共有ツリーへ届くcommandを起動させる。実行directoryでは正当化
-  // できないので、locationを持たせずに拒否させる。
-  if (writesSharedGitState(subcommand, rest)) return { write: true, location: null, subcommand, args: rest };
+  // できないので、locationを持たせずに拒否させる。値に渡した文字列をgitがそのまま実行する
+  // option（`git rebase --exec <command>`、`git push --receive-pack=<command>`）も、pathでは
+  // ないため引数の境界検査では止まらない。同じくlocationを持たせずに拒否させる。
+  if (leavesWorktreeBoundary(subcommand, rest, location)) return { write: true, location: null, subcommand, args: rest };
   // subcommandより前の引数に展開が残っていると、どのツリーを書き換えるか決まらない。
   // subcommand以降はcommit messageなどが入るため、実行directoryの判定には使わない。
   if (args.slice(0, index + 1).some(arg => /[$`]/.test(arg))) {
@@ -1186,6 +1380,13 @@ function run(rawInput, options = {}) {
           'because refs and configuration are shared with the tree that has another branch checked out: ' +
           '`git update-ref`, `git branch -f`, `git tag`, `git symbolic-ref`, `git remote`, `git notes`, `git worktree`, ' +
           '`git checkout -B`/`git switch -C`, a `<src>:<dst>` refspec (`git push . HEAD:main`) and any subcommand this gate does not know. ' +
+          'The options of an allowed subcommand are allow-listed per subcommand as well, so an option that makes Git run a command of its own ' +
+          '(`git rebase --exec`/`-x`, `git push --receive-pack=`/`--exec=`, `git fetch --upload-pack=`, `--strategy`, `git rebase -i`) ' +
+          'or that moves refs outside this worktree (`git push --delete`/`-d`/`--mirror`, `git rebase --update-refs`, `--autostash`) is rejected, ' +
+          'and so is a remote written as a path instead of a name, because the default refspec then rewrites the shared refs ' +
+          '(`git push .`, `git push ../<shared>`, `git fetch /abs/repo`); use a named remote such as `origin`. ' +
+          'A read-only subcommand carrying an argument this gate cannot read as side-effect-free is rejected everywhere for the same reason ' +
+          '(`git grep -O<command>`, `--ext-diff`); only `--output=<path inside the worktree>` stays available. ' +
           '`git stash` is rejected there too, in every writing form (`push`, `pop`, `drop`, `clear`): the single shared `refs/stash` ' +
           'also holds what another worktree put aside, so only `git stash list` is allowed; commit on the delivery branch to set work aside. ' +
           'The same boundary applies when this session already runs inside the worktree: the shared working tree and every sibling worktree stay protected.'

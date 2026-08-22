@@ -1679,7 +1679,21 @@ test('an isolated delivery only allows commands that provably act inside the wor
     `cd "${workspace}" && git add src/*.ts`,
     `git -C "${workspace}" add "${workspace}"/src/*.ts`,
     // 引用された `*` や `?` は展開されない。ただの語として通す。
-    `git -C "${workspace}" commit -m "why? handle a*b"`
+    `git -C "${workspace}" commit -m "why? handle a*b"`,
+    // 書き込みsubcommandのoptionも、外部programを起動せずworktreeの外へ書かない形は通り続ける。
+    `git -C "${workspace}" push -u origin HEAD`,
+    `cd "${workspace}" && git push --force-with-lease origin HEAD`,
+    `cd "${workspace}" && git fetch origin main`,
+    `git -C "${workspace}" rebase --continue`,
+    `cd "${workspace}" && git rebase --onto main HEAD~1`,
+    `git -C "${workspace}" commit --amend --no-edit`,
+    `cd "${workspace}" && git add -A`,
+    `git -C "${workspace}" clean -fd src`,
+    `cd "${workspace}" && git reset --hard HEAD~1`,
+    `git -C "${workspace}" apply -p1 patch.diff`,
+    `cd "${workspace}" && git cherry-pick -x abc1234`,
+    `git -C "${workspace}" restore --staged src/product.ts`,
+    `cd "${workspace}" && git checkout -b codex/issue-79-follow-up`
   ]) {
     assert.strictEqual(deliveryGate.targetsWorkspace(command, workspace, shared, { env: gateEnv }), true, command);
   }
@@ -1731,6 +1745,34 @@ test('an isolated delivery only allows commands that provably act inside the wor
     `cd "${workspace}" && git push . HEAD:main`,
     `git -C "${workspace}" fetch . main:main`,
     `cd "${workspace}" && git pull . main:main`,
+    // 値をそのままgitに実行させるoptionは、pathではないので引数の境界検査に掛からないまま
+    // 共有ツリーへ届くcommandを起動する。
+    `git -C "${workspace}" rebase --exec "rm -rf ${shared}/src" HEAD~1`,
+    `cd "${workspace}" && git rebase -x "rm -rf ${shared}/src" HEAD~1`,
+    `cd "${workspace}" && git push --receive-pack="rm -rf ${shared}/src" .`,
+    `git -C "${workspace}" push --exec="rm -rf ${shared}/src" origin HEAD`,
+    `cd "${workspace}" && git fetch --upload-pack="rm -rf ${shared}/src" origin`,
+    `git -C "${workspace}" pull --upload-pack=./evil origin main`,
+    `git -C "${workspace}" merge -s ./evil topic`,
+    `cd "${workspace}" && git merge --strategy=./evil topic`,
+    `cd "${workspace}" && git rebase -i origin/main`,
+    // worktreeの外のrefと、全worktreeで一つしかない退避先へ届くoptionも同じ。
+    `git -C "${workspace}" rebase --update-refs HEAD~2`,
+    `cd "${workspace}" && git rebase --autostash origin/main`,
+    `git -C "${workspace}" pull --autostash origin main`,
+    `cd "${workspace}" && git push --delete origin codex/issue-79-old`,
+    `git -C "${workspace}" push -d origin codex/issue-79-old`,
+    `cd "${workspace}" && git push --mirror origin`,
+    `git -C "${workspace}" apply --unsafe-paths --directory=.. patch.diff`,
+    // remoteをpathで書くと、refspecを書かなくても既定のrefspecが共有refを書き換える。
+    `cd "${workspace}" && git push .`,
+    `git -C "${workspace}" push "${shared}" HEAD`,
+    `cd "${workspace}" && git push ../../targets-shared HEAD`,
+    `git -C "${workspace}" fetch ..`,
+    // 読み取りsubcommandでも、pagerやexternal driverを起動する引数は外部commandを走らせる。
+    `cd "${workspace}" && git grep -O./evil pattern`,
+    `git -C "${workspace}" grep -O "rm -rf ${shared}/src" pattern`,
+    `cd "${workspace}" && git log --ext-diff`,
     // aliasで別名を付けた操作も、Gateからは何をするか読めない。
     `git -C "${workspace}" sync`,
     // cdの効果が次のcommandに届くのは `&&` のときだけ。cdが失敗しても、あるいは
@@ -1933,14 +1975,27 @@ test('an isolated delivery cannot move the branch the shared working tree has ch
     `/usr/bin/git -C "${worktreePath}" update-ref refs/heads/${baseBranch} ${branch}`,
     `cd "${worktreePath}" && ./git branch -f ${baseBranch} ${branch}`,
     `cd "${worktreePath}" && /usr/bin/git config alias.move "!git update-ref refs/heads/${baseBranch} ${branch}"`,
-    `cd "${worktreePath}" && /usr/bin/git stash drop`
+    `cd "${worktreePath}" && /usr/bin/git stash drop`,
+    // 許可したsubcommandでも、値をそのままgitに実行させるoptionと、pathで指したremoteは
+    // 共有refへ届く。どちらもworktreeの中で走る形で書ける。
+    `cd "${worktreePath}" && git rebase --exec "git update-ref refs/heads/${baseBranch} ${branch}" HEAD~1`,
+    `git -C "${worktreePath}" push --receive-pack="git update-ref refs/heads/${baseBranch} ${branch}" .`,
+    `cd "${worktreePath}" && git rebase --update-refs HEAD~1`,
+    `git -C "${worktreePath}" push . HEAD`,
+    `cd "${worktreePath}" && git push "${fixture}" HEAD`,
+    `git -C "${worktreePath}" push --delete origin ${baseBranch}`
   ]) {
     const denied = JSON.parse(deliveryGate.run(bash(command), { cwd: fixture, env: fixtureEnv }));
     assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny', command);
   }
-  // worktreeの中で完結する書き込みは、これまでどおり通る。
-  const allowed = bash(`git -C "${worktreePath}" commit -am "fix in the worktree"`);
-  assert.strictEqual(deliveryGate.run(allowed, { cwd: fixture, env: fixtureEnv }), allowed);
+  // worktreeの中で完結する書き込みは、これまでどおり通る。名前で指したremoteへのpushも同じ。
+  for (const command of [
+    `git -C "${worktreePath}" commit -am "fix in the worktree"`,
+    `git -C "${worktreePath}" push -u origin HEAD`
+  ]) {
+    const allowed = bash(command);
+    assert.strictEqual(deliveryGate.run(allowed, { cwd: fixture, env: fixtureEnv }), allowed, command);
+  }
   // 拒否している間、共有ツリーのbranchは一度も動いていない。
   assert.strictEqual(
     spawnSync('git', ['rev-parse', baseBranch], { cwd: fixture, encoding: 'utf8' }).stdout.trim(),

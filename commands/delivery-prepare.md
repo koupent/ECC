@@ -122,8 +122,12 @@ have run in the worktree:
 - A `git` subcommand that is not on the read-only list counts as a write, so a
   subcommand the gate does not know is never allowed against the shared tree. A
   read-only subcommand also counts as a write as soon as an argument can create a file
-  or start another program (`git diff --output=…`, `--ext-diff`, `git grep -O…`), so
-  only arguments that are known to be side-effect-free pass in the shared tree.
+  or start another program, so only arguments that are known to be side-effect-free
+  pass in the shared tree. Of those arguments only `--output=<path>` stays available in
+  the worktree, and its target is checked like any other path: an argument that makes
+  Git start a program of its own (`--ext-diff`, `--textconv`, `git grep -O<command>`,
+  which runs its value as a pager) is rejected wherever it runs, because the value is
+  not a path and the argument check cannot see what it would do.
 - A `git` write that lands in the shared common directory instead of the worktree, even
   when it provably runs inside the worktree. Refs, remotes, notes and the configuration
   are shared by the main working tree and every worktree, so `git update-ref`,
@@ -145,6 +149,21 @@ have run in the worktree:
   because a refspec writes the named ref directly when the remote is this repository
   (`git push . HEAD:main`, `git fetch . main:main`). Push with a named remote
   (`git push -u origin HEAD`) stays available.
+- The options of an allowed subcommand are allow-listed per subcommand for the same
+  reason, since an option value is not a path and the argument check cannot see what it
+  would do. Rejected are the options that make Git run a command of its own
+  (`git rebase --exec`/`-x`, `git push --receive-pack=`/`--exec=`,
+  `git fetch --upload-pack=`, `--strategy`/`-s`, `git rebase -i`, whose todo list can
+  carry `exec` lines) and the options that write outside this worktree
+  (`git push --delete`/`-d`/`--mirror`, `git rebase --update-refs`, `--autostash`, which
+  uses the shared stash, `git apply --unsafe-paths`). A remote written as a path instead
+  of a name is rejected as well: with a local repository as the remote the default
+  refspec rewrites the shared refs without a `:` anywhere in the command
+  (`git push .`, `git push ../<shared tree>`, `git fetch /abs/repo`). The everyday forms
+  stay available: `git add -A`, `git commit -am …`, `git commit --amend --no-edit`,
+  `git checkout -b`/`git switch -c`, `git rebase --continue`, `git reset --hard`,
+  `git fetch origin main`, `git push -u origin HEAD`,
+  `git push --force-with-lease origin HEAD`.
 - A path that stays inside the worktree only on paper: the gate resolves symbolic
   links, so `cd "<worktree_path>" && echo x > link-to-shared/src/product.ts` and an
   `Edit` of the same path are rejected.
