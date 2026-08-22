@@ -150,6 +150,13 @@ have run in the worktree:
   `Edit` of the same path are rejected.
 - Indirect invocations (`sh -c`, `eval`, `env`, `xargs`, `find -exec`, `sudo`, …),
   command substitution and `${...}` expansion.
+- A command started through a path instead of a bare name (`/usr/bin/git`, `./git`,
+  `"<worktree_path>/sort"`). The command line does not say which program a path names,
+  so the checks tied to a name cannot be applied to it. A path-qualified `git` is
+  rejected wherever it runs, inside the worktree as well: without that, the Git-specific
+  checks above are skipped and `cd "<worktree_path>" && /usr/bin/git update-ref
+  refs/heads/main HEAD` would reach the shared common directory. Use the bare command
+  name.
 - `--git-dir`, `--work-tree`, `--namespace`, `--exec-path`, any `-c <key>=<value>` or
   `--config-env` override, and any `GIT_*` variable in the command's environment
   prefix. A configuration override is rejected whatever its key and whatever the

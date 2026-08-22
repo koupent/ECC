@@ -1774,6 +1774,21 @@ test('an isolated delivery only allows commands that provably act inside the wor
     `cd "${workspace}" && git config --worktree core.worktree "${shared}"`,
     // 絶対pathでgitを呼んでも同じgitである。
     '/usr/bin/git reset --hard',
+    // pathを付けたgitは、名前がgitのままGit専用検査を素通りして一般commandの経路へ流れる。
+    // worktreeの中で走ることだけを根拠に通すと、common-dirの共有領域へ届く書き込みが
+    // そのまま実行できてしまう。実行位置を問わず拒否する。
+    `cd "${workspace}" && /usr/bin/git update-ref refs/heads/main HEAD`,
+    `/usr/bin/git -C "${workspace}" update-ref refs/heads/main HEAD`,
+    `cd "${workspace}" && /usr/bin/git branch -f main HEAD`,
+    `cd "${workspace}" && /usr/bin/git stash drop`,
+    `cd "${workspace}" && /usr/bin/git config alias.destroy "!rm -rf ${shared}/src"`,
+    `cd "${workspace}" && /usr/bin/git tag -f v1.0.0 HEAD`,
+    `cd "${workspace}" && ./git update-ref refs/heads/main HEAD`,
+    `cd "${workspace}" && ../codex-issue-79/git update-ref refs/heads/main HEAD`,
+    `cd "${workspace}" && "${path.join(workspace, 'git')}" update-ref refs/heads/main HEAD`,
+    // 実体が本当にgitかどうかもcommand文字列からは読めない。読み取りに見える形も通さない。
+    `cd "${workspace}" && /usr/bin/git status --porcelain`,
+    `cd "${workspace}" && ./git.exe log --oneline -5`,
     // Gitを使わなくても共有ツリーは書き換えられる。worktreeの中で走ると読み取れない
     // 限り、ファイルを作りうるcommandは通さない。
     'npm test',
@@ -1911,7 +1926,14 @@ test('an isolated delivery cannot move the branch the shared working tree has ch
     `git -C "${worktreePath}" checkout -B ${baseBranch}`,
     `cd "${worktreePath}" && git push . HEAD:refs/heads/${baseBranch}`,
     `git -C "${worktreePath}" tag -f release ${branch}`,
-    `git -C "${worktreePath}" symbolic-ref HEAD refs/heads/${baseBranch}`
+    `git -C "${worktreePath}" symbolic-ref HEAD refs/heads/${baseBranch}`,
+    // pathを付けたgitも同じgitである。名前がgitのままGit専用検査を素通りすると、worktreeの
+    // 中で走る形のまま共有refを書き換えられてしまう。
+    `cd "${worktreePath}" && /usr/bin/git update-ref refs/heads/${baseBranch} ${branch}`,
+    `/usr/bin/git -C "${worktreePath}" update-ref refs/heads/${baseBranch} ${branch}`,
+    `cd "${worktreePath}" && ./git branch -f ${baseBranch} ${branch}`,
+    `cd "${worktreePath}" && /usr/bin/git config alias.move "!git update-ref refs/heads/${baseBranch} ${branch}"`,
+    `cd "${worktreePath}" && /usr/bin/git stash drop`
   ]) {
     const denied = JSON.parse(deliveryGate.run(bash(command), { cwd: fixture, env: fixtureEnv }));
     assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny', command);

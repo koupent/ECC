@@ -868,7 +868,13 @@ function targetsWorkspace(command, workspace, cwd = process.cwd(), options = {})
     // 起動しうる）。worktreeの中で走ることが読み取れるcommandだけを通す。
     if (shellStateMutated && !inWorktree) return false;
     if (mutatesShellState(name, tokens.slice(1))) shellStateMutated = true;
-    if (name === 'git' && isBareCommand(executable)) {
+    if (name === 'git') {
+      // pathを付けたgit（`/usr/bin/git`、`./git`）は、名前がgitのままGit専用検査を素通りし、
+      // worktreeの中で走ることだけを根拠に一般commandとして通ってしまう。本物のgitなら
+      // `update-ref refs/heads/main` や `config` がcommon-dirの共有領域へ届き、worktreeの外に
+      // 効く書き込みになる。実体が本当にgitかどうかもcommand文字列からは決められないので、
+      // pathを付けた形は実行位置を問わず拒否し、素の `git` として書き直させる。
+      if (!isBareCommand(executable)) return false;
       const { write, location, args } = gitInvocation(tokens.slice(1), current);
       if (write && !confinedToWorktree(workspace, location)) return false;
       // worktreeで走るgitでも、引数は外のpathを指せる（`git diff --output=<共有ツリー>/x`）。
@@ -1172,6 +1178,8 @@ function run(rawInput, options = {}) {
           'Forms whose working tree cannot be read from the command itself are rejected: wrappers such as `sh -c` or `xargs`, ' +
           'command substitution and `${...}` expansion, `--git-dir`/`--work-tree`/`GIT_*` overrides, ' +
           'any `-c <key>=<value>`/`--config-env` override and `git config` itself (an alias or `include.path` can point Git back at the shared tree), ' +
+          'a command started through a path instead of a bare name (`/usr/bin/git`, `./git`, `<worktree>/sort`), ' +
+          'which for `git` is rejected inside the worktree as well because the Git-specific checks below cannot be tied to it, ' +
           'a `cd` that is not chained with `&&`, ' +
           'and quoting the gate cannot parse (an unclosed quote or a trailing backslash). ' +
           'Every Git write that lands in the shared common directory instead of this worktree is rejected as well, even from inside it, ' +
