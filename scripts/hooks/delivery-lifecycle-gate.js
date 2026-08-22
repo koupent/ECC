@@ -188,6 +188,15 @@ function run(rawInput, options = {}) {
   const command = String(input.tool_input && input.tool_input.command || '');
   // Worktree削除済みなどの旧stateでも、明示resetだけは復旧経路として常に許可する。
   if (toolName === 'Bash' && isExactLifecycleCommand(command, 'reset')) return rawInput;
+  if (state.delivery.status === 'config-error') {
+    const target = String(input.tool_input && (input.tool_input.file_path || input.tool_input.notebook_path) || '');
+    const repairsProjectConfig = ['Edit', 'Write'].includes(toolName) && target &&
+      path.resolve(cwd, target) === path.resolve(state.delivery.config_path || path.join(cwd, '.ecc', 'config.json'));
+    if (repairsProjectConfig || ['Read', 'Glob', 'Grep'].includes(toolName)) return rawInput;
+    return deny(
+      '[ECC Delivery Gate] .ecc/config.json could not be read or parsed. Repair the recorded config file, reset this Delivery, and submit the request again; completion defaults will not be used.'
+    );
+  }
   if (
     worktreeMode === 'required' &&
     toolName === 'ExitWorktree' &&

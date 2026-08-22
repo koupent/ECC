@@ -4,6 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { loadConfig } = require('./config');
 const { projectFingerprintCandidates, projectStateMatches, readJson, stateRoot } = require('./runtime-state');
 
 function command(binary, args, cwd, env) {
@@ -60,6 +61,9 @@ function audit(options = {}, dependencies = {}) {
 
   const state = entry.state;
   const delivery = state.delivery || {};
+  const projectConfig = loadConfig(cwd, env);
+  const completionMethod = delivery.completion_method || projectConfig.deliveryCompletion;
+  const squashExpected = completionMethod === 'squash-merge';
   const squashMerged = delivery.status === 'merged';
   const gitStatus = execute('git', ['status', '--porcelain'], cwd, env);
   const branch = execute('git', ['branch', '--show-current'], cwd, env);
@@ -87,8 +91,11 @@ function audit(options = {}, dependencies = {}) {
       (delivery.requested_issue_number === issueNumber && delivery.issue_number === issueNumber),
       issueNumber ? `requested=${issueNumber}, selected=${issueNumber}` : 'selected issue',
       `requested=${delivery.requested_issue_number}, selected=${delivery.issue_number}`),
-    check('delivery-stop-gate', ['draft-pr', 'merged'].includes(delivery.status) && Boolean(delivery.completed_at),
-      'draft-pr or merged with completed_at', delivery.status),
+    check('delivery-stop-gate', (squashExpected ? delivery.status === 'merged' : ['draft-pr', 'merged'].includes(delivery.status)) && Boolean(delivery.completed_at),
+      squashExpected ? 'merged with completed_at' : 'draft-pr or merged with completed_at', delivery.status),
+    check('delivery-completion-contract', Boolean(delivery.completion_method) || projectConfig.projectConfigStatus === 'ok',
+      'recorded completion method or readable project config',
+      delivery.completion_method || projectConfig.projectConfigStatus),
     check('delivery-pr-url', squashMerged ? Boolean(delivery.merged_pr_url) : Boolean(delivery.draft_pr_url),
       squashMerged ? 'non-empty merged PR URL' : 'non-empty Draft PR URL',
       squashMerged ? delivery.merged_pr_url : delivery.draft_pr_url),

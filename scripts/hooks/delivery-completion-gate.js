@@ -61,6 +61,7 @@ function verifyCommitStatus(execute, config, head, cwd, env) {
   if (!status || status.state !== 'success') {
     return {
       ok: false,
+      expectedProgress: !status || ['pending', 'queued'].includes(status.state),
       reason: `${config.mergeGate.statusContext} is ${status && status.state || 'missing'} for current HEAD ${head}. Run ${config.mergeGate.command} and retry.`
     };
   }
@@ -140,16 +141,16 @@ function completeBySquashMerge(execute, config, delivery, pr, head, cwd, env) {
   const gate = verifyCommitStatus(execute, config, head, cwd, env);
   if (!gate.ok) return gate;
 
-  if (pr.state === 'MERGED') return { ok: true, pr, status: gate.status };
-
-  if (pr.isDraft) {
-    const ready = execute('gh', ['pr', 'ready', String(pr.number)], cwd, env);
-    if (!ready.ok) return { ok: false, reason: `PR #${pr.number} could not be marked ready: ${ready.stderr || 'gh pr ready failed'}` };
+  if (pr.state !== 'MERGED') {
+    if (pr.isDraft) {
+      const ready = execute('gh', ['pr', 'ready', String(pr.number)], cwd, env);
+      if (!ready.ok) return { ok: false, reason: `PR #${pr.number} could not be marked ready: ${ready.stderr || 'gh pr ready failed'}` };
+    }
+    const merge = execute('gh', ['pr', 'merge', String(pr.number), '--squash', '--match-head-commit', head], cwd, env);
+    if (!merge.ok) return { ok: false, reason: `PR #${pr.number} could not be squash merged: ${merge.stderr || 'gh pr merge failed'}` };
   }
-  const merge = execute('gh', ['pr', 'merge', String(pr.number), '--squash'], cwd, env);
-  if (!merge.ok) return { ok: false, reason: `PR #${pr.number} could not be squash merged: ${merge.stderr || 'gh pr merge failed'}` };
 
-  const view = execute('gh', ['pr', 'view', String(pr.number), '--json', 'state,isDraft,headRefOid,url'], cwd, env);
+  const view = execute('gh', ['pr', 'view', String(pr.number), '--json', 'state,isDraft,headRefOid,url,mergeCommit'], cwd, env);
   if (!view.ok) return { ok: false, reason: `Merged PR could not be confirmed: ${view.stderr || 'gh pr view failed'}` };
   let merged;
   try {
@@ -159,6 +160,9 @@ function completeBySquashMerge(execute, config, delivery, pr, head, cwd, env) {
   }
   if (merged.state !== 'MERGED' || merged.headRefOid !== head) {
     return { ok: false, reason: `GitHub did not confirm PR #${pr.number} as merged for current HEAD ${head}.` };
+  }
+  if (!merged.mergeCommit || !merged.mergeCommit.oid) {
+    return { ok: false, reason: `GitHub did not return the squash merge commit for PR #${pr.number}.` };
   }
   return { ok: true, pr: merged, status: gate.status };
 }
@@ -177,6 +181,9 @@ function run(rawInput, options = {}) {
   const delivery = state.delivery;
   if (!delivery) return rawInput;
   if ((delivery.workflow_mode || config.deliveryWorkflow) !== 'required') return rawInput;
+  if (delivery.status === 'config-error') {
+    return block('The ECC project configuration is invalid. Repair .ecc/config.json, reset the recorded Delivery, and submit the request again; completion defaults will not be used.');
+  }
   if (delivery.status === 'deferred') {
     const permissionMode = String(input.permission_mode || input.permissionMode || '').toLowerCase();
     if (permissionMode === 'plan') return rawInput;
@@ -201,7 +208,18 @@ function run(rawInput, options = {}) {
         `Use Claude Code's EnterWorktree tool with the recorded ${entry}, then run \`/ecc:delivery-prepare\` again.`
     );
   }
-  if (delivery.status !== 'ready') return rawInput;
+  if (!delivery.completion_method && config.projectConfigStatus === 'invalid') {
+    recordIncident({
+      type: 'delivery_completion_config_invalid',
+      severity: 'critical',
+      hook_id: 'delivery-completion',
+      message: 'The completion method was not recorded and the ECC project configuration is invalid.'
+    }, { cwd, env });
+    return block('Delivery completion cannot be selected because .ecc/config.json is invalid and this legacy Delivery has no recorded completion method.');
+  }
+  const completionMethod = delivery.completion_method || config.deliveryCompletion;
+  if (!['ready', 'draft-pr'].includes(delivery.status)) return rawInput;
+  if (delivery.status === 'draft-pr' && completionMethod !== 'squash-merge') return rawInput;
 
   const execute = options.command || command;
 
@@ -232,7 +250,7 @@ function run(rawInput, options = {}) {
 
   const prs = execute('gh', [
     'pr', 'list', '--head', branch,
-    '--state', config.deliveryCompletion === 'squash-merge' ? 'all' : 'open',
+    '--state', completionMethod === 'squash-merge' ? 'all' : 'open',
     '--json', 'url,isDraft,number,body,baseRefName,headRefOid,state'
   ], cwd, env);
   if (!prs.ok) {
@@ -248,13 +266,13 @@ function run(rawInput, options = {}) {
   }
   const matchingHead = entries.filter(pr =>
     pr.headRefOid === head.stdout &&
-    (config.deliveryCompletion !== 'squash-merge' || ['OPEN', 'MERGED'].includes(pr.state || 'OPEN'))
+    (completionMethod !== 'squash-merge' || ['OPEN', 'MERGED'].includes(pr.state || 'OPEN'))
   );
-  const candidate = config.deliveryCompletion === 'squash-merge'
+  const candidate = completionMethod === 'squash-merge'
     ? matchingHead.length === 1 && matchingHead[0]
     : matchingHead.find(pr => pr.isDraft === true);
   if (!candidate) {
-    const detail = config.deliveryCompletion === 'squash-merge' && matchingHead.length > 1
+    const detail = completionMethod === 'squash-merge' && matchingHead.length > 1
       ? `Multiple open PRs exist for ${branch}; keep exactly one.`
       : `No open Draft PR exists for ${branch}. Push the branch and create one with \`gh pr create --draft --base ${delivery.base_branch}\`, linking Issue #${delivery.issue_number}.`;
     return block(detail);
@@ -277,13 +295,15 @@ function run(rawInput, options = {}) {
     );
   }
 
-  if (config.deliveryCompletion === 'squash-merge') {
+  if (completionMethod === 'squash-merge') {
     const completion = completeBySquashMerge(execute, config, delivery, candidate, head.stdout, cwd, env);
     if (!completion.ok) {
-      recordIncident(
-        { type: 'delivery_squash_merge_blocked', severity: 'minor', message: completion.reason, hook_id: 'delivery-completion' },
-        { cwd, env }
-      );
+      if (!completion.expectedProgress) {
+        recordIncident(
+          { type: 'delivery_squash_merge_blocked', severity: 'minor', message: completion.reason, hook_id: 'delivery-completion' },
+          { cwd, env }
+        );
+      }
       return block(completion.reason);
     }
     writeState(input, {
@@ -294,6 +314,7 @@ function run(rawInput, options = {}) {
         draft_pr_url: candidate.url,
         merged_pr_url: completion.pr.url || candidate.url,
         merged_head: head.stdout,
+        merge_commit: completion.pr.mergeCommit.oid,
         completed_at: new Date().toISOString()
       }
     }, env);

@@ -27,10 +27,23 @@ function readProjectConfig(cwd = process.cwd(), env = process.env) {
   const file = env.ECC_PROJECT_CONFIG
     ? path.resolve(env.ECC_PROJECT_CONFIG)
     : path.join(root, '.ecc', 'config.json');
+  let source;
   try {
-    return { root, file, exists: true, value: JSON.parse(fs.readFileSync(file, 'utf8')) };
-  } catch {
-    return { root, file, exists: false, value: {} };
+    source = fs.readFileSync(file, 'utf8');
+  } catch (error) {
+    return {
+      root,
+      file,
+      exists: false,
+      status: error && error.code === 'ENOENT' ? 'missing' : 'invalid',
+      error: String(error && (error.code || error.message) || 'read failure'),
+      value: {}
+    };
+  }
+  try {
+    return { root, file, exists: true, status: 'ok', error: null, value: JSON.parse(source) };
+  } catch (error) {
+    return { root, file, exists: false, status: 'invalid', error: String(error.message || error), value: {} };
   }
 }
 
@@ -42,6 +55,8 @@ function loadConfig(cwd = process.cwd(), env = process.env) {
   return {
     projectRoot: project.root,
     projectConfigPath: project.file,
+    projectConfigStatus: project.status,
+    projectConfigError: project.error,
     projectEnabled: project.exists,
     enabled: project.exists && envEnabled(env.ECC_CODEX_ENABLED, codex.enabled !== false),
     hookProfile: env.ECC_HOOK_PROFILE || project.value.profile || 'standard',
