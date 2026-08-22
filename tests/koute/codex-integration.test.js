@@ -851,7 +851,23 @@ test('local merge policy blocks merge bypasses and direct success status publica
     'gh --repo acme/example pr merge 12 --squash',
     // A payload assembled by an expansion cannot be cleared as non-success.
     'STATE=success; gh api repos/acme/example/statuses/abc -f state="$STATE"',
-    'STATE=success; curl -X POST https://api.github.com/repos/acme/example/statuses/abc -d "state=$STATE"'
+    'STATE=success; curl -X POST https://api.github.com/repos/acme/example/statuses/abc -d "state=$STATE"',
+    // An argument can be the command line itself: `env -S` splits and runs it,
+    // and `find` runs the words after `-exec` up to `;` or `+`.
+    "env -S 'gh pr merge 12 --squash'",
+    "env --split-string='gh pr merge 12 --squash'",
+    'find . -name "*.md" -exec gh pr merge 12 --squash \\;',
+    "find . -exec sh -c 'gh pr merge 12 --squash' \\;",
+    "CMD='gh pr merge 12 --squash'; env -S \"$CMD\"",
+    // A gh operand built by an expansion or by ANSI-C quoting is unknown text
+    // at run time, so it can still be the subcommand, the verb or the endpoint.
+    'P=pr; gh "$P" merge 12 --squash',
+    'M=merge; gh pr "$M" 12 --squash',
+    "gh $'pr' merge 12 --squash",
+    'URL=repos/acme/example/statuses/abc; gh api "$URL" -f state=success',
+    'STATE=success; gh api "$URL" -f state="$STATE"',
+    'URL=repos/acme/example/statuses/abc; gh api "$URL" --input body.json',
+    'URL=https://api.github.com/repos/acme/example/statuses/abc; curl -X POST "$URL" -d \'{"state":"success"}\''
   ];
   for (const command of denied) {
     const decision = JSON.parse(localMergePolicy.run(bash(command), { cwd: fixture, env }));
@@ -884,7 +900,16 @@ test('local merge policy blocks merge bypasses and direct success status publica
     // Only success is reserved for the merge gate; other states stay available.
     'gh api repos/acme/example/statuses/abc -f state=failure -f context="Local Merge Gate"',
     // An unresolved binary that sends no request only mentions the endpoint.
-    '"$PYTHON" scripts/report.py --url https://api.github.com/repos/acme/example/statuses/abc'
+    '"$PYTHON" scripts/report.py --url https://api.github.com/repos/acme/example/statuses/abc',
+    // A delegated command is judged by what it really runs, and `-exec` outside
+    // `find` is an ordinary word.
+    'find . -name "*.js" -exec grep -l "gh pr merge" {} +',
+    'echo -exec gh pr merge 12 --squash',
+    "env -S 'echo the merge stays with the completion gate'",
+    // An endpoint this gate cannot read is not a status post when the field the
+    // request writes is readable and is not the commit state.
+    'gh api "repos/$REPO/issues/1/comments" -f body="$MSG"',
+    'curl -X POST "$WEBHOOK" -d "text=delivery ready"'
   ];
   for (const command of allowedCommands) {
     const allowed = bash(command);
@@ -955,6 +980,30 @@ test('local merge policy blocks merge bypasses and direct success status publica
   });
   assert.match(
     JSON.parse(localMergePolicy.run(backgroundDirect, { cwd: fixture, env })).hookSpecificOutput.permissionDecisionReason,
+    /foreground/
+  );
+
+  // The path only starts a role where a script is executed: printing it or
+  // writing it into a commit message starts nothing (central Issue #75).
+  const backgroundText = [
+    'echo scripts/codex/run-role.js',
+    'git commit -m "run scripts/codex/run-role.js in the foreground"',
+    'node scripts/ci/project-verify.js --json'
+  ];
+  for (const command of backgroundText) {
+    const allowed = JSON.stringify({ cwd: fixture, tool_name: 'Bash', tool_input: { command, run_in_background: true } });
+    assert.strictEqual(localMergePolicy.run(allowed, { cwd: fixture, env }), allowed, command);
+  }
+
+  // A script path this gate cannot read sits in the executed position, so it
+  // could be the runner and fails closed.
+  const backgroundUnresolvedScript = JSON.stringify({
+    cwd: fixture,
+    tool_name: 'Bash',
+    tool_input: { command: 'R=scripts/codex/run-role.js; node "$R" review --request test', run_in_background: true }
+  });
+  assert.match(
+    JSON.parse(localMergePolicy.run(backgroundUnresolvedScript, { cwd: fixture, env })).hookSpecificOutput.permissionDecisionReason,
     /foreground/
   );
 });

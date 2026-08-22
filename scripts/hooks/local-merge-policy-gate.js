@@ -32,9 +32,29 @@ const WRAPPER_VALUE_OPTIONS = {
   ])
 };
 
+// Wrapper options whose value is a command line the wrapper runs itself:
+// `env -S 'gh pr merge 12'` splits the string into words and executes them, so
+// the value is parsed as a command instead of skipped as a plain operand.
+const SPLIT_STRING_OPTIONS = {
+  env: new Set(['-S', '--split-string'])
+};
+
 // Shells that execute their `-c` operand as a script, so that operand is parsed
 // as its own command instead of being treated as inert text.
 const SHELL_BINARIES = new Set(['bash', 'busybox', 'dash', 'ksh', 'sh', 'zsh']);
+
+// Interpreters that execute the script file named by their first operand. The
+// role runner is only started from that position: `echo scripts/codex/run-role.js`
+// names the same path and starts nothing (central Issue #75).
+const SCRIPT_INTERPRETERS = new Set(['bun', 'deno', 'node', 'nodejs', 'ts-node', 'tsx']);
+
+// Subcommands those interpreters accept before the script path (`deno run app.ts`).
+const INTERPRETER_SUBCOMMANDS = new Set(['exec', 'run']);
+
+// `find` actions that execute the words after them, up to `;` or `+`, as a
+// command of their own: `find . -exec gh pr merge 12 \;` really merges.
+const FIND_EXEC_ACTIONS = new Set(['-exec', '-execdir', '-ok', '-okdir']);
+const FIND_EXEC_TERMINATORS = new Set([';', '+']);
 
 // Reserved words that only introduce a command instead of being one. Without
 // them `if true; then gh pr merge 12; fi` would resolve `then` as the executed
@@ -82,6 +102,15 @@ const FILE_BODY_OPTIONS = {
   wget: new Set(['--body-file', '--post-file'])
 };
 
+// Options of the HTTP clients whose value is not the request target. They are
+// consumed so a header or an output path is never read as the endpoint, and so
+// the endpoint operand of `curl -H "$AUTH" "$URL"` stays visible.
+const CLIENT_VALUE_OPTIONS = new Set([
+  '-A', '-C', '-D', '-E', '-H', '-K', '-O', '-P', '-U', '-b', '-c', '-e', '-m', '-o', '-u', '-w', '-y', '-z',
+  '--connect-timeout', '--cookie', '--directory-prefix', '--header', '--max-time', '--output',
+  '--output-document', '--referer', '--retry', '--user', '--user-agent', '--write-out'
+]);
+
 const NO_OPTIONS = new Set();
 
 /** @param {Record<string, Set<string>>} map */
@@ -123,11 +152,16 @@ const SUBSTITUTION = '$()';
 // closed rather than being read literally (`"$GH" pr merge`, `-f state="$S"`).
 const UNRESOLVED_TEXT = /\$\S|`/;
 const WRAPPER_OPERAND = /^\d+(?:\.\d+)?[smhd]?$/i;
-// The Codex role runner, matched against a resolved command word or argument.
-// Text that only mentions the path — a heredoc body, a note, a commit message —
-// starts no role, so it must not be read as one (central Issue #75).
+// The Codex role runner, matched against a command word or the script operand
+// of an interpreter. Text that only mentions the path — a heredoc body, a note,
+// a commit message — starts no role, so it must not be read as one (central
+// Issue #75).
 const ROLE_RUNNER = /(?:^|[\\/])run-role\.js$/i;
 const STATUS_ENDPOINT = /(?:\/statuses\/|\/status$)/i;
+// `name=value` request field, used to tell a payload that could set the commit
+// status apart from one that writes another field (`-f body="$MSG"`).
+const REQUEST_FIELD = /^([A-Za-z_][A-Za-z0-9_.-]*)=([\s\S]*)$/;
+const STATE_FIELD_NAME = /^state$/i;
 const SUCCESS_FIELD = /(?:^|=)state=success$/i;
 const SUCCESS_JSON = /["']state["']\s*:\s*["']success["']/i;
 const MUTATING_METHOD = /^(?:post|put|patch)$/i;
@@ -343,7 +377,9 @@ function isBraceGroupClose(source, index) {
  * decision on real argument positions: heredoc bodies are skipped, quotes are
  * resolved into token values, redirection operators and their targets are
  * dropped (`gh pr </dev/null merge 12` still merges), and command
- * substitutions are returned for separate parsing.
+ * substitutions are returned for separate parsing. A command another program
+ * runs on behalf of the caller (`env -S`, `find -exec`) is an argument position
+ * that still executes, so it joins the returned commands.
  *
  * @param {string} source
  * @returns {{ commands: string[][], nested: string[], unresolved: boolean }}
@@ -556,11 +592,26 @@ function tokenizeScript(source) {
 
   const nested = [...substitutions];
   let unresolved = false;
-  for (const detail of details) {
-    nested.push(...shellScriptArguments(detail.tokens));
+  // `details` grows while it is walked: a delegated command is analyzed like any
+  // other, so `find . -exec env -S 'gh pr merge 12' \;` is followed to the end.
+  // Each delegation drops at least its own binary and action word, so the token
+  // lists get strictly shorter and the walk terminates.
+  for (let index = 0; index < details.length; index += 1) {
+    const detail = details[index];
+    const delegatedScripts = [];
+    nested.push(...shellScriptArguments(detail.tokens, delegatedScripts));
     const stdin = shellStdinScripts(detail);
     nested.push(...stdin.scripts);
     if (stdin.unresolved || executesDynamicScript(detail)) unresolved = true;
+    for (const script of delegatedScripts) {
+      nested.push(script);
+      // `env -S "$CMD"` runs a command line this gate cannot read.
+      if (UNRESOLVED_TEXT.test(script)) unresolved = true;
+    }
+    for (const delegated of delegatedCommands(detail.tokens)) {
+      commands.push(delegated);
+      details.push({ tokens: delegated, expanded: [], stdin: [], inputFromUnknown: false });
+    }
   }
   return { commands, nested, unresolved };
 }
@@ -615,10 +666,15 @@ function binaryName(token) {
  * names an unknown binary, so it resolves to {@link UNRESOLVED_BINARY} and its
  * arguments are still checked.
  *
+ * A wrapper option that carries a whole command line is not an operand of the
+ * wrapper: `env -S 'gh pr merge 12'` executes its value, so the value is
+ * reported through `delegated` and parsed as a script of its own.
+ *
  * @param {string[]} tokens
+ * @param {string[]} [delegated] receives command lines a wrapper option runs
  * @returns {{ name: string, args: string[] }[]}
  */
-function resolveExecutions(tokens) {
+function resolveExecutions(tokens, delegated) {
   const executions = [];
   let index = 0;
   let wrapped = false;
@@ -638,11 +694,27 @@ function resolveExecutions(tokens) {
 
     wrapped = true;
     const values = WRAPPER_VALUE_OPTIONS[name] || NO_OPTIONS;
+    const scripts = SPLIT_STRING_OPTIONS[name] || NO_OPTIONS;
     index += 1;
     while (index < tokens.length) {
       const argument = tokens[index];
       if (argument.startsWith('-') && argument !== '-') {
+        const separator = argument.indexOf('=');
+        const flag = separator === -1 ? argument : argument.slice(0, separator);
         index += 1;
+        if (scripts.has(flag)) {
+          // `-S value`, `--split-string=value` and the attached `-Svalue`.
+          if (separator !== -1) noteScript(delegated, argument.slice(separator + 1));
+          else if (index < tokens.length) {
+            noteScript(delegated, tokens[index]);
+            index += 1;
+          }
+          continue;
+        }
+        if (!flag.startsWith('--') && flag.length > 2 && scripts.has(flag.slice(0, 2))) {
+          noteScript(delegated, flag.slice(2));
+          continue;
+        }
         if (values.has(argument) && index < tokens.length) index += 1;
         continue;
       }
@@ -654,6 +726,36 @@ function resolveExecutions(tokens) {
     }
   }
   return executions;
+}
+
+function noteScript(delegated, script) {
+  if (delegated && script) delegated.push(script);
+}
+
+/**
+ * Token lists a command hands to another program to run as a command of its own.
+ * Only programs that really execute those words are considered, so `echo -exec
+ * gh pr merge 12` stays inert text (central Issue #75).
+ *
+ * @param {string[]} tokens
+ * @returns {string[][]}
+ */
+function delegatedCommands(tokens) {
+  const delegated = [];
+  for (const execution of resolveExecutions(tokens)) {
+    if (execution.name !== 'find' && execution.name !== UNRESOLVED_BINARY) continue;
+    const args = execution.args;
+    for (let index = 0; index < args.length; index += 1) {
+      if (!FIND_EXEC_ACTIONS.has(args[index])) continue;
+      const words = [];
+      for (let cursor = index + 1; cursor < args.length && !FIND_EXEC_TERMINATORS.has(args[cursor]); cursor += 1) {
+        words.push(args[cursor]);
+      }
+      if (words.length) delegated.push(words);
+      index += words.length;
+    }
+  }
+  return delegated;
 }
 
 /**
@@ -675,11 +777,12 @@ function runsShellScripts(name) {
  * `eval <words>` both execute their operands, so they are parsed as commands.
  *
  * @param {string[]} tokens
+ * @param {string[]} [delegated] receives command lines a wrapper option runs
  * @returns {string[]}
  */
-function shellScriptArguments(tokens) {
+function shellScriptArguments(tokens, delegated) {
   const scripts = [];
-  for (const execution of resolveExecutions(tokens)) {
+  for (const execution of resolveExecutions(tokens, delegated)) {
     if (execution.name === 'eval') {
       if (execution.args.length) scripts.push(execution.args.join(' '));
       continue;
@@ -797,14 +900,34 @@ function hasUnreadablePayload(bodies, files) {
 }
 
 /**
- * Positional operands of a `gh` invocation, with flag values consumed so a
- * value is never read as a subcommand (`gh pr -R owner/name merge 12`).
+ * True when a request body could still carry `state=success` at run time: the
+ * payload is not in argv, its field name is unknown, or the `state` field's own
+ * value comes from an expansion. A readable field name that is not `state`
+ * cannot publish a commit status, so `-f body="$MSG"` stays allowed.
+ *
+ * @param {string} value
+ * @returns {boolean}
+ */
+function bodyMayCarrySuccess(value) {
+  const field = REQUEST_FIELD.exec(value);
+  if (field && !UNRESOLVED_TEXT.test(field[1])) {
+    if (!STATE_FIELD_NAME.test(field[1])) return false;
+    return isOpaqueBody(field[2]) || /^success$/i.test(field[2]);
+  }
+  return isOpaqueBody(value) || SUCCESS_FIELD.test(value) || SUCCESS_JSON.test(value);
+}
+
+/**
+ * Positional operands of an invocation, with flag values consumed so a value is
+ * never read as a subcommand or as the request target (`gh pr -R owner/name
+ * merge 12`, `curl -H "$AUTH" "$URL"`).
  *
  * @param {string[]} args
+ * @param {Set<string>} valueOptions flags known to take a separate value
  * @param {boolean} unknownTakesValue how a flag of unknown arity is resolved
  * @returns {string[]}
  */
-function ghOperands(args, unknownTakesValue) {
+function commandOperands(args, valueOptions, unknownTakesValue) {
   const operands = [];
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
@@ -819,7 +942,7 @@ function ghOperands(args, unknownTakesValue) {
     // `--flag=value` and attached short forms such as `-Rowner/name` carry
     // their own value; a separate word is consumed only when the flag takes one.
     if (argument.includes('=') || (!argument.startsWith('--') && argument.length > 2)) continue;
-    if (GH_VALUE_OPTIONS.has(argument) || unknownTakesValue) index += 1;
+    if (valueOptions.has(argument) || unknownTakesValue) index += 1;
   }
   return operands;
 }
@@ -827,32 +950,89 @@ function ghOperands(args, unknownTakesValue) {
 // Both readings of an unknown flag's arity are checked, so an unrecognized
 // `gh pr --unknown value merge 12` cannot shift `merge` out of view.
 function ghOperandResolutions(args) {
-  return [ghOperands(args, false), ghOperands(args, true)];
+  return [commandOperands(args, GH_VALUE_OPTIONS, false), commandOperands(args, GH_VALUE_OPTIONS, true)];
+}
+
+// The endpoint of a `curl`/`wget`/httpie call is an operand; the known options
+// that take a value of their own are consumed so they are not mistaken for it.
+function clientOperands(name, args) {
+  const valueOptions = new Set([
+    ...CLIENT_VALUE_OPTIONS,
+    ...(METHOD_OPTIONS[name] || NO_OPTIONS),
+    ...(BODY_OPTIONS[name] || NO_OPTIONS),
+    ...(FILE_BODY_OPTIONS[name] || NO_OPTIONS)
+  ]);
+  return commandOperands(args, valueOptions, false);
+}
+
+/**
+ * Compare an operand with the word the policy looks for. An operand built by an
+ * expansion is unknown text: `P=pr; gh "$P" merge 12` merges just as much as the
+ * literal form, so it matches anything instead of being compared literally.
+ *
+ * @param {string} operand
+ * @param {string|RegExp} expected
+ * @returns {boolean}
+ */
+function operandMatches(operand, expected) {
+  if (UNRESOLVED_TEXT.test(operand)) return true;
+  return typeof expected === 'string' ? operand === expected : expected.test(operand);
+}
+
+/**
+ * How far the operands go towards naming a commit-status endpoint: `definite`
+ * when a readable operand is one, `possible` when an operand is built by an
+ * expansion and could be one at run time (`gh api "$URL"`), `no` otherwise.
+ *
+ * @param {string[][]} resolutions operand lists to consider
+ * @returns {'definite'|'possible'|'no'}
+ */
+function statusEndpointReach(resolutions) {
+  const operands = resolutions.flat();
+  if (operands.some(operand => !UNRESOLVED_TEXT.test(operand) && STATUS_ENDPOINT.test(operand))) return 'definite';
+  if (operands.some(operand => UNRESOLVED_TEXT.test(operand))) return 'possible';
+  return 'no';
+}
+
+/**
+ * Decide a mutation whose target may be a commit-status endpoint. A readable
+ * endpoint keeps the strict reading: any payload that cannot be cleared as
+ * non-success is denied. An endpoint this gate cannot read is only treated as a
+ * status endpoint when the payload could still carry `state=success`, so
+ * ordinary writes such as `gh api "$REPO/issues/1/comments" -f body="$MSG"`
+ * stay allowed (central Issue #75).
+ */
+function publishesToStatusEndpoint(reach, bodies, files) {
+  if (reach === 'definite') return hasSuccessValue(bodies) || hasUnreadablePayload(bodies, files);
+  return files.length > 0 || bodies.some(bodyMayCarrySuccess);
 }
 
 function mergesPullRequest(tokens) {
   return resolveExecutions(tokens).some(execution => {
     if (execution.name !== 'gh' && execution.name !== UNRESOLVED_BINARY) return false;
-    return ghOperandResolutions(execution.args)
-      .some(operands => operands.some((operand, index) => operand === 'pr' && operands[index + 1] === 'merge'));
+    return ghOperandResolutions(execution.args).some(operands => operands.some((operand, index) => (
+      index + 1 < operands.length && operandMatches(operand, 'pr') && operandMatches(operands[index + 1], 'merge')
+    )));
   });
 }
 
 function ghPublishesSuccessStatus(args) {
   const resolutions = ghOperandResolutions(args);
-  if (!resolutions.some(operands => operands[0] === 'api')) return false;
-  if (!resolutions.some(operands => operands.some(operand => STATUS_ENDPOINT.test(operand)))) return false;
+  if (!resolutions.some(operands => operands.length > 0 && operandMatches(operands[0], 'api'))) return false;
+  const reach = statusEndpointReach(resolutions);
+  if (reach === 'no') return false;
   const bodies = optionValues(args, BODY_OPTIONS.gh);
   const files = optionValues(args, FILE_BODY_OPTIONS.gh);
   const methods = optionValues(args, METHOD_OPTIONS.gh);
   // `gh api` only sends a request body for field/input flags or an explicit
   // mutating method; a plain read of the statuses endpoint stays allowed.
   if (!bodies.length && !files.length && !methods.some(method => MUTATING_METHOD.test(method))) return false;
-  return hasSuccessValue(bodies) || hasUnreadablePayload(bodies, files);
+  return publishesToStatusEndpoint(reach, bodies, files);
 }
 
 function clientPublishesSuccessStatus(name, args) {
-  if (!args.some(argument => STATUS_ENDPOINT.test(argument))) return false;
+  const reach = statusEndpointReach([clientOperands(name, args)]);
+  if (reach === 'no') return false;
   const bodies = optionValues(args, BODY_OPTIONS[name] || NO_OPTIONS);
   const files = optionValues(args, FILE_BODY_OPTIONS[name] || NO_OPTIONS);
   const methods = optionValues(args, METHOD_OPTIONS[name] || NO_OPTIONS);
@@ -863,7 +1043,10 @@ function clientPublishesSuccessStatus(name, args) {
     || methods.some(method => MUTATING_METHOD.test(method))
     || operands.some(operand => MUTATING_METHOD.test(operand));
   if (!mutating) return false;
-  return hasSuccessValue(bodies) || hasSuccessValue(operands) || hasUnreadablePayload(bodies, files);
+  if (hasSuccessValue(operands)) return true;
+  // An httpie item can also be the field that sets the state.
+  const items = reach === 'definite' ? [] : operands.filter(operand => REQUEST_FIELD.test(operand));
+  return publishesToStatusEndpoint(reach, bodies, files) || items.some(bodyMayCarrySuccess);
 }
 
 /**
@@ -897,17 +1080,42 @@ function isDirectSuccessStatus(command) {
 }
 
 /**
- * True only when the token list actually starts the Codex role runner, whether
- * the script is the command word (`scripts/codex/run-role.js review`) or an
- * argument of an interpreter (`node "$ROOT/scripts/codex/run-role.js" review`).
+ * The operands an interpreter can take as the script it executes: the first one,
+ * or the one after a `run`/`exec` subcommand. Both readings of an unknown flag's
+ * arity are kept, so `node -r dotenv/config scripts/codex/run-role.js` is seen
+ * whichever way `-r` is resolved.
+ *
+ * @param {string[]} args
+ * @returns {string[]}
+ */
+function scriptOperands(args) {
+  const candidates = [];
+  for (const unknownTakesValue of [false, true]) {
+    const operands = commandOperands(args, NO_OPTIONS, unknownTakesValue);
+    const start = INTERPRETER_SUBCOMMANDS.has(operands[0]) ? 1 : 0;
+    if (operands.length > start) candidates.push(operands[start]);
+  }
+  return candidates;
+}
+
+/**
+ * True only when the token list actually starts the Codex role runner: the
+ * runner is the command word (`scripts/codex/run-role.js review`), or it sits in
+ * the script position of an interpreter (`node "$ROOT/…/run-role.js" review`).
+ * A path this gate cannot read in either position could be the runner, so it
+ * fails closed; the same path written as ordinary text — `echo`, a note, a
+ * commit message — starts nothing and stays allowed (central Issue #75).
  *
  * @param {string[]} tokens
  * @returns {boolean}
  */
 function runsCodexRole(tokens) {
-  return resolveExecutions(tokens).some(execution => (
-    ROLE_RUNNER.test(execution.name) || execution.args.some(argument => ROLE_RUNNER.test(argument))
-  ));
+  return resolveExecutions(tokens).some(execution => {
+    if (execution.name === UNRESOLVED_BINARY || ROLE_RUNNER.test(execution.name)) return true;
+    if (!SCRIPT_INTERPRETERS.has(execution.name)) return false;
+    return scriptOperands(execution.args)
+      .some(operand => ROLE_RUNNER.test(operand) || UNRESOLVED_TEXT.test(operand));
+  });
 }
 
 function isCodexRoleRunner(command) {
@@ -931,7 +1139,7 @@ function run(rawInput, options = {}) {
   const command = String(input.tool_input && input.tool_input.command || '');
   const { commands, unresolved } = analyzeCommand(command);
   if (input.tool_input && input.tool_input.run_in_background === true && commands.some(runsCodexRole)) {
-    return deny('必須Codex roleはforegroundで完了させてください。backgroundではClaude CLI終了時に子processと外部state証拠が失われます。');
+    return deny('必須Codex roleはforegroundで完了させてください。backgroundではClaude CLI終了時に子processと外部state証拠が失われます。実行するcommandやscript pathが展開で解決できない場合も、role起動と区別できないため同じく拒否します。');
   }
   if (commands.some(mergesPullRequest)) {
     return deny('PRのmergeはCompletion Gateだけが実行できます。Local Merge Gateを通し、通常のStopフローへ戻ってください。');
