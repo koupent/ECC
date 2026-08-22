@@ -1346,13 +1346,15 @@ test('distributed agent rules defer to runtime capabilities and do not claim aut
   assert.match(rootAgents, /does not automatically spawn/i);
 });
 
-test('the canonical delegation policy is named as canonical and is subordinate to the harness', () => {
-  // 中央Issue #58: 正本が一意でなく、ハーネスとの優先順位も書かれていなかったため、
-  // Rulesとハーネス指示が正面衝突した。正本・機構・期待・優先順位・適用範囲を回帰対象にする。
+test('the canonical delegation policy carries the project owner standing authorization', () => {
+  // 中央Issue #184: 「ユーザーが要求した場合だけ委任可」というruntime条件に対して、
+  // ECC導入自体が所有者の継続的な委任要求であることを明示し、毎セッションの再許可を不要にする。
   const agentsRule = readRepoFile('rules', 'common', 'agents.md');
   assert.match(agentsRule, /canonical delegation policy/);
   assert.match(agentsRule, /governs every "use the X agent" step/);
-  assert.match(agentsRule, /do not call the Agent tool unless the user requested it/);
+  assert.match(agentsRule, /standing\s+request/i);
+  assert.match(agentsRule, /satisfies.*requires a user request/is);
+  assert.doesNotMatch(agentsRule, /follow the harness.*parent context/is);
 
   for (const [file, restatement] of [
     [readRepoFile('CLAUDE.md'), /canonical delegation policy/],
@@ -1364,12 +1366,12 @@ test('the canonical delegation policy is named as canonical and is subordinate t
     assert.match(file, /rules\/common\/agents\.md/);
     assert.match(file, restatement);
     assert.match(file, /governs\s+\n?every "use the X agent" step/);
-    assert.match(file, /higher-priority/);
+    assert.match(file, /standing\s+request/i);
   }
 
   const rulesReadme = readRepoFile('rules', 'README.md');
   assert.match(rulesReadme, /Rule Priority/);
-  assert.match(rulesReadme, /follow the harness/);
+  assert.match(rulesReadme, /standing\s+request/);
 });
 
 test('rules that name an agent stay conditional on the canonical delegation policy', () => {
@@ -1404,7 +1406,7 @@ test('the Kiro steering surface ships the delegation policy and keeps its agent 
   const policy = readRepoFile('.kiro', 'steering', 'agents.md');
   assert.match(policy, /^---\n[\s\S]*inclusion: auto[\s\S]*?\n---/, '.kiro/steering/agents.md');
   assert.match(policy, /does not automatically spawn/i);
-  assert.match(policy, /do not call the Agent tool unless the user requested it/);
+  assert.match(policy, /standing\s+request/i);
 
   for (const file of [
     ['.kiro', 'steering', 'testing.md'],
