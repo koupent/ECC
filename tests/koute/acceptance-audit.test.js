@@ -155,7 +155,6 @@ test('accepts squash-merged delivery evidence bound to the reviewed HEAD', () =>
 test('fails closed when the recorded delivery worktree is gone instead of auditing the shared tree', () => {
   const entry = validEntry();
   entry.state.delivery.worktree_path = path.join(path.resolve('.'), 'no-such-delivery-worktree');
-  entry.state.delivery.worktree_shared = false;
   const executed = [];
   const tracking = (binary, args, cwd) => {
     executed.push(`${binary} ${args.join(' ')} @${cwd}`);

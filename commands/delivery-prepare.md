@@ -42,13 +42,25 @@ Worktree handling is deliberately fail-closed:
 - By default the worktree is created next to the repository in
   `<repo>-worktrees/<branch with / replaced by ->`, so it never dirties the shared
   tree. Set `deliveryWorktreeRoot` in `.ecc/config.json` or
-  `ECC_DELIVERY_WORKTREE_ROOT` to place it elsewhere.
+  `ECC_DELIVERY_WORKTREE_ROOT` to place it elsewhere. A relative value is resolved
+  against the shared working tree, and a root that lands inside that tree stops
+  preparation instead of silently dirtying the shared `git status`.
+- A delivery that was prepared before worktree isolation existed is still bound to
+  the shared tree: it records an Issue and a branch but no `worktree_path`. Running
+  preparation again moves that same Issue and branch into a worktree without
+  searching GitHub or creating a second Issue. Commit or stash the work first if the
+  shared tree still has that branch checked out; committed work follows the branch
+  into the new worktree, uncommitted changes stay behind.
 
 Once a delivery is bound to its own worktree, every later stage stays bound to it.
 The Delivery Gate, the commit observer, `/ecc:code-review`, the Completion Gate and
 the acceptance audit read that worktree only. If the recorded directory is gone or
 now belongs to another repository, they stop and ask you to restore it or reset the
-delivery; none of them falls back to the shared working tree. While the delivery is
+delivery; none of them falls back to the shared working tree. Recovery stays
+reachable while the gate is closed: the exact `delivery-lifecycle.js prepare` and
+`reset.js` commands are always allowed, and when the worktree is on the wrong branch
+a command that provably acts inside it (`git -C "<worktree_path>" switch <branch>`)
+is allowed so the branch can be restored there. While the delivery is
 isolated, a command is allowed only when the gate can read out of the command line
 itself that it acts on the worktree (`cd "<worktree_path>" && ...` or
 `git -C "<worktree_path>" ...`); mentioning the path elsewhere in the command line is

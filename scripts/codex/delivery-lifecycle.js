@@ -26,6 +26,16 @@ function isActiveDelivery(delivery) {
   return Boolean(delivery && ACTIVE_DELIVERY_STATUSES.has(delivery.status));
 }
 
+// worktree払い出し以前に `ready` となったDeliveryは、共有作業ツリーの上で進んでいる。
+// そのDeliveryは二度とprepareできないと、隔離へ移す手段がresetしか残らず、記録済みの
+// IssueとbranchごとDeliveryを捨てることになる。worktreeを記録していないreadyだけを
+// 再度preparableにして、同じIssueとbranchのまま専用worktreeへ移せるようにする。
+function isPreparableDelivery(delivery) {
+  if (!delivery) return false;
+  if (PREPARABLE_DELIVERY_STATUSES.has(delivery.status)) return true;
+  return delivery.status === 'ready' && !delivery.worktree_path;
+}
+
 function isDeliveryRequest(prompt) {
   const value = String(prompt || '').trim();
   const actionable = value.replace(NEGATED_DELIVERY_REQUEST, '');
@@ -152,8 +162,7 @@ function pendingSessionForProject(cwd, env = process.env) {
     candidates = fs.readdirSync(sessionsDir)
       .filter(file => file.endsWith('.json'))
       .map(file => readJson(path.join(sessionsDir, file)))
-      .filter(state => state && state.project === project && state.delivery &&
-        PREPARABLE_DELIVERY_STATUSES.has(state.delivery.status))
+      .filter(state => state && state.project === project && isPreparableDelivery(state.delivery))
       .sort((left, right) => String(right.updated_at || '').localeCompare(String(left.updated_at || '')));
   } catch {
     return '';
@@ -252,15 +261,47 @@ function listWorktrees(options = {}) {
   return entries;
 }
 
+function isInsideWorkingTree(root, target) {
+  const relative = path.relative(root, target);
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+// 設定値をそのまま信じると、リポジトリの中を指す払い出し先を受け入れてしまう。境界は
+// ここで拒否し、既定値へ黙って戻さない。実体pathでも判定するのは、リポジトリの外に
+// 見えるsymlinkが中を指している場合に字面だけでは通ってしまうためである。
+function assertWorktreeOutsideSharedTree(main, target, configured) {
+  const roots = new Set([main]);
+  try {
+    roots.add(fs.realpathSync(main));
+  } catch {
+    // 主作業ツリーを解決できない環境では字面の判定だけを行う。
+  }
+  for (const root of roots) {
+    if (!isInsideWorkingTree(root, target)) continue;
+    throw new Error(
+      `Delivery worktree ${target} would be created inside the shared working tree ${root}. ` +
+        'A worktree inside the repository dirties the shared `git status` and breaks the clean-HEAD checks this workflow depends on. ' +
+        (configured
+          ? `Point deliveryWorktreeRoot (or ECC_DELIVERY_WORKTREE_ROOT) at a path outside that tree; a relative value such as "${configured}" is resolved against the shared working tree. `
+          : 'Point deliveryWorktreeRoot (or ECC_DELIVERY_WORKTREE_ROOT) at a path outside that tree. ') +
+        'Then run this command again.'
+    );
+  }
+}
+
 function deliveryWorktreePath(mainWorktree, branch, options = {}) {
   const configured = (options.config && options.config.deliveryWorktreeRoot) || '';
   const main = path.resolve(mainWorktree);
   // 既定の払い出し先はリポジトリの外側に置く。worktreeを作業ツリーの中へ作ると、
   // 共有ツリーの `git status` が汚れ、cleanなHEADを要求する検証を自分で壊す。
+  // 設定値の相対pathは共有ツリーの根から解決する。process.cwdから解決すると、同じ設定でも
+  // 起動場所ごとに別の場所へ払い出してしまう。
   const root = configured
-    ? path.resolve(configured)
+    ? path.resolve(main, configured)
     : path.join(path.dirname(main), `${path.basename(main)}-worktrees`);
-  return path.join(root, assertSafeGitRef(branch, 'Delivery branch').replace(/\//g, '-'));
+  const target = path.join(root, assertSafeGitRef(branch, 'Delivery branch').replace(/\//g, '-'));
+  assertWorktreeOutsideSharedTree(main, target, configured);
+  return target;
 }
 
 function ensureDeliveryWorktree(delivery, branch, options = {}) {
@@ -279,7 +320,8 @@ function ensureDeliveryWorktree(delivery, branch, options = {}) {
       throw new Error(
         `Branch ${target} is checked out in the shared working tree ${existingPath}. ` +
           'Delivery work always runs in a worktree of its own, and preparation never adopts the shared working tree. ' +
-          `Switch ${existingPath} to another branch yourself (its uncommitted changes stay there), then run this command again.`
+          `Commit or stash the work that belongs to ${target} first: the new worktree checks out the same branch, so committed work follows it while uncommitted changes stay in the shared tree. ` +
+          `Then switch ${existingPath} to another branch yourself and run this command again.`
       );
     }
     // 既存のlinked worktreeは削除も上書きもせず、そのまま再利用する。
@@ -320,8 +362,13 @@ function prepareDelivery(input = {}, options = {}) {
   const cwd = options.cwd || input.cwd || process.cwd();
   const state = readState(input, env);
   const delivery = state.delivery;
-  if (!delivery || !PREPARABLE_DELIVERY_STATUSES.has(delivery.status)) {
-    throw new Error('No pending required delivery task. Submit the implementation request first.');
+  if (!isPreparableDelivery(delivery)) {
+    throw new Error(
+      delivery && delivery.status === 'ready'
+        ? `Issue #${delivery.issue_number} is already prepared in the delivery worktree ${delivery.worktree_path}. ` +
+            'Continue there; preparation never re-issues a worktree that is already recorded.'
+        : 'No pending required delivery task. Submit the implementation request first.'
+    );
   }
 
   try {
@@ -442,6 +489,7 @@ module.exports = {
   initializeDelivery,
   isActiveDelivery,
   isDeliveryRequest,
+  isPreparableDelivery,
   isSafeGitRef,
   listWorktrees,
   normalizeIssueTitle,

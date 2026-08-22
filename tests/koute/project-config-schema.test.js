@@ -37,4 +37,16 @@ assert.strictEqual(
 assert.strictEqual(validate(config({ mode: 'auto' })), false);
 assert.strictEqual(validate(config({ mode: 'docker-desktop', unexpected: true })), false);
 
+// Delivery worktreeの払い出し先は設定できる。空文字は払い出し先を決められないので拒否する。
+assert.strictEqual(
+  validate({
+    ...config({ mode: 'disabled' }),
+    deliveryWorkflow: 'required',
+    deliveryWorktreeRoot: '../ecc-delivery-worktrees'
+  }),
+  true,
+  JSON.stringify(validate.errors)
+);
+assert.strictEqual(validate({ ...config({ mode: 'disabled' }), deliveryWorktreeRoot: '' }), false);
+
 process.stdout.write('ECC project config voice schema tests passed\n');

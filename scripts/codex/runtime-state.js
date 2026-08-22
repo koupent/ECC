@@ -133,10 +133,15 @@ function projectFingerprint(cwd = process.cwd()) {
 }
 
 // 進行中のDeliveryが払い出されたworktreeを持つ場合、branch・HEAD・作業ツリーの
-// 検証はそのworktreeで行う。worktreeを記録していないDeliveryは従来どおり共有ツリーが
-// 作業場所である。記録済みのworktreeが消えている、あるいは別リポジトリを指している
-// ときはnullを返してfail-closeさせる。ここで共有ツリーへ戻すと、隔離したはずの
+// 検証はそのworktreeで行う。記録済みのworktreeが消えている、あるいは別リポジトリを
+// 指しているときはnullを返してfail-closeさせる。ここで共有ツリーへ戻すと、隔離したはずの
 // Deliveryを共有ツリーのbranchとHEADで判定し、Issueが指摘した衝突を再現してしまう。
+//
+// worktreeを一度も記録していないDeliveryは、worktree払い出し以前に始まった作業である。
+// これは共有ツリーが作業場所のまま従来どおり扱う。ここでfail-closeさせると、進行中の
+// 作業が記録済みのIssueとbranchごと止まり、resetで捨てる以外の道がなくなるためである。
+// 隔離へ移すときは prepare を再実行する（delivery-lifecycle.js の isPreparableDelivery）。
+// 新しく払い出されるDeliveryは必ずworktreeを記録するので、この経路は移行中だけ通る。
 function deliveryWorkspace(state, cwd = process.cwd()) {
   const fallback = path.resolve(cwd || process.cwd());
   const recorded = state && state.delivery && state.delivery.worktree_path;

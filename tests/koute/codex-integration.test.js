@@ -713,7 +713,6 @@ test('isolation holds against attached redirections, writing Git arguments, and 
       issue_url: 'https://example.invalid/issues/79',
       branch,
       worktree_path: worktreePath,
-      worktree_shared: false,
       draft_pr_url: null
     }
   }, fixtureEnv);
@@ -813,7 +812,6 @@ test('isolation holds when the session runs from a subdirectory of the shared wo
       issue_url: 'https://example.invalid/issues/79',
       branch,
       worktree_path: worktreePath,
-      worktree_shared: false,
       draft_pr_url: null
     }
   }, fixtureEnv);
@@ -959,6 +957,135 @@ test('preparation fails closed while the shared working tree holds the delivery 
   assert.strictEqual(spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim(), baseBranch);
 });
 
+test('a delivery still bound to the shared working tree is migrated into a worktree by preparing again', () => {
+  const fixture = createGitFixture('delivery-migration-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  const baseBranch = spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  const branch = 'codex/issue-79-migration';
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-migration-state') };
+  const input = { session_id: 'delivery-migration', cwd: fixture };
+  // worktree払い出し以前のstate。Issueとbranchは記録済みだが worktree_path を持たない。
+  writeState(input, {
+    project: projectFingerprint(fixture),
+    delivery: {
+      status: 'ready',
+      request_hash: 'migration-fixture',
+      title: 'a delivery that started on the shared working tree',
+      base_branch: baseBranch,
+      issue_number: 79,
+      issue_url: 'https://example.invalid/issues/79',
+      branch,
+      draft_pr_url: null
+    }
+  }, fixtureEnv);
+  // 共有ツリーが対象branchをcheckoutしたまま進んでいる状態。
+  assert.strictEqual(spawnSync('git', ['switch', '--quiet', '-c', branch], { cwd: fixture }).status, 0);
+
+  // このstateは再度prepareできる。共有ツリーがbranchを握っている間はfail-closeする。
+  assert.strictEqual(pendingSessionForProject(fixture, fixtureEnv), 'delivery-migration');
+  assert.throws(
+    () => prepareDelivery(input, { cwd: fixture, env: fixtureEnv }),
+    /checked out in the shared working tree/
+  );
+
+  assert.strictEqual(spawnSync('git', ['switch', '--quiet', baseBranch], { cwd: fixture }).status, 0);
+  // GitHubは引き直さない。記録済みのIssueとbranchのまま専用worktreeへ移す。
+  const migrated = prepareDelivery(input, { cwd: fixture, env: fixtureEnv });
+  assert.strictEqual(migrated.status, 'ready');
+  assert.strictEqual(migrated.issue_number, 79);
+  assert.strictEqual(migrated.branch, branch);
+  assert.strictEqual(migrated.worktree_created, true);
+  assert.strictEqual(deliveryWorkspace(readState(input, fixtureEnv), fixture), migrated.worktree_path);
+  assert.strictEqual(spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim(), baseBranch);
+
+  // 隔離済みになったDeliveryは、もうworktreeを作り直さない。
+  assert.throws(() => prepareDelivery(input, { cwd: fixture, env: fixtureEnv }), /already prepared/);
+  assert.strictEqual(pendingSessionForProject(fixture, fixtureEnv), '');
+});
+
+test('a worktree on the wrong branch can be restored inside that worktree', () => {
+  const fixture = createGitFixture('delivery-branch-restore-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  const baseBranch = spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  const branch = 'codex/issue-79-branch-restore';
+  const worktreePath = path.join(temp, 'delivery-branch-restore-worktree');
+  assert.strictEqual(
+    spawnSync('git', ['worktree', 'add', '--quiet', '-b', branch, worktreePath], { cwd: fixture }).status,
+    0
+  );
+  // 払い出したworktreeが別branchへ移ってしまった状態。
+  assert.strictEqual(
+    spawnSync('git', ['switch', '--quiet', '-c', 'codex/issue-79-other'], { cwd: worktreePath }).status,
+    0
+  );
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-branch-restore-state') };
+  const input = { session_id: 'delivery-branch-restore', cwd: fixture };
+  writeState(input, {
+    delivery: {
+      status: 'ready',
+      request_hash: 'branch-restore-fixture',
+      title: 'the recorded branch must come back in the worktree',
+      base_branch: baseBranch,
+      issue_number: 79,
+      issue_url: 'https://example.invalid/issues/79',
+      branch,
+      worktree_path: worktreePath,
+      draft_pr_url: null
+    }
+  }, fixtureEnv);
+
+  const edit = JSON.stringify({
+    ...input,
+    tool_name: 'Edit',
+    tool_input: { file_path: path.join(worktreePath, 'src', 'product.ts') }
+  });
+  const denied = JSON.parse(deliveryGate.run(edit, { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny');
+  // 案内するcommandは、このGateが実際に通す形でなければ復旧できない。
+  assert.match(
+    denied.hookSpecificOutput.permissionDecisionReason,
+    new RegExp(`git -C "${worktreePath}" switch ${branch}`.replace(/[\\^$*+?.()|[\]{}]/g, '\\$&'))
+  );
+
+  const bash = command => JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command } });
+  for (const command of [
+    `git -C "${worktreePath}" switch ${branch}`,
+    `cd "${worktreePath}" && git switch ${branch}`,
+    `node "${path.join(pluginRoot, 'scripts', 'codex', 'reset.js')}" delivery-branch-restore`
+  ]) {
+    assert.strictEqual(deliveryGate.run(bash(command), { cwd: fixture, env: fixtureEnv }), bash(command), command);
+  }
+  // 共有ツリーへ届くcommandは、branchが合っていない間も拒否し続ける。
+  for (const command of ['git reset --hard', 'touch src/product.ts', `git --work-tree "${fixture}" checkout -- .`]) {
+    assert.strictEqual(
+      JSON.parse(deliveryGate.run(bash(command), { cwd: fixture, env: fixtureEnv })).hookSpecificOutput.permissionDecision,
+      'deny',
+      command
+    );
+  }
+  const sharedEdit = JSON.stringify({
+    ...input,
+    tool_name: 'Edit',
+    tool_input: { file_path: path.join(fixture, 'src', 'product.ts') }
+  });
+  assert.strictEqual(
+    JSON.parse(deliveryGate.run(sharedEdit, { cwd: fixture, env: fixtureEnv })).hookSpecificOutput.permissionDecision,
+    'deny'
+  );
+
+  // branchを戻せば、Gateは通常の判定に戻る。
+  assert.strictEqual(spawnSync('git', ['switch', '--quiet', branch], { cwd: worktreePath }).status, 0);
+  assert.strictEqual(deliveryGate.run(edit, { cwd: fixture, env: fixtureEnv }), edit);
+});
+
 test('worktree issuance fails closed on unverified paths and shell-unsafe refs', () => {
   const executed = [];
   const runCommand = (binary, args) => {
@@ -1007,6 +1134,36 @@ test('worktree issuance fails closed on unverified paths and shell-unsafe refs',
     /already exists but is not registered/
   );
   assert.strictEqual(fs.readFileSync(path.join(occupied, 'unrelated.txt'), 'utf8'), 'keep me\n');
+
+  // 払い出し先の設定は境界まで検証する。リポジトリの中を指す値を受け入れると、隔離した
+  // はずのworktreeが共有ツリーの `git status` に現れ、cleanなHEADを要求する検証を壊す。
+  const main = path.join(temp, 'failclose-main');
+  const insideRepo = { deliveryWorktreeRoot: path.join(main, '.worktrees') };
+  for (const config of [insideRepo, { deliveryWorktreeRoot: 'delivery-worktrees' }, { deliveryWorktreeRoot: '.' }]) {
+    assert.throws(
+      () => deliveryWorktreePath(main, 'codex/issue-68-inside', { config }),
+      /inside the shared working tree/,
+      config.deliveryWorktreeRoot
+    );
+  }
+  // 相対値は共有ツリーの根から解決する。process.cwd から解決すると、同じ設定でも起動
+  // 場所ごとに別の場所へ払い出してしまう。
+  assert.strictEqual(
+    deliveryWorktreePath(main, 'codex/issue-68-outside', {
+      config: { deliveryWorktreeRoot: path.join('..', 'ecc-delivery-worktrees') }
+    }),
+    path.join(temp, 'ecc-delivery-worktrees', 'codex-issue-68-outside')
+  );
+  assert.throws(
+    () => ensureDeliveryWorktree({ base_branch: 'main' }, 'codex/issue-68-inside', {
+      cwd: main,
+      config: insideRepo,
+      runCommand
+    }),
+    /inside the shared working tree/
+  );
+  // 境界違反はgitへ渡る前に止まる。中途半端に登録されたworktreeを残さない。
+  assert.ok(executed.every(command => !command.includes('worktree add')));
 });
 
 test('delivery preparation resolves the unique pending project session without relying on Bash environment propagation', () => {
@@ -1280,7 +1437,6 @@ test('a delivery whose worktree is gone fails closed instead of falling back to 
       branch,
       base_branch: baseBranch,
       worktree_path: worktreePath,
-      worktree_shared: false,
       committed_head: head
     },
     review_role: 'review',
@@ -1304,6 +1460,26 @@ test('a delivery whose worktree is gone fails closed instead of falling back to 
   assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny');
   assert.match(denied.hookSpecificOutput.permissionDecisionReason, /no longer a working tree of this repository/);
   assert.ok(readEvents(fixtureEnv).some(event => event.type === 'delivery_worktree_missing'));
+
+  // fail-closeしている間も、拒否理由が案内するECC自身のcommandだけは実行できる。
+  // ここを塞ぐと、案内しているresetそのものを走らせられず復旧できない。
+  for (const command of [
+    `node "${path.join(pluginRoot, 'scripts', 'codex', 'reset.js')}" delivery-worktree-lost`,
+    `node "${path.join(pluginRoot, 'scripts', 'codex', 'delivery-lifecycle.js')}" prepare --session delivery-worktree-lost`
+  ]) {
+    const recovery = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command } });
+    assert.strictEqual(deliveryGate.run(recovery, { cwd: fixture, env: fixtureEnv }), recovery, command);
+  }
+  // 共有ツリーで走るcommandは、案内に見えても通らない。
+  const restoreElsewhere = JSON.stringify({
+    ...input,
+    tool_name: 'Bash',
+    tool_input: { command: `git worktree add "${worktreePath}" ${branch}` }
+  });
+  assert.strictEqual(
+    JSON.parse(deliveryGate.run(restoreElsewhere, { cwd: fixture, env: fixtureEnv })).hookSpecificOutput.permissionDecision,
+    'deny'
+  );
 
   const raw = JSON.stringify(input);
   const blocked = JSON.parse(deliveryCompletion.run(raw, {

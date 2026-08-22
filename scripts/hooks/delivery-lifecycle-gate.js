@@ -667,19 +667,30 @@ function run(rawInput, options = {}) {
   const state = readState(input, env);
   if (!state.delivery) return rawInput;
   if (state.delivery.status === 'draft-pr' || state.delivery.status === 'merged') return rawInput;
+
+  const toolName = String(input.tool_name || '');
+  const command = String(input.tool_input && input.tool_input.command || '');
+  const sessionId = resolveSessionId(input, env);
+  const prepareScript = path.resolve(__dirname, '../codex/delivery-lifecycle.js');
+  const resetScript = path.resolve(__dirname, '../codex/reset.js');
+  // 記録済みDeliveryを立て直すECC自身のcommandは、Gateがfail-closeしている間も通す。
+  // ここまで塞ぐと、拒否理由が案内しているprepareとreset自体を実行できず、隔離を
+  // 復旧する手段が残らない。判定は引数まで固定した完全一致で、shellの制御文字を含む形は
+  // isExactLifecycleCommandが弾く。
+  const isLifecycleCommand = toolName === 'Bash' &&
+    (isExactLifecycleCommand(command, 'prepare') || isExactLifecycleCommand(command, 'reset'));
+  // 隔離が成立した後のfail-closeでは、script名の一致だけでECCのcommandと認めない。同じ
+  // 名前で置いた任意のscriptを通すと、拒否しているはずの共有ツリーへの書き込みが復旧
+  // commandの顔で通ってしまう。実体がこのplugin自身のscriptである場合だけ復旧と認める。
+  const isLifecycleRecovery = isLifecycleCommand && isWorktreeAwareTool(tokenize(command), cwd, env);
+
   if (state.delivery.status !== 'ready') {
-    const toolName = String(input.tool_name || '');
-    const command = String(input.tool_input && input.tool_input.command || '');
     const permissionMode = String(input.permission_mode || input.permissionMode || '').toLowerCase();
     // Plan mode中はClaude自身のread-only制約に任せて調査を許可する。承認後は同じ
     // deferred stateが残るため、最初のBash/Edit/Writeをprepare完了までfail-closeする。
     if (state.delivery.status === 'deferred' && permissionMode === 'plan') return rawInput;
-    const isPrepareCommand = toolName === 'Bash' && isExactLifecycleCommand(command, 'prepare');
-    const isResetCommand = toolName === 'Bash' && isExactLifecycleCommand(command, 'reset');
-    if (isPrepareCommand || isResetCommand) return rawInput;
-    const sessionId = resolveSessionId(input, env);
-    const prepareScript = path.resolve(__dirname, '../codex/delivery-lifecycle.js');
-    const resetScript = path.resolve(__dirname, '../codex/reset.js');
+    // prepare前は隔離すべきworktreeがまだ無い。ここは従来どおりcommandの形だけで通す。
+    if (isLifecycleCommand) return rawInput;
     return deny(
       '[ECC Delivery Gate] Repository tools are blocked until duplicate Issue search, Issue selection/creation, and the issue-linked worktree are recorded. ' +
         'Preparation never switches the shared working tree; it checks the issue-linked branch out in a separate worktree and reports that path. ' +
@@ -708,12 +719,22 @@ function run(rawInput, options = {}) {
         delivery: { ...state.delivery, worktree_missing_recorded_at: new Date().toISOString() }
       }, env);
     }
+    if (isLifecycleRecovery) return rawInput;
     return deny(
       `[ECC Delivery Gate] Issue #${state.delivery.issue_number} is bound to the delivery worktree ${state.delivery.worktree_path}, ` +
         'but that path is no longer a working tree of this repository. ' +
-        'Restore it with `git worktree add` or reset the delivery; this gate never falls back to the shared working tree.'
+        'Restore that worktree outside this session with `git worktree add`, ' +
+        `or explicitly reset the delivery with node "${resetScript}" "${sessionId}". ` +
+        'This gate never falls back to the shared working tree.'
     );
   }
+  // 共有ツリーの境界はGitの主作業ツリーの根であって、hookに渡されたcwdではない。
+  // 判定に必要になったときだけ解決し、Deliveryごとに一度で済ませる。
+  let sharedCache = '';
+  const shared = () => {
+    if (!sharedCache) sharedCache = sharedRoot(cwd, env, config.projectRoot);
+    return sharedCache;
+  };
   const actualBranch = branchAt(workspace, env);
   if (!actualBranch || actualBranch !== state.delivery.branch) {
     // Gateがfail-closeしている復旧可能な不一致は、即criticalではない。同じDeliveryで
@@ -738,9 +759,21 @@ function run(rawInput, options = {}) {
         }
       }, env);
     }
+    // 記録済みworktreeの中でbranchを戻す作業だけは通す。ここまで拒否すると、隔離された
+    // worktreeを直す手段が残らず、共有ツリーへ戻る以外の道がなくなる。共有ツリーへ届く
+    // commandは、隔離中と同じ判定でそのまま拒否される。編集toolは通さない。
+    if (isLifecycleRecovery) return rawInput;
+    if (
+      toolName === 'Bash' &&
+      workspace !== path.resolve(cwd) &&
+      targetsWorkspace(command, workspace, cwd, { shared: shared(), env })
+    ) {
+      return rawInput;
+    }
     return deny(
       `[ECC Delivery Gate] Expected issue-linked branch ${state.delivery.branch} in ${workspace}, but its current branch is ${actualBranch || '<none>'}. ` +
-        'Restore the recorded branch in the delivery worktree before editing.'
+        `Restore it with \`git -C "${workspace}" switch ${state.delivery.branch}\` before editing; ` +
+        'this gate never falls back to the shared working tree.'
     );
   }
 
@@ -755,11 +788,10 @@ function run(rawInput, options = {}) {
     }, env);
   }
 
-  const toolName = String(input.tool_name || '');
   const isEdit = WRITE_TOOLS.has(toolName);
   const isolated = workspace !== path.resolve(cwd);
   if (isolated) {
-    const shared = sharedRoot(cwd, env, config.projectRoot);
+    const sharedTree = shared();
     if (isEdit) {
       // 払い出したworktreeの外へ書くと、隔離したはずの共有ツリーを再び変更してしまう。
       // 共有ツリー配下だけを拒否し、リポジトリ外のファイルは従来どおり素通しする。
@@ -771,11 +803,11 @@ function run(rawInput, options = {}) {
             'Reissue the edit with an explicit absolute path inside that worktree.'
         );
       }
-      const outside = targets.find(target => escapesWorktree(workspace, shared, target));
+      const outside = targets.find(target => escapesWorktree(workspace, sharedTree, target));
       if (outside) {
         // symlinkで抜ける経路は、共有ツリーからの相対pathに置き換えられない。その場合は
         // 具体的な代替pathを示さず、worktreeの中で書き直させる。
-        const relative = path.relative(shared, outside);
+        const relative = path.relative(sharedTree, outside);
         const inShared = relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
         return deny(
           `[ECC Delivery Gate] Issue #${state.delivery.issue_number} is checked out in the delivery worktree ${workspace}. ` +
@@ -786,7 +818,7 @@ function run(rawInput, options = {}) {
         );
       }
     }
-    if (toolName === 'Bash' && !targetsWorkspace(input.tool_input && input.tool_input.command, workspace, cwd, { shared, env })) {
+    if (toolName === 'Bash' && !targetsWorkspace(command, workspace, cwd, { shared: sharedTree, env })) {
       return deny(
         `[ECC Delivery Gate] This delivery is isolated in the worktree ${workspace}, but the command is not provably confined to that worktree. ` +
           `Write it as \`cd "${workspace}" && ...\` or \`git -C "${workspace}" ...\`. ` +
