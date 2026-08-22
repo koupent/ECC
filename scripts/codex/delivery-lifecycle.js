@@ -5,7 +5,15 @@ const { spawnSync } = require('child_process');
 const { loadConfig } = require('./config');
 const fs = require('fs');
 const path = require('path');
-const { hash, projectFingerprint, readJson, readState, recordIncident, resolveSessionId, stateRoot, writeState } = require('./runtime-state');
+const {
+  hash,
+  listProjectSessions,
+  projectFingerprint,
+  readState,
+  recordIncident,
+  resolveSessionId,
+  writeState
+} = require('./runtime-state');
 
 const DELIVERY_REQUEST = /(?:\b(?:implement|fix|change|add|remove|refactor|build|create|update)\b|実装|修正|変更|追加|削除|作成|更新|直して)/i;
 const DELIVERY_COMPLETION_REQUEST = /(?:\b(?:complete|finish|finalize|deliver)\b|\bmerge\s+(?:it|the\s+pr|pr\s*#?\d+)\b|完遂|完了まで|仕上げて|マージまで)/i;
@@ -155,18 +163,12 @@ function initializeDelivery(input, request, options = {}) {
 }
 
 function pendingSessionForProject(cwd, env = process.env) {
-  const sessionsDir = path.join(stateRoot(env), 'sessions');
-  const project = projectFingerprint(cwd);
-  let candidates = [];
-  try {
-    candidates = fs.readdirSync(sessionsDir)
-      .filter(file => file.endsWith('.json'))
-      .map(file => readJson(path.join(sessionsDir, file)))
-      .filter(state => state && state.project === project && isPreparableDelivery(state.delivery))
-      .sort((left, right) => String(right.updated_at || '').localeCompare(String(left.updated_at || '')));
-  } catch {
-    return '';
-  }
+  // 旧版が作業ツリーpathで記録したprojectも同じprojectとして拾う。listProjectSessionsが
+  // canonicalな識別子へ移行してから返すので、以降の検索は新旧が混ざらない。
+  const candidates = listProjectSessions(cwd, env)
+    .map(entry => entry.state)
+    .filter(state => isPreparableDelivery(state.delivery))
+    .sort((left, right) => String(right.updated_at || '').localeCompare(String(left.updated_at || '')));
   return candidates.length === 1 ? resolveSessionId(candidates[0], env) : '';
 }
 
@@ -459,8 +461,9 @@ function prepareDelivery(input = {}, options = {}) {
       prepared_at: new Date().toISOString()
     };
     // worktreeを払い出す前にIssueとbranchを記録する。払い出しが失敗しても、再実行が
-    // GitHubを引き直して重複Issueを作ることはない。
-    writeState(input, { delivery: prepared }, env);
+    // GitHubを引き直して重複Issueを作ることはない。旧版が作業ツリーpathで記録した
+    // projectは、ここでcanonicalなリポジトリ識別子へ揃える。
+    writeState(input, { delivery: prepared, project: projectFingerprint(cwd) }, env);
 
     // prepareは共有ツリーのbranchを切り替えず、Issueごとのworktreeを払い出す。以降の
     // 編集、コミット、レビュー、完了判定はこのpathで行われ、共有ツリーで走っている

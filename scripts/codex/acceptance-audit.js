@@ -1,10 +1,9 @@
 #!/usr/bin/env node
 'use strict';
 
-const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
-const { deliveryWorkspace, projectFingerprint, readJson, stateRoot } = require('./runtime-state');
+const { deliveryWorkspace, listProjectSessions } = require('./runtime-state');
 
 function command(binary, args, cwd, env) {
   const result = spawnSync(binary, args, {
@@ -21,22 +20,15 @@ function command(binary, args, cwd, env) {
   };
 }
 
+// 旧版が作業ツリーpathで記録したprojectのstateも同じprojectとして監査する。共通IDへ
+// 移行する前に記録されたDeliveryを見失うと、監査は証拠が無いと報告してしまう。
 function latestState(cwd, issueNumber, env) {
-  const sessionsDir = path.join(stateRoot(env), 'sessions');
-  const project = projectFingerprint(cwd);
-  let entries = [];
-  try {
-    entries = fs.readdirSync(sessionsDir)
-      .filter(file => file.endsWith('.json'))
-      .map(file => ({ file: path.join(sessionsDir, file), state: readJson(path.join(sessionsDir, file)) }))
-      .filter(entry => entry.state && entry.state.project === project && entry.state.delivery)
-      .filter(entry => !issueNumber ||
-        entry.state.delivery.requested_issue_number === issueNumber ||
-        entry.state.delivery.issue_number === issueNumber)
-      .sort((left, right) => String(right.state.updated_at || '').localeCompare(String(left.state.updated_at || '')));
-  } catch {
-    return null;
-  }
+  const entries = listProjectSessions(cwd, env)
+    .filter(entry => entry.state.delivery)
+    .filter(entry => !issueNumber ||
+      entry.state.delivery.requested_issue_number === issueNumber ||
+      entry.state.delivery.issue_number === issueNumber)
+    .sort((left, right) => String(right.state.updated_at || '').localeCompare(String(left.state.updated_at || '')));
   return entries[0] || null;
 }
 

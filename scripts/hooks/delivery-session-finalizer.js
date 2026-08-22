@@ -1,15 +1,11 @@
 #!/usr/bin/env node
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
 const {
-  projectFingerprint,
-  readJson,
+  listProjectSessions,
   readState,
   recordIncident,
   resolveSessionId,
-  stateRoot,
   writeState
 } = require('../codex/runtime-state');
 
@@ -44,20 +40,13 @@ function auditStale(input, options = {}) {
   const env = options.env || process.env;
   const cwd = options.cwd || input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const currentSession = resolveSessionId(input, env);
-  const project = projectFingerprint(cwd);
   const maxAgeSeconds = Math.max(0, Number(env.ECC_STALE_DELIVERY_SECONDS || 1800));
   const cutoff = Date.now() - maxAgeSeconds * 1000;
-  const sessionsDir = path.join(stateRoot(env), 'sessions');
   let reported = 0;
-  let files = [];
-  try {
-    files = fs.readdirSync(sessionsDir).filter(file => file.endsWith('.json'));
-  } catch {
-    return 0;
-  }
-  for (const file of files) {
-    const state = readJson(path.join(sessionsDir, file));
-    if (!state || state.session_id === currentSession || state.project !== project) continue;
+  // 旧版が作業ツリーpathで記録したprojectのstateも同じprojectとして扱う。取り残された
+  // Deliveryを識別子の違いで見逃すと、中断がインシデントとして記録されない。
+  for (const { state } of listProjectSessions(cwd, env)) {
+    if (state.session_id === currentSession) continue;
     const updated = Date.parse(state.updated_at || '');
     if (!Number.isFinite(updated) || updated > cutoff) continue;
     if (reportIncomplete({ session_id: state.session_id, cwd }, state, { cwd, env })) reported += 1;

@@ -9,6 +9,7 @@ const { spawnSync } = require('child_process');
 
 const MAX_LOG_BYTES = 8 * 1024 * 1024;
 const REPOSITORY_IDENTITY_CACHE = new Map();
+const LEGACY_IDENTITY_CACHE = new Map();
 
 function hash(value, length = 24) {
   return crypto.createHash('sha256').update(String(value || '')).digest('hex').slice(0, length);
@@ -98,23 +99,22 @@ function contextReady(input = {}, env = process.env) {
   return state.context_status === 'ready' && state.context && typeof state.context === 'object';
 }
 
-// git common-dirは主作業ツリーと全てのlinked worktreeで同一である。これを識別子に
-// 使うと、worktreeで記録したDelivery、レビュー証拠、イベントを主作業ツリーからも
-// 同じprojectとして参照できる。Git配下でない場所は従来どおり絶対パスで識別する。
-function repositoryIdentity(root) {
+function gitOutput(root, args) {
   let result;
   try {
-    result = spawnSync('git', ['rev-parse', '--git-common-dir'], {
-      cwd: root,
-      encoding: 'utf8',
-      timeout: 5000,
-      windowsHide: true
-    });
+    result = spawnSync('git', args, { cwd: root, encoding: 'utf8', timeout: 5000, windowsHide: true });
   } catch {
     return '';
   }
   if (!result || result.error || result.status !== 0) return '';
-  const common = String(result.stdout || '').trim();
+  return String(result.stdout || '').trim();
+}
+
+// git common-dirは主作業ツリーと全てのlinked worktreeで同一である。これを識別子に
+// 使うと、worktreeで記録したDelivery、レビュー証拠、イベントを主作業ツリーからも
+// 同じprojectとして参照できる。Git配下でない場所は従来どおり絶対パスで識別する。
+function repositoryIdentity(root) {
+  const common = gitOutput(root, ['rev-parse', '--git-common-dir']);
   if (!common) return '';
   const absolute = path.resolve(root, common);
   try {
@@ -130,6 +130,75 @@ function projectFingerprint(cwd = process.cwd()) {
     REPOSITORY_IDENTITY_CACHE.set(root, hash(repositoryIdentity(root) || root));
   }
   return REPOSITORY_IDENTITY_CACHE.get(root);
+}
+
+// 以前のprojectは「作業ツリーの絶対pathのhash」だった。読み込み側がcommon-dir由来の
+// 新しいIDだけを探すと、旧版で始まったDeliveryはpending検索にも受入監査にも掛からず、
+// 再開もresetもできないまま取り残される。同じリポジトリの作業ツリーpathから作られる
+// 旧IDを互換識別子として認め、見つけた時点でcanonicalなIDへ書き換える。
+function legacyProjectFingerprints(cwd = process.cwd()) {
+  const root = path.resolve(cwd || process.cwd());
+  if (LEGACY_IDENTITY_CACHE.has(root)) return LEGACY_IDENTITY_CACHE.get(root);
+  const paths = new Set([root]);
+  // 旧IDは記録した場所のpathで決まる。主作業ツリーでもlinked worktreeでも記録されうる
+  // ため、このリポジトリの作業ツリーをすべて候補にする。
+  for (const line of gitOutput(root, ['worktree', 'list', '--porcelain']).split(/\r?\n/)) {
+    if (!line.startsWith('worktree ')) continue;
+    const value = line.slice('worktree '.length).trim();
+    if (!value) continue;
+    const absolute = path.resolve(value);
+    paths.add(absolute);
+    try {
+      paths.add(fs.realpathSync(absolute));
+    } catch {
+      // 消えた登録は候補から外れるだけで、判定には影響しない。
+    }
+  }
+  const canonical = projectFingerprint(root);
+  const identifiers = [...new Set([...paths].map(value => hash(value)))].filter(value => value !== canonical);
+  LEGACY_IDENTITY_CACHE.set(root, identifiers);
+  return identifiers;
+}
+
+function matchesProject(state, cwd = process.cwd()) {
+  const project = state && state.project;
+  if (!project) return false;
+  return project === projectFingerprint(cwd) || legacyProjectFingerprints(cwd).includes(project);
+}
+
+// 旧IDのstateは読み込んだ時点でcanonicalなIDへ書き換える。互換で読み続けるだけでは、
+// 同じprojectを二つの識別子で指す期間が終わらない。書き換えは他の更新と同じ
+// 原子的な置換で行い、失敗しても呼び出し側は移行後の値で進める。
+function canonicalizeProjectState(file, state, cwd = process.cwd()) {
+  const canonical = projectFingerprint(cwd);
+  if (!state || state.project === canonical) return state;
+  const migrated = { ...state, project: canonical, project_migrated_from: state.project };
+  try {
+    atomicWrite(file, migrated);
+  } catch {
+    // 書き換えられなくても、この呼び出しの判定はcanonicalな識別子で行う。
+  }
+  return migrated;
+}
+
+// このprojectのsession stateを列挙する。旧IDで記録されたstateも同じprojectとして返し、
+// 返す前にcanonicalなIDへ移行する。
+function listProjectSessions(cwd = process.cwd(), env = process.env) {
+  const sessionsDir = path.join(stateRoot(env), 'sessions');
+  let files = [];
+  try {
+    files = fs.readdirSync(sessionsDir).filter(file => file.endsWith('.json'));
+  } catch {
+    return [];
+  }
+  const entries = [];
+  for (const name of files) {
+    const file = path.join(sessionsDir, name);
+    const state = readJson(file);
+    if (!matchesProject(state, cwd)) continue;
+    entries.push({ file, state: canonicalizeProjectState(file, state, cwd) });
+  }
+  return entries;
 }
 
 // 進行中のDeliveryが払い出されたworktreeを持つ場合、branch・HEAD・作業ツリーの
@@ -233,11 +302,15 @@ function recordIncident(incident, options = {}) {
 module.exports = {
   appendEvent,
   atomicWrite,
+  canonicalizeProjectState,
   contextReady,
   deliveryWorkspace,
   hash,
   incidentFingerprint,
+  legacyProjectFingerprints,
+  listProjectSessions,
   logPath,
+  matchesProject,
   projectFingerprint,
   readEvents,
   readJson,

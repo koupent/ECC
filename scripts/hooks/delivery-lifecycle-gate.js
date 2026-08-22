@@ -109,6 +109,20 @@ const SHELL_UNSAFE_OPTIONS = new Map([
 ]);
 // operandが出力先や状態変更になるcommand。`uniq <in> <out>` は二つ目にファイルを作る。
 const SHELL_MAX_OPERANDS = new Map([['hostname', 0], ['uniq', 1]]);
+// 引数のcodeをそのまま実行する起動の仕方。何をどこへ書くかはcommand文字列から追えない
+// ので、worktreeの中で走っていても拒否する。scriptやmoduleを指す形（`node tests/x.js`）は、
+// そのpathが境界検査を通る限り通す。worktreeの中のscript自身が何をするかまではこのGateでは
+// 決められない。そこまで塞ぐには、共有ツリーをprocessから見えなくするOS側の隔離が要る。
+const INLINE_CODE_COMMANDS = new Map([
+  ['node', { options: new Set(['-e', '--eval', '-p', '--print']), letters: 'ep' }],
+  ['bun', { options: new Set(['-e', '--eval', 'eval']), letters: 'e' }],
+  ['deno', { options: new Set(['eval']), letters: '' }],
+  ['python', { options: new Set(['-c']), letters: 'c' }],
+  ['python3', { options: new Set(['-c']), letters: 'c' }],
+  ['perl', { options: new Set(['-e', '-E']), letters: 'eE' }],
+  ['ruby', { options: new Set(['-e']), letters: 'e' }],
+  ['php', { options: new Set(['-r']), letters: 'r' }]
+]);
 // ECC自身のcommandは記録済みのDeliveryからworktreeを解決して、そこだけを読み書きする。
 // 共有ツリーのcwdから起動されても共有ツリーを変更しないので、隔離中でも通す。ただし
 // 「scripts/codex/run-role.js で終わるpath」を名前だけで信用すると、worktreeの中に同じ
@@ -518,6 +532,54 @@ function isWorktreeAwareTool(tokens, base, env) {
   return script !== '' && WORKTREE_AWARE_TOOL_PATHS.has(script);
 }
 
+// ECC自身のcommandでも、`--cwd <共有ツリー>` を渡せば隔離した先ではなくそのpathで走る。
+// 明示的な実行directoryは、記録済みworktreeの中を指す場合だけ通す。値を読み取れない形は
+// どこで走るか決まらないので拒否する。
+function toolWorkspaceOptions(tokens, base, workspace) {
+  for (let index = 1; index < tokens.length; index += 1) {
+    const token = String(tokens[index] || '');
+    const name = token.split('=')[0];
+    if (name !== '--cwd' && name !== '-C') continue;
+    const value = token.includes('=') ? token.slice(token.indexOf('=') + 1) : tokens[index + 1];
+    if (!confinedToWorktree(workspace, resolveDirectory(base, value))) return false;
+  }
+  return true;
+}
+
+// worktreeの中で走ると読み取れても、commandの引数は外のpathを指せる
+// （`cd <worktree> && rm -rf <共有ツリー>/src`、`ln -s <共有ツリー> link`）。実行位置だけで
+// 任意のcommandを通さず、語として現れるpathを実行directoryから解決し、守る根へ届く形を
+// 拒否する。`--name=<path>` のように値を抱えた形も同じに見る。
+// glob（`*` `?`）は一つ以上の名前へ展開されるだけで字面より浅いpathにはならないため、
+// 字面のまま解決して判定できる。先頭の `~` と変数展開は展開結果が決まらないので、
+// worktreeの中だと言い切れず拒否する。
+function confinedOperands(tokens, base, workspace, shared) {
+  for (const token of tokens) {
+    const value = String(token || '');
+    if (!value) continue;
+    const separator = value.indexOf('=');
+    const candidates = separator > 0 ? [value, value.slice(separator + 1)] : [value];
+    for (const candidate of candidates) {
+      if (!candidate) continue;
+      if (candidate.startsWith('~') || candidate.includes('$')) return false;
+      if (escapesWorktree(workspace, shared, path.resolve(base, candidate))) return false;
+    }
+  }
+  return true;
+}
+
+function runsInlineCode(name, args) {
+  const inline = INLINE_CODE_COMMANDS.get(name);
+  if (!inline) return false;
+  return args.some(argument => {
+    const value = String(argument || '');
+    if (inline.options.has(value.split('=')[0])) return true;
+    // `node -pe "…"` のようにまとめて書いた短いoptionも、引数のcodeを実行する。
+    return inline.letters !== '' && /^-[A-Za-z]+$/.test(value) &&
+      [...value.slice(1)].some(letter => inline.letters.includes(letter));
+  });
+}
+
 // 共有ツリーのcwdで通す読み取りcommandは、引数まで読んで初めて読み取りだと言える。
 function isReadOnlyShellCommand(name, args) {
   if (!READ_ONLY_COMMANDS.has(name)) return false;
@@ -606,11 +668,11 @@ function gitInvocation(args, cwd) {
   }
   const subcommand = args[index];
   const rest = args.slice(index + 1);
-  if (!configOverride && isReadOnlyGit(subcommand, rest)) return { write: false, location };
+  if (!configOverride && isReadOnlyGit(subcommand, rest)) return { write: false, location, args: rest };
   // subcommandより前の引数に展開が残っていると、どのツリーを書き換えるか決まらない。
   // subcommand以降はcommit messageなどが入るため、実行directoryの判定には使わない。
-  if (args.slice(0, index + 1).some(arg => /[$`]/.test(arg))) return { write: true, location: null };
-  return { write: true, location };
+  if (args.slice(0, index + 1).some(arg => /[$`]/.test(arg))) return { write: true, location: null, args: rest };
+  return { write: true, location, args: rest };
 }
 
 // worktreeを払い出しても、親CLIのcwdは共有ツリーのままである。隔離中は、実行directoryが
@@ -647,11 +709,12 @@ function targetsWorkspace(command, workspace, cwd = process.cwd(), options = {})
     // 差し替える（`PATH=<worktree> cat …`）。GIT_* は実行directoryに関わらず拒否し、
     // それ以外はworktreeの中で走ることが読み取れる場合だけ通す。
     let overridesEnvironment = false;
+    const assignments = [];
     while (tokens.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) {
       // GIT_DIR や GIT_WORK_TREE はgit自身の書き込み先を差し替える。
       if (/^GIT_/i.test(tokens[0])) return false;
       overridesEnvironment = true;
-      tokens.shift();
+      assignments.push(tokens.shift());
     }
     const executable = tokens[0];
     const name = commandName(executable);
@@ -673,15 +736,31 @@ function targetsWorkspace(command, workspace, cwd = process.cwd(), options = {})
     const inWorktree = confinedToWorktree(workspace, current);
     if (overridesEnvironment && !inWorktree) return false;
     if (name === 'git' && isBareCommand(executable)) {
-      const { write, location } = gitInvocation(tokens.slice(1), current);
+      const { write, location, args } = gitInvocation(tokens.slice(1), current);
       if (write && !confinedToWorktree(workspace, location)) return false;
+      // worktreeで走るgitでも、引数は外のpathを指せる（`git diff --output=<共有ツリー>/x`）。
+      // subcommand以降の引数はgitの実行directoryから解決して境界を検査する。
+      if (write && !confinedOperands(args, location, workspace, shared)) return false;
       continue;
     }
-    if (inWorktree) continue;
+    // ECC自身のcommandは記録済みDeliveryのworktreeを解決して、そこだけを読み書きする。
+    // 実行位置が共有ツリーでもworktreeでも、明示的な実行directoryが外を指さない限り通す。
+    if (isWorktreeAwareTool(tokens, current, env)) {
+      if (!toolWorkspaceOptions(tokens, current, workspace)) return false;
+      continue;
+    }
+    if (inWorktree) {
+      // 実行位置がworktreeの中でも、引数は共有ツリーや兄弟worktreeを指せる。実行位置
+      // だけで任意のcommandを通さない。
+      if (runsInlineCode(name, tokens.slice(1))) return false;
+      // 副作用がないと引数まで確認できた読み取りは、共有ツリーのファイルを引数に取っても
+      // 何も書き換えない。環境変数の前置きがあると、どのprogramが走るか決まらない。
+      if (!overridesEnvironment && isBareCommand(executable) && isReadOnlyShellCommand(name, tokens.slice(1))) continue;
+      if (!confinedOperands([...assignments, ...tokens], current, workspace, shared)) return false;
+      continue;
+    }
     // git以外のcommandも共有ツリーのファイルを書き換える。worktreeの中で走ることが
-    // 読み取れないなら、引数まで見て副作用がないと言える読み取りcommandと、実体が
-    // このplugin自身のscriptであるECCのcommandだけを通す。
-    if (isWorktreeAwareTool(tokens, current, env)) continue;
+    // 読み取れないなら、引数まで見て副作用がないと言える読み取りcommandだけを通す。
     if (!isBareCommand(executable) || !isReadOnlyShellCommand(name, tokens.slice(1))) return false;
   }
   return true;
@@ -895,10 +974,14 @@ function run(rawInput, options = {}) {
       return deny(
         `[ECC Delivery Gate] This delivery is isolated in the worktree ${workspace}, but the command is not provably confined to that worktree. ` +
           `Write it as \`cd "${workspace}" && ...\` or \`git -C "${workspace}" ...\`. ` +
+          'Running inside that worktree is not enough on its own: every argument must resolve inside it, ' +
+          'so a path that reaches the shared working tree or a sibling worktree (`rm -rf <shared>/src`, `ln -s <shared> link`, ' +
+          '`git diff --output=<shared>/file`), an argument only a shell expansion could resolve (`$VAR`, `~/…`), ' +
+          'and inline code (`node -e`, `python -c`) are rejected. ' +
           'In the shared working tree only side-effect-free inspection is allowed (read-only `git` subcommands, `ls`, `cat`, `grep`, …), ' +
           'checked argument by argument, so an option that writes a file or starts another program (`sort -o …`, `rg --pre …`) is rejected, ' +
           "and ECC's own worktree-aware commands (`scripts/codex/run-role.js`, …) only when the script is this plugin's own file, " +
-          'with no output redirection into that tree. ' +
+          'with no output redirection into that tree and no `--cwd` outside the delivery worktree. ' +
           'Forms whose working tree cannot be read from the command itself are rejected: wrappers such as `sh -c` or `xargs`, ' +
           'command substitution and `${...}` expansion, `--git-dir`/`--work-tree`/`GIT_*` overrides, a `cd` that is not chained with `&&`, ' +
           'and quoting the gate cannot parse (an unclosed quote or a trailing backslash). ' +

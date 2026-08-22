@@ -8,16 +8,20 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 const { loadConfig } = require('../../scripts/codex/config');
 const {
+  atomicWrite,
   deliveryWorkspace,
   hash,
   projectFingerprint,
+  readJson,
   readState,
   readEvents,
   recordIncident,
   redactText,
   resetState,
+  statePath,
   writeState
 } = require('../../scripts/codex/runtime-state');
+const { latestState } = require('../../scripts/codex/acceptance-audit');
 const { isTestPath, normalizeReviewResult, requireUsableResult, reviewSnapshot, roleInstructions, runRole, validateResult, workingTreeSignature } = require('../../scripts/codex/run-role');
 const {
   acquireLock,
@@ -929,7 +933,17 @@ test('the boundary holds when the session itself already runs inside the deliver
     `git -C "${siblingPath}" commit -am "fix"`,
     `echo bypass > "${path.join(fixture, 'src', 'product.ts')}"`,
     `cd "${fixture}" && touch src/product.ts`,
-    `echo "safe\\""; git -C "${fixture}" reset --hard`
+    `echo "safe\\""; git -C "${fixture}" reset --hard`,
+    // worktreeの中で走っていても、引数は共有ツリーや兄弟worktreeを指せる。
+    `rm -rf "${path.join(fixture, 'src')}"`,
+    `cp src/product.ts "${path.join(siblingPath, 'src', 'product.ts')}"`,
+    `ln -s "${fixture}" linked-shared`,
+    'rm -rf "$SHARED_TREE"',
+    // 引数のcodeをそのまま実行する形は、何をどこへ書くかcommandから追えない。
+    `node -e "require('fs').rmSync('${fixture}', { recursive: true })"`,
+    'node --eval "process.exit(0)"',
+    // gitがworktreeで走っても、出力先の引数は外を指せる。
+    `git diff --output="${path.join(fixture, 'leak.diff')}"`
   ]) {
     const denied = decide({ ...input, tool_name: 'Bash', tool_input: { command } });
     assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny', command);
@@ -944,7 +958,16 @@ test('the boundary holds when the session itself already runs inside the deliver
     const allowed = JSON.stringify({ ...input, tool_name: 'Edit', tool_input: toolInput });
     assert.strictEqual(deliveryGate.run(allowed, { cwd: worktreePath, env: fixtureEnv }), allowed, toolInput.file_path);
   }
-  for (const command of ['git commit -am "fix"', 'npm test', 'git status --porcelain']) {
+  for (const command of [
+    'git commit -am "fix"',
+    'npm test',
+    'git status --porcelain',
+    // worktreeの中で完結する作業と、共有ツリーを読むだけのcommandは通り続ける。
+    'rm -rf node_modules',
+    'node scripts/build.js',
+    'git diff --output=review.diff',
+    `cat "${path.join(fixture, 'src', 'product.ts')}"`
+  ]) {
     const allowed = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command } });
     assert.strictEqual(deliveryGate.run(allowed, { cwd: worktreePath, env: fixtureEnv }), allowed, command);
   }
@@ -1350,6 +1373,70 @@ test('a linked worktree shares the project identity of its main working tree', (
   assert.strictEqual(pendingSessionForProject(worktreePath, fixtureEnv), 'identity-session');
 });
 
+test('a delivery recorded with the legacy working-tree project identifier is still found and migrated', () => {
+  const fixture = createGitFixture('legacy-project-id-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  const worktreePath = path.join(temp, 'legacy-project-id-worktree');
+  assert.strictEqual(
+    spawnSync('git', ['worktree', 'add', '--quiet', '-b', 'codex/issue-79-legacy', worktreePath], { cwd: fixture }).status,
+    0
+  );
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'legacy-project-id-state') };
+  const input = { session_id: 'legacy-project-id', cwd: fixture };
+  writeState(input, {
+    delivery: {
+      status: 'ready',
+      request_hash: 'legacy-project-fixture',
+      title: 'a delivery serialized before the common project identifier',
+      base_branch: 'main',
+      issue_number: 79,
+      issue_url: 'https://example.invalid/issues/79',
+      branch: 'codex/issue-79-legacy',
+      draft_pr_url: null
+    }
+  }, fixtureEnv);
+
+  // 旧版が直列化したstate。projectは共通のリポジトリ識別子ではなく作業ツリー絶対pathの
+  // hashで、更新時刻はstale監査の対象になるほど古い。
+  const file = statePath(input, fixtureEnv);
+  const legacyProject = hash(path.resolve(fixture));
+  const restoreLegacyState = () => atomicWrite(file, {
+    ...readJson(file),
+    project: legacyProject,
+    updated_at: '2026-01-01T00:00:00.000Z'
+  });
+  assert.notStrictEqual(legacyProject, projectFingerprint(fixture));
+
+  // prepare待ちのSession検索は旧IDでも見つけ、読み込んだ時点でcanonicalなIDへ移行する。
+  restoreLegacyState();
+  assert.strictEqual(pendingSessionForProject(fixture, fixtureEnv), 'legacy-project-id');
+  assert.strictEqual(readJson(file).project, projectFingerprint(fixture));
+
+  // 主作業ツリーのpathで記録された旧IDは、worktreeから探しても同じprojectである。
+  restoreLegacyState();
+  assert.strictEqual(pendingSessionForProject(worktreePath, fixtureEnv), 'legacy-project-id');
+  assert.strictEqual(readJson(file).project, projectFingerprint(worktreePath));
+
+  // 受入監査も旧IDのDeliveryを見失わない。
+  restoreLegacyState();
+  const entry = latestState(fixture, 79, fixtureEnv);
+  assert.ok(entry, 'the acceptance audit must find the legacy state');
+  assert.strictEqual(entry.state.session_id, 'legacy-project-id');
+  assert.strictEqual(readJson(file).project, projectFingerprint(fixture));
+
+  // 取り残されたDeliveryのstale監査も同じく旧IDを拾う。
+  restoreLegacyState();
+  assert.strictEqual(
+    deliveryFinalizer.auditStale({ session_id: 'another-session', cwd: fixture }, { cwd: fixture, env: fixtureEnv }),
+    1
+  );
+  assert.ok(readEvents(fixtureEnv).some(event => event.type === 'delivery_session_incomplete'));
+});
+
 test('completion accepts review evidence bound to the delivery worktree, not the shared tree', () => {
   const fixture = createGitFixture('delivery-worktree-completion-repo');
   fs.writeFileSync(
@@ -1448,7 +1535,17 @@ test('an isolated delivery only allows commands that provably act inside the wor
     'grep -rn pattern\\;name src',
     // ECC自身のcommandは記録済みDeliveryのworktreeを解決して動く。
     'node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --session delivery',
-    `node "${path.join(pluginRoot, 'scripts', 'codex', 'acceptance-audit.js')}" --issue 79`
+    `node "${path.join(pluginRoot, 'scripts', 'codex', 'acceptance-audit.js')}" --issue 79`,
+    // 明示cwdが記録済みworktreeを指すなら、ECCのcommandはそのまま通る。
+    `node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --cwd "${workspace}"`,
+    `cd "${workspace}" && node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --session delivery`,
+    // worktreeの中で完結する作業は、gitでなくても通り続ける。
+    `cd "${workspace}" && rm -rf node_modules`,
+    `cd "${workspace}" && cp src/product.ts src/product.ts.bak`,
+    `cd "${workspace}" && node tests/run-all.js`,
+    `cd "${workspace}" && git diff --output=review.diff`,
+    // 共有ツリーを読むだけのcommandは、worktreeの中からでも通す。
+    `cd "${workspace}" && cat "${shared}/src/product.ts"`
   ]) {
     assert.strictEqual(deliveryGate.targetsWorkspace(command, workspace, shared, { env: gateEnv }), true, command);
   }
@@ -1551,7 +1648,34 @@ test('an isolated delivery only allows commands that provably act inside the wor
     // 読み切れない引用は、どこからが次のcommandなのかを決められない。
     'git status --porcelain "',
     "git status --porcelain 'unclosed",
-    'git status --porcelain \\'
+    'git status --porcelain \\',
+    // 実行位置がworktreeの中でも、引数は共有ツリーや兄弟worktreeを指せる。実行位置だけで
+    // 任意のcommandを通すと、隔離はcdを一つ書くだけで無効になる。
+    `cd "${workspace}" && rm -rf "${shared}/src"`,
+    `cd "${workspace}" && cp src/product.ts "${shared}/src/product.ts"`,
+    `cd "${workspace}" && mv src/product.ts "${shared}/src/product.ts"`,
+    `cd "${workspace}" && rm -rf ../../targets-shared/src`,
+    // 共有ツリーへのsymlinkを作れば、以降の書き込みはworktreeの中に見える。
+    `cd "${workspace}" && ln -s "${shared}" linked-shared`,
+    `cd "${workspace}" && ln -s ../../targets-shared linked-shared`,
+    // 展開してからでないと、引数が何を指すか決まらない。
+    `cd "${workspace}" && rm -rf "$SHARED_TREE"`,
+    `cd "${workspace}" && rm -rf ~/repo/src`,
+    `cd "${workspace}" && PATH="${shared}/bin" npm test`,
+    // 引数のcodeをそのまま実行する形は、worktreeの中で走っていても対象を追えない。
+    `cd "${workspace}" && node -e "require('fs').writeFileSync('x', '')"`,
+    `cd "${workspace}" && node --eval "process.exit(0)"`,
+    `cd "${workspace}" && node -pe "1"`,
+    `cd "${workspace}" && python3 -c "open('x', 'w')"`,
+    `cd "${workspace}" && perl -e "1"`,
+    // gitがworktreeで走っても、引数の出力先は外を指せる。
+    `cd "${workspace}" && git diff --output="${shared}/leak.diff"`,
+    `git -C "${workspace}" diff --output="${shared}/leak.diff"`,
+    // ECC自身のcommandでも、明示cwdが外を指せば隔離した先では走らない。
+    `node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --cwd "${shared}"`,
+    `node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --cwd="${shared}"`,
+    `cd "${workspace}" && node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --cwd ..`,
+    `node "${path.join(pluginRoot, 'scripts', 'codex', 'run-role.js')}" review --cwd`
   ]) {
     assert.strictEqual(deliveryGate.targetsWorkspace(command, workspace, shared, { env: gateEnv }), false, command);
   }
@@ -2361,6 +2485,51 @@ test('run-role persists a contradictory release blocker as blocked', () => {
   assert.strictEqual(output.result.status, 'blocked');
   assert.strictEqual(state.review_status, 'blocked');
   assert.strictEqual(state.review_blocking_findings, 1);
+});
+
+test('Codex roles refuse an explicit cwd that is not the recorded delivery worktree', () => {
+  const fixture = createGitFixture('run-role-cwd-repo');
+  const fixtureEnv = {
+    ...env,
+    ECC_KOUTE_STATE_DIR: path.join(temp, 'run-role-cwd-state'),
+    // shimはworktreeにも渡る必要があるため、払い出しの前にcommitしておく。
+    ECC_CODEX_BINARY: createCodexShim('run-role-cwd', fixture)
+  };
+  const branch = 'codex/issue-79-run-role-cwd';
+  const worktreePath = path.join(temp, 'run-role-cwd-worktree');
+  assert.strictEqual(
+    spawnSync('git', ['worktree', 'add', '--quiet', '-b', branch, worktreePath], { cwd: fixture }).status,
+    0
+  );
+  const session = { session_id: 'run-role-cwd' };
+  writeState(session, {
+    delivery: { status: 'ready', issue_number: 79, branch, base_branch: 'main', worktree_path: worktreePath }
+  }, fixtureEnv);
+
+  // 共有ツリーを --cwd で渡しても、隔離済みDeliveryのroleはそこでは走らない。
+  // workspace-write roleならそのまま共有ツリーを書き換えてしまう。
+  for (const cwd of [fixture, path.join(worktreePath, 'src')]) {
+    assert.throws(
+      () => runRole({ role: 'contract-test', request: 'write a contract test', cwd, sessionId: session.session_id, env: fixtureEnv }),
+      /--cwd points at/,
+      cwd
+    );
+  }
+
+  // 記録済みworktreeそのものを指す --cwd は従来どおり通り、証拠もそのHEADに結び付く。
+  const output = runRole({ role: 'review', request: 'review the delivery', cwd: worktreePath, sessionId: session.session_id, env: fixtureEnv });
+  assert.strictEqual(output.ok, true, JSON.stringify(output));
+  assert.strictEqual(
+    readState(session, fixtureEnv).review_head,
+    spawnSync('git', ['rev-parse', 'HEAD'], { cwd: worktreePath, encoding: 'utf8' }).stdout.trim()
+  );
+
+  // worktreeが失われた後も、--cwdで共有ツリーへ戻ることはできない。
+  fs.rmSync(worktreePath, { recursive: true, force: true });
+  assert.throws(
+    () => runRole({ role: 'review', request: 'review the delivery', cwd: fixture, sessionId: session.session_id, env: fixtureEnv }),
+    /missing or belongs to another repository/
+  );
 });
 
 test('distributed agent rules defer to runtime capabilities and do not claim automatic spawning', () => {

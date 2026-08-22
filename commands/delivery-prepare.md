@@ -79,6 +79,17 @@ have run in the worktree:
 
 - Anything that can create or change a file while the gate cannot prove it runs in
   the worktree: `npm test`, `touch`, `rm`, `mv`, `sed -i`, `node script.js`, …
+- Running inside the worktree is not a blanket permission. Every argument must
+  resolve inside it, so `cd "<worktree_path>" && rm -rf "<shared tree>/src"`,
+  `cp file "<sibling worktree>/file"`, `ln -s "<shared tree>" link` and
+  `git diff --output="<shared tree>/x"` are rejected there too. Arguments only a
+  shell expansion could resolve (`$VAR`, `~/…`, an environment prefix such as
+  `PATH=…`) and inline code (`node -e`, `node -p`, `python -c`, `perl -e`, …) are
+  rejected because the gate cannot read their target. A command that only reads
+  (`cat`, `grep`, `ls`, …) may still take a shared-tree path as an argument.
+  Scripts inside the worktree (`node tests/run-all.js`, `npm test`) run as before;
+  what such a script does at runtime is beyond a command-line gate, so treat
+  OS-level isolation as the stronger boundary when you need one.
 - Output redirection into the shared tree, whatever the command is
   (`git status > src/out.txt`, `echo x >> src/product.ts`), including an operator
   attached to the preceding word (`echo payload marker>src/product.ts`) or carrying a
@@ -113,7 +124,10 @@ subcommands (`git status`, `git log`, `git diff`, `git branch --show-current`,
 as long as they redirect nothing into that tree. ECC's own worktree-aware commands
 (`node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" …`, `acceptance-audit.js`,
 `reset.js`) also stay available, because they resolve the recorded worktree
-themselves.
+themselves. An explicit working directory does not override that: `run-role.js`
+refuses a `--cwd` that is not the recorded worktree, and the gate rejects such a
+command as well, so a Codex role can never be pointed at the shared tree or a
+sibling worktree.
 
 The branch and base refs must be shell-safe (letters, digits, `.`, `_`, `/`, `-`,
 no leading `-` and no `..`). Git also accepts refs containing `;`, `&` or `$()`,

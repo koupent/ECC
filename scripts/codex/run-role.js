@@ -30,6 +30,17 @@ const ROLE_DEFS = {
   'harness-remediation': { model: 'review', schema: 'assessment-result.schema.json', sandbox: 'workspace-write', writePolicy: 'fork-only' }
 };
 
+// symlink越しに同じdirectoryを指す形も同一と見なせるよう、実体まで解決する。
+// 解決できないpathは字面のまま比べる。
+function realPath(target) {
+  const absolute = path.resolve(String(target || ''));
+  try {
+    return fs.realpathSync(absolute);
+  } catch {
+    return absolute;
+  }
+}
+
 function git(cwd, args, options = {}) {
   return spawnSync('git', args, {
     cwd,
@@ -275,13 +286,24 @@ function runRole(options) {
   if (!def) throw new Error(`Unknown Codex role: ${role}`);
   const env = options.env || process.env;
   const input = { session_id: options.sessionId || resolveSessionId({}, env) };
-  // 明示的なcwdがなければ、進行中Deliveryのworktreeで実行する。共有ツリーでレビュー
-  // すると、証拠が実装コミットではないHEADに結び付き、完了Gateを通せない。
-  const workspace = options.cwd || deliveryWorkspace(readState(input, env), process.cwd());
-  if (!workspace) {
+  // 進行中Deliveryがworktreeを記録しているなら、roleはそのworktreeでしか走らない。
+  // 共有ツリーでレビューすると、証拠が実装コミットではないHEADに結び付いて完了Gateを
+  // 通せないうえ、workspace-write roleなら共有ツリーを書き換えてしまう。
+  const deliveryState = readState(input, env);
+  const isolated = Boolean(deliveryState.delivery && deliveryState.delivery.worktree_path);
+  const workspace = deliveryWorkspace(deliveryState, options.cwd || process.cwd());
+  if (isolated && !workspace) {
     throw new Error(
       'The worktree recorded for the active delivery is missing or belongs to another repository. ' +
-        'Restore it or pass an explicit --cwd; Codex roles never fall back to the shared working tree.'
+        'Restore that worktree or reset the delivery; Codex roles never fall back to the shared working tree.'
+    );
+  }
+  // 明示的な --cwd は、記録済みworktreeそのものを指す場合だけ受け付ける。ここでcwdを
+  // 優先すると、role呼び出しに共有ツリーや兄弟worktreeを渡すだけで隔離を迂回できる。
+  if (isolated && options.cwd && path.resolve(options.cwd) !== workspace && realPath(options.cwd) !== realPath(workspace)) {
+    throw new Error(
+      `Codex roles for the active delivery run in its worktree ${workspace}, but --cwd points at ${path.resolve(options.cwd)}. ` +
+        'Drop --cwd, or reset the delivery if the recorded worktree is no longer the right place to work.'
     );
   }
   const cwd = path.resolve(workspace);
@@ -460,7 +482,8 @@ function runRole(options) {
 }
 
 function parseArgs(argv) {
-  // cwdは既定値を持たない。指定がないときだけrunRoleがDelivery worktreeへ解決する。
+  // cwdは既定値を持たない。指定がなければrunRoleがDelivery worktreeへ解決し、指定が
+  // あっても隔離済みDeliveryでは記録済みworktreeと同一であることを要求する。
   const options = { role: argv[2], request: '' };
   for (let i = 3; i < argv.length; i += 1) {
     if (argv[i] === '--request') options.request = argv[++i] || '';
