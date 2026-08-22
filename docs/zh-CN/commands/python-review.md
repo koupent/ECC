@@ -9,7 +9,7 @@ description: 全面的Python代码审查，确保符合PEP 8标准、类型提�
 ## 此命令的功能
 
 1. **识别 Python 变更**：通过 `git diff` 查找修改过的 `.py` 文件
-2. **运行静态分析**：执行 `ruff`、`mypy`、`pylint`、`black --check`
+2. **运行静态分析**：只运行项目配置中选定的格式化、导入排序、检查和类型工具
 3. **安全扫描**：检查 SQL 注入、命令注入、不安全的反序列化
 4. **类型安全审查**：分析类型提示和 mypy 错误
 5. **Pythonic 代码检查**：验证代码是否遵循 PEP 8 和 Python 最佳实践
@@ -62,10 +62,9 @@ description: 全面的Python代码审查，确保符合PEP 8标准、类型提�
 # Type checking
 mypy .
 
-# Linting and formatting
+# Linting and formatting (Ruff-only example)
+ruff format --check .
 ruff check .
-black --check .
-isort --check-only .
 
 # Security scanning
 bandit -r .
@@ -91,9 +90,9 @@ Agent:
 - app/services/auth.py (modified)
 
 ## Static Analysis Results
-✓ ruff: No issues
+✓ configured formatter: No issues
+✓ configured linter: No issues
 ✓ mypy: No errors
-WARNING: black: 2 files need reformatting
 ✓ bandit: No security issues
 
 ## Issues Found
@@ -175,7 +174,7 @@ with open("config.json") as f:  # Good
 
 ## 所需的格式化
 
-运行：`black app/routes/user.py app/services/auth.py`
+请运行项目配置中选定的格式化工具。
 
 ````
 ## 审批标准

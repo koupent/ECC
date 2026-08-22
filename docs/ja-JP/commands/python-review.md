@@ -9,7 +9,7 @@ description: PEP 8準拠、型ヒント、セキュリティ、Pythonic慣用句
 ## このコマンドの機能
 
 1. **Python変更の特定**: `git diff`で変更された`.py`ファイルを検出
-2. **静的解析の実行**: `ruff`、`mypy`、`pylint`、`black --check`を実行
+2. **静的解析の実行**: プロジェクトが設定したformatter、import sorter、linter、型検査だけを実行
 3. **セキュリティスキャン**: SQLインジェクション、コマンドインジェクション、安全でないデシリアライゼーションをチェック
 4. **型安全性のレビュー**: 型ヒントとmypyエラーを分析
 5. **Pythonicコードチェック**: コードがPEP 8とPythonベストプラクティスに従っていることを確認
@@ -58,10 +58,9 @@ description: PEP 8準拠、型ヒント、セキュリティ、Pythonic慣用句
 # 型チェック
 mypy .
 
-# リンティングとフォーマット
+# リンティングとフォーマット（Ruff専用構成の例）
+ruff format --check .
 ruff check .
-black --check .
-isort --check-only .
 
 # セキュリティスキャン
 bandit -r .
@@ -87,9 +86,9 @@ Agent:
 - app/services/auth.py (変更)
 
 ## 静的解析結果
-✓ ruff: 問題なし
+✓ 設定済みformatter: 問題なし
+✓ 設定済みlinter: 問題なし
 ✓ mypy: エラーなし
-WARNING: black: 2ファイルが再フォーマット必要
 ✓ bandit: セキュリティ問題なし
 
 ## 発見された問題
@@ -158,7 +157,7 @@ with open("config.json") as f:  # 良い
 推奨: FAIL: CRITICAL問題が修正されるまでマージをブロック
 
 ## フォーマット必要
-実行: `black app/routes/user.py app/services/auth.py`
+プロジェクトが設定したformatterを対象ファイルへ実行してください。
 ```
 
 ## 承認基準

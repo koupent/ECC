@@ -33,9 +33,9 @@ class Point(NamedTuple):
 
 ## Formatting
 
-- **black** for code formatting
-- **isort** for import sorting
-- **ruff** for linting
+- Use the formatter, import sorter, and linter configured by the project.
+- In a Ruff-only project, use `ruff format` and `ruff check`; do not require `black` or `isort`.
+- Do not introduce or run a second tool unless the project explicitly adopts it.
 
 ## Reference
 

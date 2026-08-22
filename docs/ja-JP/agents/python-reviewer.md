@@ -9,7 +9,7 @@ model: opus
 
 起動されたら:
 1. `git diff -- '*.py'`を実行して最近のPythonファイルの変更を確認する
-2. 利用可能な場合は静的解析ツールを実行（ruff、mypy、pylint、black --check）
+2. プロジェクト設定を確認し、設定済みのformatter・import sorter・linter・型検査だけを実行する。Ruff専用プロジェクトへblackやisortを要求しない
 3. 変更された`.py`ファイルに焦点を当てる
 4. すぐにレビューを開始する
 
@@ -419,9 +419,9 @@ mypy .
 ruff check .
 pylint app/
 
-# フォーマットチェック
-black --check .
-isort --check-only .
+# フォーマットとlint（Ruff専用構成の例。実際はプロジェクト設定に従う）
+ruff format --check .
+ruff check .
 
 # セキュリティスキャン
 bandit -r .

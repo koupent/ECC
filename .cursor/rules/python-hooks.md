@@ -11,7 +11,7 @@ alwaysApply: false
 
 Configure in `~/.claude/settings.json`:
 
-- **black/ruff**: Auto-format `.py` files after edit
+- **Configured formatter**: Auto-format `.py` files after edit with the formatter selected by the project
 - **mypy/pyright**: Run type checking after editing `.py` files
 
 ## Warnings

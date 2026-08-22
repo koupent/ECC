@@ -10,7 +10,7 @@ model: sonnet
 当被调用时：
 
 1. 运行 `git diff -- '*.py'` 以查看最近的 Python 文件更改
-2. 如果可用，运行静态分析工具（ruff, mypy, pylint, black --check）
+2. 先读取项目配置，只运行项目选定的格式化、导入排序、检查和类型工具；Ruff-only 项目不得要求 black 或 isort
 3. 重点关注已修改的 `.py` 文件
 4. 立即开始审查
 
@@ -70,8 +70,8 @@ model: sonnet
 
 ```bash
 mypy .                                     # Type checking
-ruff check .                               # Fast linting
-black --check .                            # Format check
+ruff format --check .                      # Ruff-only format example
+ruff check .                               # Ruff-only lint example
 bandit -r .                                # Security scan
 pytest --cov=app --cov-report=term-missing # Test coverage
 ```

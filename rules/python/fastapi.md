@@ -1,12 +1,18 @@
 ---
 paths:
+  - "**/api/**/*.py"
   - "**/app/**/*.py"
   - "**/fastapi/**/*.py"
+  - "**/routers/**/*.py"
+  - "**/routes/**/*.py"
   - "**/*_api.py"
 ---
 # FastAPI Rules
 
-Use these rules for FastAPI projects alongside the general Python rules.
+Use these rules for FastAPI projects alongside the general Python rules. The
+path globs above cover the common FastAPI layouts (`api/`, `app/`, top-level
+`routers/` or `routes/`); if the project does not depend on `fastapi`, these
+rules do not apply even when a file matches.
 
 ## Structure
 

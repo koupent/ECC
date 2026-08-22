@@ -33,9 +33,9 @@ class Point(NamedTuple):
 
 ## Formatlama
 
-- Kod formatlama için **black**
-- Import sıralama için **isort**
-- Linting için **ruff**
+- Projenin yapılandırdığı biçimlendirici, import sıralayıcı ve linter'ı kullanın
+- Ruff-only projede `ruff format` ve `ruff check` kullanın; black veya isort istemeyin
+- Projenin benimsemediği ikinci bir aracı eklemeyin veya çalıştırmayın
 
 ## Referans
 

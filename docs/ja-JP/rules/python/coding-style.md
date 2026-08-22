@@ -33,9 +33,9 @@ class Point(NamedTuple):
 
 ## フォーマット
 
-- **black** — コードフォーマット
-- **isort** — インポートの並べ替え
-- **ruff** — リンティング
+- プロジェクトが設定したformatter、import sorter、linterを使用する
+- Ruff専用プロジェクトでは`ruff format`と`ruff check`を使い、blackやisortを要求しない
+- プロジェクトが採用していないツールを追加・実行しない
 
 ## リファレンス
 

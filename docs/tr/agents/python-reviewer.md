@@ -9,7 +9,7 @@ Pythonic kodun ve en iyi uygulamaların yüksek standartlarını sağlayan kıde
 
 Çağrıldığınızda:
 1. Son Python dosya değişikliklerini görmek için `git diff -- '*.py'` çalıştırın
-2. Varsa statik analiz araçlarını çalıştırın (ruff, mypy, pylint, black --check)
+2. Proje yapılandırmasını okuyun ve yalnız seçilen biçimlendirici, import sıralayıcı, linter ve tür denetleyiciyi çalıştırın; Ruff-only projede black veya isort istemeyin
 3. Değiştirilmiş `.py` dosyalarına odaklanın
 4. İncelemeye hemen başlayın
 
@@ -62,8 +62,8 @@ Pythonic kodun ve en iyi uygulamaların yüksek standartlarını sağlayan kıde
 
 ```bash
 mypy .                                     # Tür kontrolü
-ruff check .                               # Hızlı linting
-black --check .                            # Format kontrolü
+ruff format --check .                      # Ruff-only biçim örneği
+ruff check .                               # Ruff-only lint örneği
 bandit -r .                                # Güvenlik taraması
 pytest --cov=app --cov-report=term-missing # Test kapsama
 ```

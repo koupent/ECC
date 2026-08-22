@@ -9,7 +9,7 @@ This command invokes the **python-reviewer** agent for comprehensive Python-spec
 ## What This Command Does
 
 1. **Identify Python Changes**: Find modified `.py` files via `git diff`
-2. **Run Static Analysis**: Execute `ruff`, `mypy`, `pylint`, `black --check`
+2. **Run Static Analysis**: Read the project configuration and run only the formatter, import sorter, linter, and type checker that the project actually declares. Do not require `black` or `isort` in a Ruff-only project.
 3. **Security Scan**: Check for SQL injection, command injection, unsafe deserialization
 4. **Type Safety Review**: Analyze type hints and mypy errors
 5. **Pythonic Code Check**: Verify code follows PEP 8 and Python best practices
@@ -58,10 +58,9 @@ Use `/python-review` when:
 # Type checking
 mypy .
 
-# Linting and formatting
+# Linting and formatting (Ruff-only example; use the configured tools)
+ruff format --check .
 ruff check .
-black --check .
-isort --check-only .
 
 # Security scanning
 bandit -r .
@@ -87,9 +86,9 @@ Agent:
 - app/services/auth.py (modified)
 
 ## Static Analysis Results
-✓ ruff: No issues
+✓ configured formatter: No issues
+✓ configured linter: No issues
 ✓ mypy: No errors
-WARNING: black: 2 files need reformatting
 ✓ bandit: No security issues
 
 ## Issues Found
@@ -158,7 +157,7 @@ with open("config.json") as f:  # Good
 Recommendation: FAIL: Block merge until CRITICAL issue is fixed
 
 ## Formatting Required
-Run: `black app/routes/user.py app/services/auth.py`
+Run the formatter configured by this project for the listed files.
 ```
 
 ## Approval Criteria
