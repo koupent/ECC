@@ -21,12 +21,64 @@ const fs = require('fs');
 
 const MAX_STDIN = 1024 * 1024; // 1MB limit
 
+// Git global options that consume the following token as their value.
+const GIT_GLOBAL_OPTIONS_WITH_VALUE = new Set([
+  '-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--config-env', '--super-prefix'
+]);
+
+function tokenizeCommand(segment) {
+  return String(segment || '').match(/"[^"]*"|'[^']*'|\S+/g) || [];
+}
+
+function unquoteToken(token) {
+  const value = String(token || '');
+  return /^(["']).*\1$/.test(value) ? value.slice(1, -1) : value;
+}
+
+/**
+ * Locate the `git commit` in a command line and the directory it runs in.
+ *
+ * A delivery commits inside its own worktree (`git -C "<worktree>" commit ...`
+ * or `cd "<worktree>" && git commit ...`), while this hook's process still runs
+ * in the directory the CLI was started from. Inspecting the staged files of that
+ * directory would check a different tree than the one being committed, so the
+ * working directory is read from the command line itself.
+ *
+ * @param {string} command
+ * @returns {{cwd: string}|null} Commit invocation, or null when there is none
+ */
+function findGitCommit(command) {
+  let base = process.cwd();
+  for (const segment of String(command || '').split(/[;&|\n]+/)) {
+    const tokens = tokenizeCommand(segment);
+    const name = unquoteToken(tokens[0]);
+    if (name === 'cd' && tokens.length > 1) {
+      base = path.resolve(base, unquoteToken(tokens[1]));
+      continue;
+    }
+    if (!/^git(?:\.exe)?$/i.test(name)) continue;
+
+    let cwd = base;
+    let index = 1;
+    while (index < tokens.length && tokens[index].startsWith('-')) {
+      const option = tokens[index];
+      if (option === '-C') cwd = path.resolve(cwd, unquoteToken(tokens[index + 1]));
+      else if (option.length > 2 && option.startsWith('-C')) cwd = path.resolve(cwd, unquoteToken(option.slice(2)));
+      index += GIT_GLOBAL_OPTIONS_WITH_VALUE.has(option) ? 2 : 1;
+    }
+    if (tokens[index] === 'commit') return { cwd };
+  }
+  return null;
+}
+
 /**
  * Detect staged files for commit
+ * @param {string} cwd - Working directory the commit runs in
  * @returns {string[]} Array of staged file paths
  */
-function getStagedFiles() {
+function getStagedFiles(cwd) {
   const result = spawnSync('git', ['diff', '--cached', '--name-only', '--diff-filter=ACMR'], {
+    cwd,
     encoding: 'utf8',
     stdio: ['pipe', 'pipe', 'pipe']
   });
@@ -36,8 +88,9 @@ function getStagedFiles() {
   return result.stdout.trim().split('\n').filter(f => f.length > 0);
 }
 
-function getStagedFileContent(filePath) {
+function getStagedFileContent(cwd, filePath) {
   const result = spawnSync('git', ['show', `:${filePath}`], {
+    cwd,
     encoding: 'utf8',
     stdio: ['pipe', 'pipe', 'pipe']
   });
@@ -59,14 +112,15 @@ function shouldCheckFile(filePath) {
 
 /**
  * Find issues in file content
- * @param {string} filePath 
+ * @param {string} cwd - Working directory the commit runs in
+ * @param {string} filePath
  * @returns {object[]} Array of issues found
  */
-function findFileIssues(filePath) {
+function findFileIssues(cwd, filePath) {
   const issues = [];
-  
+
   try {
-    const content = getStagedFileContent(filePath);
+    const content = getStagedFileContent(cwd, filePath);
     if (content === null || content === undefined) {
       return issues;
     }
@@ -223,9 +277,10 @@ function resolveCommand(command) {
   return null;
 }
 
-function runLinterCommand(command, args) {
+function runLinterCommand(command, args, cwd) {
   const useShell = process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(command);
   return spawnSync(command, args, {
+    cwd,
     encoding: 'utf8',
     stdio: ['pipe', 'pipe', 'pipe'],
     timeout: 30000,
@@ -239,10 +294,11 @@ function commandOutput(result) {
 
 /**
  * Run linter on staged files
- * @param {string[]} files 
+ * @param {string[]} files
+ * @param {string} cwd - Working directory the commit runs in
  * @returns {object} Lint results
  */
-function runLinter(files) {
+function runLinter(files, cwd) {
   const jsFiles = files.filter(f => /\.(js|jsx|ts|tsx)$/.test(f));
   const pyFiles = files.filter(f => f.endsWith('.py'));
   const goFiles = files.filter(f => f.endsWith('.go'));
@@ -256,9 +312,9 @@ function runLinter(files) {
   // Run ESLint if available
   if (jsFiles.length > 0) {
     const eslintBin = process.platform === 'win32' ? 'eslint.cmd' : 'eslint';
-    const eslintPath = path.join(process.cwd(), 'node_modules', '.bin', eslintBin);
+    const eslintPath = path.join(cwd, 'node_modules', '.bin', eslintBin);
     if (fs.existsSync(eslintPath)) {
-      const result = runLinterCommand(eslintPath, ['--format', 'compact', ...jsFiles]);
+      const result = runLinterCommand(eslintPath, ['--format', 'compact', ...jsFiles], cwd);
       results.eslint = {
         success: result.status === 0,
         output: commandOutput(result)
@@ -273,7 +329,7 @@ function runLinter(files) {
       if (!pylintPath) {
         results.pylint = null;
       } else {
-        const result = runLinterCommand(pylintPath, ['--output-format=text', ...pyFiles]);
+        const result = runLinterCommand(pylintPath, ['--output-format=text', ...pyFiles], cwd);
         results.pylint = {
           success: result.status === 0,
           output: commandOutput(result)
@@ -291,7 +347,7 @@ function runLinter(files) {
       if (!golintPath) {
         results.golint = null;
       } else {
-        const result = runLinterCommand(golintPath, goFiles);
+        const result = runLinterCommand(golintPath, goFiles, cwd);
         results.golint = {
           success: !result.stdout || result.stdout.trim() === '',
           output: commandOutput(result)
@@ -314,20 +370,21 @@ function evaluate(rawInput) {
   try {
     const input = JSON.parse(rawInput);
     const command = input.tool_input?.command || '';
-    
-    // Only run for git commit commands
-    if (!command.includes('git commit')) {
+
+    // Only run for git commit commands, wherever they run
+    const commit = findGitCommit(command);
+    if (!commit) {
       return { output: rawInput, exitCode: 0 };
     }
-    
+
     // Check if this is an amend (skip checks for amends to avoid blocking)
     if (command.includes('--amend')) {
       return { output: rawInput, exitCode: 0 };
     }
-    
-    // Get staged files
-    const stagedFiles = getStagedFiles();
-    
+
+    // Get staged files from the tree that is actually being committed
+    const stagedFiles = getStagedFiles(commit.cwd);
+
     if (stagedFiles.length === 0) {
       console.error('[Hook] No staged files found. Use "git add" to stage files first.');
       return { output: rawInput, exitCode: 0 };
@@ -343,7 +400,7 @@ function evaluate(rawInput) {
     let infoCount = 0;
     
     for (const file of filesToCheck) {
-      const fileIssues = findFileIssues(file);
+      const fileIssues = findFileIssues(commit.cwd, file);
       if (fileIssues.length > 0) {
         console.error(`\n[FILE] ${file}`);
         for (const issue of fileIssues) {
@@ -372,7 +429,7 @@ function evaluate(rawInput) {
     }
     
     // Run linter
-    const lintResults = runLinter(filesToCheck);
+    const lintResults = runLinter(filesToCheck, commit.cwd);
     
     if (lintResults.eslint && !lintResults.eslint.success) {
       console.error('\nESLint Issues:');
@@ -445,4 +502,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { run, evaluate };
+module.exports = { run, evaluate, findGitCommit };

@@ -2235,7 +2235,7 @@ test('delivery completion gate does not allow a required pending delivery to sto
   assert.match(output.reason, /delivery-prepare/);
 });
 
-test('a clean commit is recorded and further edits wait for an independent review', () => {
+test('a clean commit in the delivery worktree is recorded and further edits wait for an independent review', () => {
   const fixture = createGitFixture('delivery-progress-repo');
   fs.writeFileSync(
     path.join(fixture, '.ecc', 'config.json'),
@@ -2245,25 +2245,38 @@ test('a clean commit is recorded and further edits wait for an independent revie
   assert.strictEqual(spawnSync('git', ['add', '.ecc/config.json'], { cwd: fixture }).status, 0);
   assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'require delivery'], { cwd: fixture }).status, 0);
   const branch = 'codex/issue-31-progress';
-  assert.strictEqual(spawnSync('git', ['switch', '-c', branch], { cwd: fixture }).status, 0);
-  fs.writeFileSync(path.join(fixture, 'src', 'product.ts'), 'export const product = false;\n', 'utf8');
-  assert.strictEqual(spawnSync('git', ['add', 'src/product.ts'], { cwd: fixture }).status, 0);
-  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'fix product'], { cwd: fixture }).status, 0);
+  // 実装は共有ツリーではなく払い出したworktreeで進む。共有ツリーは自分のbranchのままである。
+  const worktreePath = path.join(temp, 'delivery-progress-worktree');
+  assert.strictEqual(
+    spawnSync('git', ['worktree', 'add', '--quiet', '-b', branch, worktreePath], { cwd: fixture }).status,
+    0
+  );
+  fs.writeFileSync(path.join(worktreePath, 'src', 'product.ts'), 'export const product = false;\n', 'utf8');
+  assert.strictEqual(spawnSync('git', ['add', 'src/product.ts'], { cwd: worktreePath }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'fix product'], { cwd: worktreePath }).status, 0);
 
   const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-progress-state') };
   const input = { session_id: 'delivery-progress', cwd: fixture };
-  writeState(input, { delivery: { status: 'ready', issue_number: 31, branch, base_branch: 'main' } }, fixtureEnv);
+  writeState(input, {
+    project: projectFingerprint(fixture),
+    delivery: { status: 'ready', issue_number: 31, branch, base_branch: 'main', worktree_path: worktreePath }
+  }, fixtureEnv);
+  // 手順書が案内するコミットの形は `git -C "<worktree>" commit …` である。共有ツリーで走る
+  // 形しか読めない観測では、隔離後のDeliveryのコミットを一つも記録できない。
+  assert.strictEqual(deliveryProgress.runsGitCommit(`git -C "${worktreePath}" commit -m "fix product"`), true);
+  assert.strictEqual(deliveryProgress.runsGitCommit(`cd "${worktreePath}" && git commit -m "fix product"`), true);
+  assert.strictEqual(deliveryProgress.runsGitCommit('git log --oneline -5'), false);
   const progress = deliveryProgress.run(JSON.stringify({
     ...input,
     tool_name: 'Bash',
-    tool_input: { command: 'git commit -m "fix product"' },
+    tool_input: { command: `git -C "${worktreePath}" commit -m "fix product"` },
     tool_response: { exit_code: 0 }
   }), { cwd: fixture, env: fixtureEnv });
   assert.match(progress.additionalContext, /independent Codex review/);
   const recorded = readState(input, fixtureEnv);
-  assert.strictEqual(recorded.delivery.committed_head, spawnSync('git', ['rev-parse', 'HEAD'], { cwd: fixture, encoding: 'utf8' }).stdout.trim());
+  assert.strictEqual(recorded.delivery.committed_head, spawnSync('git', ['rev-parse', 'HEAD'], { cwd: worktreePath, encoding: 'utf8' }).stdout.trim());
 
-  const edit = JSON.stringify({ ...input, tool_name: 'Edit', tool_input: { file_path: path.join(fixture, 'src', 'product.ts') } });
+  const edit = JSON.stringify({ ...input, tool_name: 'Edit', tool_input: { file_path: path.join(worktreePath, 'src', 'product.ts') } });
   const denied = JSON.parse(deliveryGate.run(edit, { cwd: fixture, env: fixtureEnv }));
   assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny');
   assert.match(denied.hookSpecificOutput.permissionDecisionReason, /waiting for an independent Codex review/);
@@ -2286,20 +2299,30 @@ test('failed commits do not advance Delivery and branch mismatch incidents are d
     JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
     'utf8'
   );
+  const branch = 'codex/issue-32-dedup';
+  // 記録済みbranchとは別のbranchのまま残っているworktree。不一致はここで観測される。
+  const worktreePath = path.join(temp, 'delivery-incident-dedup-worktree');
+  assert.strictEqual(
+    spawnSync('git', ['worktree', 'add', '--quiet', '-b', 'codex/issue-32-other', worktreePath], { cwd: fixture }).status,
+    0
+  );
   const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-incident-dedup-state') };
   const input = { session_id: 'delivery-incident-dedup', cwd: fixture };
-  writeState(input, { delivery: { status: 'ready', issue_number: 32, branch: 'codex/issue-32-dedup' } }, fixtureEnv);
+  writeState(input, {
+    project: projectFingerprint(fixture),
+    delivery: { status: 'ready', issue_number: 32, branch, worktree_path: worktreePath }
+  }, fixtureEnv);
 
   const failedCommit = JSON.stringify({
     ...input,
     tool_name: 'Bash',
-    tool_input: { command: 'git commit -m failed' },
+    tool_input: { command: `git -C "${worktreePath}" commit -m failed` },
     tool_response: { exit_code: 1, stderr: 'nothing to commit' }
   });
   assert.strictEqual(deliveryProgress.run(failedCommit, { cwd: fixture, env: fixtureEnv }), failedCommit);
   assert.strictEqual(readState(input, fixtureEnv).delivery.committed_head, undefined);
 
-  const edit = JSON.stringify({ ...input, tool_name: 'Edit', tool_input: { file_path: path.join(fixture, 'src', 'product.ts') } });
+  const edit = JSON.stringify({ ...input, tool_name: 'Edit', tool_input: { file_path: path.join(worktreePath, 'src', 'product.ts') } });
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const denied = JSON.parse(deliveryGate.run(edit, { cwd: fixture, env: fixtureEnv }));
     assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny');

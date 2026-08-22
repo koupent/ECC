@@ -16,9 +16,32 @@ function gitValue(cwd, env, args) {
   return result.status === 0 ? String(result.stdout || '').trim() : '';
 }
 
+// gitのglobal optionは値を別tokenに取る（`git -C <path> commit`）。隔離されたDeliveryは
+// 払い出したworktreeでコミットするため、手順書が案内する形がまさにこれである。optionを
+// 「`-` で始まる語の並び」とだけ読むと、この形のコミットを一つも観測できず、レビュー要求も
+// コミット後の編集を止めるGateも働かないまま完了へ進んでしまう。
+const GIT_VALUE_OPTIONS = new Set([
+  '-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--config-env', '--super-prefix'
+]);
+
+// 引用の中の区切り文字までは追わない。ここは隔離境界ではなくコミットの観測であり、
+// 取りこぼさないことを優先する。Deliveryの成果として記録してよいかどうかは、このあと
+// 記録済みworktreeのbranch・HEAD・cleanさで判定する。
+function runsGitCommit(command) {
+  return String(command || '').split(/[;&|\n]+/).some(segment => {
+    const tokens = segment.match(/"[^"]*"|'[^']*'|\S+/g) || [];
+    if (!/^git(?:\.exe)?$/i.test(tokens[0] || '')) return false;
+    let index = 1;
+    while (index < tokens.length && tokens[index].startsWith('-')) {
+      index += GIT_VALUE_OPTIONS.has(tokens[index]) ? 2 : 1;
+    }
+    return tokens[index] === 'commit';
+  });
+}
+
 function isSuccessfulCommit(input) {
   const command = String(input.tool_input && input.tool_input.command || '');
-  if (!/(?:^|[;&|]\s*)git\s+(?:-[^\s]+\s+)*commit(?:\s|$)/i.test(command)) return false;
+  if (!runsGitCommit(command)) return false;
   const response = input.tool_response || input.tool_result || {};
   if (response && typeof response === 'object') {
     const status = [response.exit_code, response.exitCode, response.status, response.code]
@@ -117,4 +140,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { gitValue, isSuccessfulCommit, run };
+module.exports = { gitValue, isSuccessfulCommit, run, runsGitCommit };
