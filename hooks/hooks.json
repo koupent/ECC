@@ -15,7 +15,7 @@
         "id": "pre:read-search:codex-context-gate"
       },
       {
-        "matcher": "Bash|Edit|Write|MultiEdit",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
@@ -23,7 +23,7 @@
             "timeout": 5
           }
         ],
-        "description": "Require duplicate Issue search and an issue-linked branch before the first repository mutation",
+        "description": "Inspect every PreToolUse call so NotebookEdit and MCP writes cannot bypass the required Issue, branch, and Draft PR gates",
         "id": "pre:edit-write:delivery-lifecycle"
       },
       {

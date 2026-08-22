@@ -29,6 +29,15 @@ function hasExecutableShellControl(command) {
   let quote = null;
   for (let index = 0; index < command.length; index += 1) {
     const character = command[index];
+    // backslashは次の1文字をリテラル化する（single quoteの中を除く）。ここを読み飛ばすと
+    // `echo \"; touch x; echo \"` のescapeされた引用符でquote状態を取り違え、その後の `;`
+    // を引用符の中と誤判定して任意コマンドを通してしまう。行末のbackslashは行継続なので拒否する。
+    if (character === '\\' && quote !== "'") {
+      const next = command[index + 1];
+      if (next === undefined || next === '\n' || next === '\r') return true;
+      index += 1;
+      continue;
+    }
     if (quote) {
       if (character === quote) quote = null;
       else if (
@@ -115,6 +124,29 @@ const GIT_EXEC_FLAG = /^(?:-c|-C|--config-env|--exec-path|--ext-diff|--textconv|
 const GH_EXEC_FLAG = /^(?:-w|--web)(?:=|$)/i;
 const GH_WRITE_FLAG = /^(?:-X|--method|-f|-F|--field|--raw-field|--input)(?:=|$)/i;
 const OUTPUT_FLAG = /^(?:-o|--output)(?:=|$)/i;
+// このGateは全PreToolUseを検査する。変更系toolを列挙する形にすると、NotebookEditや
+// 書き込みMCP toolのような列挙漏れがそのまま素通りし、「Draft PR後は参照だけ」という
+// 保証を破る。そこでrepositoryを変更しないと確認できたtoolだけを許可し、未知のtoolと
+// MCP toolは既定で拒否する。
+// Taskはsubagentのtool呼び出しが同じPreToolUse Gateを通るため、ここでは止めない。
+const NON_MUTATING_TOOLS = new Set([
+  'Read',
+  'NotebookRead',
+  'Glob',
+  'Grep',
+  'LS',
+  'WebFetch',
+  'WebSearch',
+  'TodoWrite',
+  'BashOutput',
+  'KillShell',
+  'ExitPlanMode',
+  'Task'
+]);
+// SlashCommandはcommand定義に埋め込まれたshell実行までは検査できないため、参照だけを
+// 保証したいdraft-pr / prepare前では拒否する。一方 `ready` のDeliveryでblockする理由は
+// fresh reviewの要求であり、そこで止めると `/ecc:code-review` へ進めずデッドロックになる。
+const REVIEW_ENTRY_TOOL = 'SlashCommand';
 
 function commandTokens(command) {
   return String(command || '')
@@ -157,7 +189,11 @@ function isReadOnlyBashCommand(command) {
   const value = String(command || '').trim();
   if (!value || hasExecutableShellControl(value)) return false;
   const tokens = commandTokens(value);
-  const binary = String(tokens[0] || '').replace(/\.(?:exe|cmd|bat)$/i, '').split(/[\\/]/).pop().toLowerCase();
+  const executable = String(tokens[0] || '');
+  // basenameだけで許可すると、`./git status` や `/tmp/gh pr view 274` が同名の任意の
+  // ローカル実行ファイルへ制御を渡す。PATH解決されるbare nameだけを許す。
+  if (/[\\/]/.test(executable)) return false;
+  const binary = executable.replace(/\.(?:exe|cmd|bat)$/i, '').toLowerCase();
   const args = tokens.slice(1);
   if (args.some(argument => OUTPUT_FLAG.test(argument))) return false;
   if (binary === 'git') return isReadOnlyGitCommand(args);
@@ -202,7 +238,7 @@ function run(rawInput, options = {}) {
     const toolName = String(input.tool_name || '');
     const command = String(input.tool_input && input.tool_input.command || '');
     if (toolName === 'Bash' && (isExactLifecycleCommand(command, 'reset') || isReadOnlyBashCommand(command))) return rawInput;
-    if (!['Bash', 'Edit', 'Write', 'MultiEdit'].includes(toolName)) return rawInput;
+    if (toolName !== 'Bash' && NON_MUTATING_TOOLS.has(toolName)) return rawInput;
     return deny(
       `[ECC Delivery Gate] The delivery for Issue #${state.delivery.issue_number || '<unknown>'} already reached its Draft PR ` +
         `(${state.delivery.draft_pr_url || 'recorded in ECC state'}). Only read-only inspection is allowed until it resumes. ` +
@@ -217,6 +253,7 @@ function run(rawInput, options = {}) {
     // Plan mode中はClaude自身のread-only制約に任せて調査を許可する。承認後は同じ
     // deferred stateが残るため、最初のBash/Edit/Writeをprepare完了までfail-closeする。
     if (state.delivery.status === 'deferred' && permissionMode === 'plan') return rawInput;
+    if (toolName !== 'Bash' && NON_MUTATING_TOOLS.has(toolName)) return rawInput;
     const isPrepareCommand = toolName === 'Bash' && isExactLifecycleCommand(command, 'prepare');
     const isResetCommand = toolName === 'Bash' && isExactLifecycleCommand(command, 'reset');
     if (isPrepareCommand || isResetCommand) return rawInput;
@@ -229,6 +266,11 @@ function run(rawInput, options = {}) {
         `If the recorded Delivery is stale or unrecoverable, explicitly reset it with node "${resetScript}" "${sessionId}".`
     );
   }
+
+  const inspectedTool = String(input.tool_name || '');
+  // 参照だけのtoolはbranch一致もfresh reviewも要求しない。調査まで止めると、branch不一致や
+  // review待ちの原因を確かめる手段まで塞いでしまう。
+  if (NON_MUTATING_TOOLS.has(inspectedTool) || inspectedTool === REVIEW_ENTRY_TOOL) return rawInput;
 
   const actualBranch = branchAt(cwd, env);
   if (!actualBranch || actualBranch !== state.delivery.branch) {
@@ -267,8 +309,10 @@ function run(rawInput, options = {}) {
     }, env);
   }
 
-  const toolName = String(input.tool_name || '');
-  const isEdit = ['Edit', 'Write', 'MultiEdit'].includes(toolName);
+  // clean commit後の追加変更は、Edit/Write以外のtoolでも同じくfresh reviewを要する。
+  // NotebookEditや書き込みMCP toolを列挙から落とすと、そこだけreviewを飛ばせてしまう。
+  // Bashのcommitやpushは delivery-progress / pre-bash 側の記録に任せる。
+  const isEdit = inspectedTool !== 'Bash';
   const head = gitValue(cwd, env, ['rev-parse', 'HEAD']);
   if (
     isEdit &&
@@ -299,4 +343,4 @@ if (require.main === module) {
   process.stdin.on('end', () => process.stdout.write(run(raw)));
 }
 
-module.exports = { branchAt, gitValue, isExactLifecycleCommand, isReadOnlyBashCommand, run };
+module.exports = { NON_MUTATING_TOOLS, branchAt, gitValue, isExactLifecycleCommand, isReadOnlyBashCommand, run };

@@ -483,6 +483,18 @@ test('a draft-pr delivery resumes on the same Issue and branch and re-applies ev
   const afterCommitEdit = JSON.parse(deliveryGate.run(edit, { cwd: fixture, env: fixtureEnv }));
   assert.strictEqual(afterCommitEdit.hookSpecificOutput.permissionDecision, 'deny');
   assert.match(afterCommitEdit.hookSpecificOutput.permissionDecisionReason, /independent Codex review/);
+  // Edit/Write以外の変更経路も同じclean commitに対してfresh reviewを要求する。
+  for (const toolName of ['NotebookEdit', 'mcp__filesystem__write_file']) {
+    const output = JSON.parse(deliveryGate.run(
+      JSON.stringify({ ...input, tool_name: toolName, tool_input: {} }),
+      { cwd: fixture, env: fixtureEnv }
+    ));
+    assert.strictEqual(output.hookSpecificOutput.permissionDecision, 'deny', toolName);
+    assert.match(output.hookSpecificOutput.permissionDecisionReason, /independent Codex review/);
+  }
+  // 参照だけのtoolはreview待ちでも通す。原因を調べる手段まで塞がない。
+  const inspect = JSON.stringify({ ...input, tool_name: 'Read', tool_input: { file_path: path.join(fixture, 'src', 'product.ts') } });
+  assert.strictEqual(deliveryGate.run(inspect, { cwd: fixture, env: fixtureEnv }), inspect);
 
   // Context Builderは同じDeliveryのpacketを再利用し、prepareも要求しない。
   const output = JSON.parse(contextBuilder.run(JSON.stringify({ ...input, prompt: followUp }), {
@@ -523,6 +535,17 @@ test('a request naming another Issue starts a new pending delivery that keeps th
   const commit = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: 'git commit -m "unreviewed"' } });
   const deniedCommit = JSON.parse(deliveryGate.run(commit, { cwd: fixture, env: fixtureEnv }));
   assert.strictEqual(deniedCommit.hookSpecificOutput.permissionDecision, 'deny');
+  // prepare前も、変更系tool・書き込みMCP tool・未知のtoolを既定で拒否し、参照だけは通す。
+  for (const toolName of ['NotebookEdit', 'mcp__filesystem__write_file', 'FutureUnknownTool']) {
+    const output = JSON.parse(deliveryGate.run(
+      JSON.stringify({ ...input, tool_name: toolName, tool_input: {} }),
+      { cwd: fixture, env: fixtureEnv }
+    ));
+    assert.strictEqual(output.hookSpecificOutput.permissionDecision, 'deny', toolName);
+    assert.match(output.hookSpecificOutput.permissionDecisionReason, /delivery-lifecycle\.js/);
+  }
+  const read = JSON.stringify({ ...input, tool_name: 'Read', tool_input: { file_path: path.join(fixture, 'src', 'product.ts') } });
+  assert.strictEqual(deliveryGate.run(read, { cwd: fixture, env: fixtureEnv }), read);
   deliveryProgress.run(JSON.stringify({
     ...input,
     tool_name: 'Bash',
@@ -598,7 +621,16 @@ test('a draft-pr delivery allows only read-only Bash and fails closed when the w
     'git blame --textconv src/product.ts',
     'gh pr view 274 --web',
     'tail -f src/product.ts',
-    'date -s 2020-01-01'
+    'date -s 2020-01-01',
+    // escapeされた引用符でquote判定を崩し、後続に別コマンドを連結する形も通さない。
+    'echo \\"; touch review-bypass-sentinel; echo \\"',
+    // 行末のbackslashは次行を継ぎ足せるため、単独では読み取り専用と断定できない。
+    'git status --porcelain \\',
+    // path付きの実行ファイルはbasenameで判定できない。同名のローカル実行ファイルは通さない。
+    './git status',
+    '/tmp/gh pr view 274',
+    '"./git" status',
+    'bin/rg -n needle src'
   ]) {
     const output = JSON.parse(deliveryGate.run(bash(denied), { cwd: fixture, env: fixtureEnv }));
     assert.strictEqual(output.hookSpecificOutput.permissionDecision, 'deny', denied);
@@ -606,6 +638,19 @@ test('a draft-pr delivery allows only read-only Bash and fails closed when the w
   }
   assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git show --stat'), true);
   assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git status; git commit -m x'), false);
+  // backslashは次の1文字をリテラル化する。escapeされた引用符をquoteとして数えると、
+  // その後の `;` を引用符の中と誤判定して連結コマンドを通してしまう。
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('echo \\"; touch sentinel; echo \\"'), false);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git log \\'), false);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand("git log --grep='a\\'; touch sentinel"), false);
+  // single quoteの中のbackslashはリテラルなので、閉じない引用符として扱う。
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand("git log --grep='needle'"), true);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git log --grep="needle"'), true);
+  // path付きの実行ファイルはbasenameで判定しない。
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('./git status'), false);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('/tmp/gh pr view 274'), false);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('..\\git status'), false);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git.exe status'), true);
   assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git log --output=/tmp/log'), false);
   assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git branch codex/issue-999-bypass'), false);
   // binary名だけの許可では、`--pre` のような実行optionを取りこぼす。
@@ -638,6 +683,125 @@ test('a draft-pr delivery allows only read-only Bash and fails closed when the w
   assert.strictEqual(moved.decision, 'block');
   assert.match(moved.reason, new RegExp(`HEAD moved from the reviewed Draft PR commit ${head}`));
   assert.match(moved.reason, /reset\.js/);
+});
+
+test('a draft-pr delivery inspects every tool and denies NotebookEdit, MCP writes, and unknown tools', () => {
+  const { fixture, fixtureEnv, input } =
+    createDraftPrFixture('delivery-draft-pr-tools-repo', 'delivery-draft-pr-tools', 'delivery-draft-pr-tools-state');
+  const call = toolName => JSON.stringify({ ...input, tool_name: toolName, tool_input: {} });
+
+  // 参照だけのtoolは通す。Taskはsubagentのtool呼び出しが同じGateを通る。
+  for (const allowed of ['Read', 'NotebookRead', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'TodoWrite', 'Task']) {
+    assert.strictEqual(deliveryGate.run(call(allowed), { cwd: fixture, env: fixtureEnv }), call(allowed), allowed);
+  }
+  // 変更系tool・書き込みMCP tool・未知のtoolは既定で拒否する。Edit/Writeだけを列挙すると、
+  // NotebookEditやMCP経由の書き込みで「参照だけ」の保証を破れる。
+  for (const denied of [
+    'Edit',
+    'Write',
+    'MultiEdit',
+    'NotebookEdit',
+    'SlashCommand',
+    'mcp__github__create_or_update_file',
+    'mcp__filesystem__write_file',
+    'FutureUnknownTool'
+  ]) {
+    const output = JSON.parse(deliveryGate.run(call(denied), { cwd: fixture, env: fixtureEnv }));
+    assert.strictEqual(output.hookSpecificOutput.permissionDecision, 'deny', denied);
+    assert.match(output.hookSpecificOutput.permissionDecisionReason, /Only read-only inspection is allowed/);
+  }
+});
+
+test('a request naming two Issues of the same kind is never routed to the first number', () => {
+  const { fixture, fixtureEnv, input, branch } =
+    createDraftPrFixture('delivery-ambiguous-repo', 'delivery-ambiguous', 'delivery-ambiguous-state');
+
+  // 先頭一致で#271と解釈すると、記録済みDraft PRを再開して別Issueの変更をそのbranchへ配送する。
+  const request = 'Issue #271 ではなく Issue #300 を修正してください';
+  assert.strictEqual(explicitIssueNumber(request), null);
+  const started = initializeDelivery(input, request, { cwd: fixture, env: fixtureEnv });
+  assert.strictEqual(started.status, 'pending');
+  assert.strictEqual(started.requested_issue_number, null);
+  assert.strictEqual(started.issue_number, null);
+  assert.strictEqual(started.draft_pr_url, null);
+  assert.match(started.ambiguous_reference, /Issue #271 \/ this repository Issue #300/);
+  const state = readState(input, fixtureEnv);
+  assert.strictEqual(state.previous_delivery.status, 'draft-pr');
+  assert.strictEqual(state.previous_delivery.issue_number, 271);
+  assert.strictEqual(state.previous_delivery.branch, branch);
+
+  // prepareはGitHubを一度も呼ばず、Issueもbranchも作らずにfail-closeする。
+  const ghCalls = [];
+  assert.throws(
+    () => prepareDelivery(input, {
+      cwd: fixture,
+      env: fixtureEnv,
+      runCommand(binary, args, commandOptions) {
+        if (binary === 'gh') ghCalls.push(args.join(' '));
+        return runCommand(binary, args, commandOptions);
+      }
+    }),
+    /names more than one target/
+  );
+  assert.deepStrictEqual(ghCalls, []);
+  assert.strictEqual(
+    spawnSync('git', ['branch', '--list', 'codex/*', '--format=%(refname:short)'], { cwd: fixture, encoding: 'utf8' }).stdout.trim(),
+    branch
+  );
+
+  // 種類の違う参照（Issue と PR）や、同じ対象を短い表記とURLで重ねた要求は曖昧ではない。
+  assert.strictEqual(explicitIssueNumber('Issue #251とPR #257を完遂してください'), 251);
+  assert.strictEqual(explicitPrNumber('Issue #251とPR #257を完遂してください'), 257);
+  assert.strictEqual(
+    explicitIssueNumber('Issue #271 (https://github.com/koupent/ECC/issues/271) を修正してください'),
+    271
+  );
+  assert.strictEqual(explicitPrNumber('PR #274 と PR #300 のどちらかを仕上げてください'), null);
+});
+
+test('an origin path embedded in another host URL never resolves as a local Issue or PR', () => {
+  const { fixture, fixtureEnv, input, branch } = createDraftPrFixture(
+    'delivery-embedded-url-repo',
+    'delivery-embedded-url',
+    'delivery-embedded-url-state'
+  );
+
+  // hostはURLのauthorityだけが決める。pathへ埋め込まれたorigin表記をPR #300と解決すると、
+  // 外部URLはfail-closeするという契約が破れる。
+  const request = 'https://evil.example/github.com/koupent/ECC/pull/300 の指摘を修正してください';
+  const started = initializeDelivery(input, request, { cwd: fixture, env: fixtureEnv });
+  assert.strictEqual(started.status, 'pending');
+  assert.strictEqual(started.requested_pr_number, null);
+  assert.strictEqual(started.requested_issue_number, null);
+  assert.match(started.foreign_reference, /evil\.example\/koupent\/ecc PR #300/);
+  assert.strictEqual(readState(input, fixtureEnv).previous_delivery.branch, branch);
+
+  const ghCalls = [];
+  assert.throws(
+    () => prepareDelivery(input, {
+      cwd: fixture,
+      env: fixtureEnv,
+      runCommand(binary, args, commandOptions) {
+        if (binary === 'gh') ghCalls.push(args.join(' '));
+        return runCommand(binary, args, commandOptions);
+      }
+    }),
+    /this clone is github\.com\/koupent\/ecc/
+  );
+  assert.deepStrictEqual(ghCalls, []);
+
+  // 別URLのqueryやpathに載せた形も、このcloneのIssue / PRとしては解決しない。
+  for (const embedded of [
+    'https://evil.example/r?u=https://github.com/koupent/ECC/pull/300 を修正してください',
+    'https://evil.example/redirect/github.com/koupent/ECC/issues/271 を修正してください'
+  ]) {
+    const references = resolveDeliveryReferences(embedded, { cwd: fixture, env: fixtureEnv });
+    assert.strictEqual(references.issue, null, embedded);
+    assert.strictEqual(references.pr, null, embedded);
+  }
+  // 通常のcanonical URLは引き続き解決する。
+  assert.strictEqual(explicitPrNumber('https://github.com/koupent/ECC/pull/300/files を修正してください'), 300);
+  assert.strictEqual(explicitIssueNumber('https://github.com/koupent/ECC/issues/300を修正してください'), 300);
 });
 
 test('a GitHub URL naming another Issue or PR starts a new delivery while the recorded PR URL resumes', () => {

@@ -66,16 +66,18 @@ function slug(value) {
 // URL表記ではhost・owner・repoも保持する。番号だけを見ると、別リポジトリの同番号URL
 // （`other/project/pull/274`）を進行中DeliveryのPR #274と同一視し、このcloneの
 // 無関係なIssueやbranchへ配送してしまう。
-const REPOSITORY_URL = String.raw`(?:https?:\/\/)?((?:[\w-]+\.)+[a-z]{2,}(?::\d+)?)\/([^\s/]+)\/([^\s/]+)`;
-const DELIVERY_REFERENCES = {
-  issue: [
-    { pattern: new RegExp(String.raw`${REPOSITORY_URL}\/issues\/(\d+)\b`, 'i'), repository: true },
-    { pattern: /\bissue\s*#?\s*(\d+)\b/i, repository: false }
-  ],
-  pr: [
-    { pattern: new RegExp(String.raw`${REPOSITORY_URL}\/pull\/(\d+)\b`, 'i'), repository: true },
-    { pattern: /\b(?:pull[\s-]*request|pr)\s*#?\s*(\d+)\b/i, repository: false }
-  ]
+// URLは境界付きで丸ごと切り出し、authorityとpathをURLパーサーで解釈する。scheme無しの
+// 部分文字列を拾うと、`https://evil.example/github.com/koupent/ECC/pull/300` の途中にある
+// `github.com/koupent/ECC/pull/300` をこのcloneのPRと誤認する。左境界では、別URLのpath・
+// query（`/`、`=`、`?`、`&`、`#`）に埋め込まれた表記を除外する。
+const DELIVERY_URL = /(?<![\w./@%=?&#-])(?:https?:\/\/)?(?:[\w-]+\.)+[a-z]{2,}(?::\d+)?\/[A-Za-z0-9._~:/?#@!$&'*+,;=%-]*/gi;
+// owner / repo はissues|pullの直前の2 segmentから採り、hostはURLのauthorityだけを見る。
+// `https://evil.example/github.com/koupent/ECC/pull/300` はowner/repoが一致していても
+// 別hostのURLであり、このcloneのPRとしては解決させない（foreignとしてfail-closeする）。
+const DELIVERY_URL_PATH = /(?:^|\/)([^/]+)\/([^/]+)\/(issues|pull)\/(\d+)(?:\/|$)/i;
+const SHORT_REFERENCES = {
+  issue: /\bissue\s*#?\s*(\d+)\b/gi,
+  pr: /\b(?:pull[\s-]*request|pr)\s*#?\s*(\d+)\b/gi
 };
 // GitHubのhost・owner・repoは大文字小文字を区別せず、remote URLは `.git` 付きでも届く。
 const REMOTE_URL = /^(?:[a-z][a-z0-9+.-]*:\/\/)?(?:[^@/\s]*@)?([^/:\s]+?)(?::\d+)?[/:]+([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/i;
@@ -94,24 +96,73 @@ function parseRepositoryUrl(value) {
   };
 }
 
-function parseDeliveryReferences(request) {
+function parseDeliveryUrl(candidate) {
+  // 文末の句読点や閉じ括弧はURLの一部ではない。
+  const trimmed = String(candidate || '').replace(/[.,;:!?)\]}'"]+$/, '');
+  let url;
+  try {
+    url = new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
+  } catch {
+    return null;
+  }
+  const match = url.pathname.match(DELIVERY_URL_PATH);
+  if (!match) return null;
+  return {
+    kind: match[3].toLowerCase() === 'issues' ? 'issue' : 'pr',
+    host: normalizeRepositoryPart(url.hostname),
+    owner: normalizeRepositoryPart(match[1]),
+    repo: normalizeRepositoryPart(match[2]),
+    number: Number(match[4])
+  };
+}
+
+function collectDeliveryReferences(request) {
   const value = String(request || '');
-  const parsed = { issue: null, pr: null };
-  for (const [kind, patterns] of Object.entries(DELIVERY_REFERENCES)) {
-    for (const { pattern, repository } of patterns) {
-      const match = value.match(pattern);
-      if (!match) continue;
-      parsed[kind] = repository
-        ? {
-            kind,
-            host: normalizeRepositoryPart(match[1]),
-            owner: normalizeRepositoryPart(match[2]),
-            repo: normalizeRepositoryPart(match[3]),
-            number: Number(match[4])
-          }
-        : { kind, host: null, owner: null, repo: null, number: Number(match[1]) };
-      break;
+  const collected = { issue: [], pr: [] };
+  for (const candidate of value.match(DELIVERY_URL) || []) {
+    const reference = parseDeliveryUrl(candidate);
+    if (reference) collected[reference.kind].push(reference);
+  }
+  for (const [kind, pattern] of Object.entries(SHORT_REFERENCES)) {
+    for (const match of value.matchAll(pattern)) {
+      collected[kind].push({ kind, host: null, owner: null, repo: null, number: Number(match[1]) });
     }
+  }
+  return collected;
+}
+
+function referenceKey(reference) {
+  return `${reference.kind}:${reference.host || ''}/${reference.owner || ''}/${reference.repo || ''}#${reference.number}`;
+}
+
+function dedupeReferences(references) {
+  const unique = new Map();
+  for (const reference of references) {
+    if (!unique.has(referenceKey(reference))) unique.set(referenceKey(reference), reference);
+  }
+  return [...unique.values()];
+}
+
+// 同じ種類の参照が複数あるとき、先頭一致で対象を決めてはいけない。
+// 「Issue #271 ではなく Issue #300 を修正してください」を#271と解釈すると、名指しされて
+// いないIssueのDraft PRを再開し、別branchへ変更を配送する。番号やrepositoryが割れる要求は
+// 対象を推測せずfail-closeする。
+function selectReference(references) {
+  if (!references.length) return { reference: null, ambiguous: [] };
+  const numbers = new Set(references.map(reference => reference.number));
+  const scopes = new Set(references.filter(reference => reference.host).map(describeRepository));
+  if (numbers.size > 1 || scopes.size > 1) return { reference: null, ambiguous: references };
+  // 同じ対象を短い表記とURLの両方で書いた要求では、host・owner・repoまで揃うURLを採る。
+  return { reference: references.find(reference => reference.host) || references[0], ambiguous: [] };
+}
+
+function parseDeliveryReferences(request) {
+  const collected = collectDeliveryReferences(request);
+  const parsed = { issue: null, pr: null, ambiguous: [] };
+  for (const kind of ['issue', 'pr']) {
+    const { reference, ambiguous } = selectReference(dedupeReferences(collected[kind]));
+    parsed[kind] = reference;
+    parsed.ambiguous.push(...ambiguous);
   }
   return parsed;
 }
@@ -163,7 +214,7 @@ function resolveDeliveryReferences(request, options = {}) {
   const repository = options.repository !== undefined
     ? options.repository
     : needsRepository ? currentRepository(options) : null;
-  const resolved = { issue: null, pr: null, repository, foreign: [] };
+  const resolved = { issue: null, pr: null, repository, foreign: [], ambiguous: parsed.ambiguous };
   for (const kind of ['issue', 'pr']) {
     const reference = parsed[kind];
     if (!reference) continue;
@@ -173,6 +224,10 @@ function resolveDeliveryReferences(request, options = {}) {
   return resolved;
 }
 
+function describeAmbiguousReferences(references) {
+  return dedupeReferences(references).map(describeReference).join(' / ');
+}
+
 function deliveryPrNumber(delivery) {
   const match = String(delivery && delivery.draft_pr_url || '').match(/\/pull\/(\d+)(?:\D|$)/);
   return match ? Number(match[1]) : (delivery && delivery.requested_pr_number) || null;
@@ -180,6 +235,8 @@ function deliveryPrNumber(delivery) {
 
 function referencesOtherDelivery(delivery, request, options = {}) {
   const references = options.references || resolveDeliveryReferences(request, options);
+  // どのIssue / PRを指すのか確定できない要求は、進行中Deliveryの続きとみなさない。
+  if (references.ambiguous.length) return true;
   // 別リポジトリを名指しした要求は、番号が一致していてもこのDeliveryの続きではない。
   if (references.foreign.length) return true;
   if (references.issue && delivery.issue_number && references.issue.number !== Number(delivery.issue_number)) return true;
@@ -279,6 +336,8 @@ function initializeDelivery(input, request, options = {}) {
     // 別リポジトリを指すURLは、このcloneのIssue・branchへ配送してはいけない。番号を
     // 採用せずに記録だけ残し、prepareでfail-closeする。
     foreign_reference: references.foreign.length ? describeReference(references.foreign[0]) : null,
+    // 同じ種類のIssue / PRを複数名指しした要求も、対象を推測せずprepareで止める。
+    ambiguous_reference: references.ambiguous.length ? describeAmbiguousReferences(references.ambiguous) : null,
     base_branch: config.deliveryBaseBranch,
     issue_number: null,
     issue_url: null,
@@ -442,6 +501,14 @@ function prepareDelivery(input = {}, options = {}) {
   const commandOptions = { cwd, env, runCommand: execute };
 
   try {
+    // 同じ種類のIssue / PRが複数名指しされた要求は、どれが対象か確定していない。推測して
+    // 進めると名指しされていないIssueのbranchへ変更を配送するため、ここで止める。
+    if (delivery.ambiguous_reference) {
+      throw new Error(
+        `The request names more than one target (${delivery.ambiguous_reference}); ` +
+          'name exactly one Issue or PR of this repository before preparing the delivery.'
+      );
+    }
     // 別リポジトリのIssue/PRは、このcloneのgh・branchでは解決できない。番号だけが一致する
     // 無関係なIssueへ配送しないよう、Issue検索もbranch作成も行わずここで止める。
     if (delivery.foreign_reference) {
@@ -551,8 +618,10 @@ if (require.main === module) {
 
 module.exports = {
   currentRepository,
+  describeAmbiguousReferences,
   describeReference,
   describeRepository,
+  parseDeliveryUrl,
   explicitIssueNumber,
   explicitPrNumber,
   deliveryBranch,
