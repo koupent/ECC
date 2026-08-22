@@ -167,6 +167,14 @@ function completeBySquashMerge(execute, config, delivery, pr, head, cwd, env) {
   return { ok: true, pr: merged, status: gate.status };
 }
 
+function continuationDecisionBlock() {
+  return block(
+    'The Delivery is merged, but the user task has no deterministic continuation decision. ' +
+    'Run `node "$CLAUDE_PLUGIN_ROOT/scripts/codex/delivery-continuation.js" continue "<concrete next Delivery>"` ' +
+    'or `node "$CLAUDE_PLUGIN_ROOT/scripts/codex/delivery-continuation.js" complete` before stopping.'
+  );
+}
+
 function run(rawInput, options = {}) {
   let input;
   try {
@@ -183,6 +191,10 @@ function run(rawInput, options = {}) {
   if ((delivery.workflow_mode || config.deliveryWorkflow) !== 'required') return rawInput;
   if (delivery.status === 'config-error') {
     return block('The ECC project configuration is invalid. Repair .ecc/config.json, reset the recorded Delivery, and submit the request again; completion defaults will not be used.');
+  }
+  if (delivery.status === 'merged') {
+    if (state.task_status === 'complete' && state.task_completion_head === delivery.merged_head) return rawInput;
+    return continuationDecisionBlock();
   }
   if (delivery.status === 'deferred') {
     const permissionMode = String(input.permission_mode || input.permissionMode || '').toLowerCase();
@@ -318,7 +330,7 @@ function run(rawInput, options = {}) {
         completed_at: new Date().toISOString()
       }
     }, env);
-    return rawInput;
+    return continuationDecisionBlock();
   }
 
   writeState(input, {
@@ -344,6 +356,7 @@ module.exports = {
   block,
   command,
   completeBySquashMerge,
+  continuationDecisionBlock,
   ensureReviewFollowupIssue,
   isTransientGitHubFailure,
   parseJson,

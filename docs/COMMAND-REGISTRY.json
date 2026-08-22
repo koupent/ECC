@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "totalCommands": 99,
+  "totalCommands": 101,
   "commands": [
     {
       "command": "aside",
@@ -134,6 +134,24 @@
         "tdd-workflow"
       ],
       "path": "commands/cpp-test.md"
+    },
+    {
+      "command": "delivery-complete",
+      "description": "マージ済みDeliveryでユーザータスク全体が完了したことを記録します。",
+      "type": "general",
+      "primaryAgents": [],
+      "allAgents": [],
+      "skills": [],
+      "path": "commands/delivery-complete.md"
+    },
+    {
+      "command": "delivery-next",
+      "description": "マージ済みDeliveryの後に、同じユーザータスクの次のDeliveryを決定論的に開始します。",
+      "type": "general",
+      "primaryAgents": [],
+      "allAgents": [],
+      "skills": [],
+      "path": "commands/delivery-next.md"
     },
     {
       "command": "delivery-prepare",
@@ -1074,7 +1092,7 @@
   "statistics": {
     "byType": {
       "build": 4,
-      "general": 12,
+      "general": 14,
       "orchestration": 11,
       "planning": 2,
       "refactoring": 1,

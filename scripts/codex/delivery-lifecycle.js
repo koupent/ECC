@@ -306,6 +306,8 @@ function initializeDelivery(input, request, options = {}) {
   writeState(input, {
     delivery,
     project: projectFingerprint(cwd),
+    task_status: 'active',
+    task_delivery_count: 1,
     review_round: 0,
     review_limit_reached: false,
     review_followups: [],

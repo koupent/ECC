@@ -832,7 +832,9 @@ test('squash completion requires a current Local Merge Gate status and confirms 
   };
 
   const raw = JSON.stringify(input);
-  assert.strictEqual(deliveryCompletion.run(raw, { cwd: fixture, env: fixtureEnv, command: execute }), raw);
+  const mergeStop = JSON.parse(deliveryCompletion.run(raw, { cwd: fixture, env: fixtureEnv, command: execute }));
+  assert.strictEqual(mergeStop.decision, 'block');
+  assert.match(mergeStop.reason, /continuation decision/);
   const completed = readState(input, fixtureEnv);
   assert.strictEqual(completed.delivery.status, 'merged');
   assert.strictEqual(completed.delivery.merged_pr_url, 'https://example.invalid/pr/8');
