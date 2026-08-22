@@ -193,6 +193,39 @@ test('project config opts into standard Codex integration', () => {
   });
 });
 
+test('invalid project config fails delivery initialization closed without choosing defaults', () => {
+  const fixture = createGitFixture('invalid-project-config');
+  const configFile = path.join(fixture, '.ecc', 'config.json');
+  fs.writeFileSync(configFile, '{ invalid json', 'utf8');
+  const fixtureEnv = { ...env, CLAUDE_SESSION_ID: 'invalid-project-config' };
+  const config = loadConfig(fixture, fixtureEnv);
+  assert.strictEqual(config.projectConfigStatus, 'invalid');
+  assert.strictEqual(config.projectEnabled, false);
+  const delivery = initializeDelivery(
+    { session_id: 'invalid-project-config', cwd: fixture },
+    'パーサーの不具合を修正してください',
+    { cwd: fixture, env: fixtureEnv }
+  );
+  assert.strictEqual(delivery.status, 'config-error');
+  assert.strictEqual(delivery.completion_method, null);
+  assert.ok(readEvents(fixtureEnv).some(event => event.type === 'delivery_project_config_invalid'));
+
+  const denied = JSON.parse(deliveryGate.run(JSON.stringify({
+    session_id: 'invalid-project-config',
+    cwd: fixture,
+    tool_name: 'Bash',
+    tool_input: { command: 'npm test' }
+  }), { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny');
+  const repair = deliveryGate.run(JSON.stringify({
+    session_id: 'invalid-project-config',
+    cwd: fixture,
+    tool_name: 'Edit',
+    tool_input: { file_path: configFile }
+  }), { cwd: fixture, env: fixtureEnv });
+  assert.strictEqual(repair.hookSpecificOutput, undefined);
+});
+
 test('incident handling remains report-only even when external config requests remediation', () => {
   const configFile = path.join(temp, 'operator-config.json');
   fs.writeFileSync(configFile, JSON.stringify({
@@ -793,7 +826,7 @@ test('squash completion requires a current Local Merge Gate status and confirms 
     if (args[0] === 'pr' && args[1] === 'ready') return { ok: true, stdout: '', stderr: '' };
     if (args[0] === 'pr' && args[1] === 'merge') return { ok: true, stdout: '', stderr: '' };
     if (args[0] === 'pr' && args[1] === 'view') {
-      return { ok: true, stdout: JSON.stringify({ state: 'MERGED', isDraft: false, headRefOid: head, url: 'https://example.invalid/pr/8' }), stderr: '' };
+      return { ok: true, stdout: JSON.stringify({ state: 'MERGED', isDraft: false, headRefOid: head, url: 'https://example.invalid/pr/8', mergeCommit: { oid: 'merge123' } }), stderr: '' };
     }
     throw new Error(`unexpected gh command: ${args.join(' ')}`);
   };
@@ -804,7 +837,7 @@ test('squash completion requires a current Local Merge Gate status and confirms 
   assert.strictEqual(completed.delivery.status, 'merged');
   assert.strictEqual(completed.delivery.merged_pr_url, 'https://example.invalid/pr/8');
   assert.ok(calls.some(call => call.join(' ') === 'gh pr ready 8'));
-  assert.ok(calls.some(call => call.join(' ') === 'gh pr merge 8 --squash'));
+  assert.ok(calls.some(call => call.join(' ') === `gh pr merge 8 --squash --match-head-commit ${head}`));
 
   writeState(input, { delivery: { status: 'ready', issue_number: 73, branch, base_branch: 'main' } }, fixtureEnv);
   const stale = JSON.parse(deliveryCompletion.run(raw, {

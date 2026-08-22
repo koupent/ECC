@@ -198,6 +198,25 @@ function initializeDelivery(input, request, options = {}) {
   const env = options.env || process.env;
   const cwd = options.cwd || input.cwd || process.cwd();
   const config = loadConfig(cwd, env);
+  if (config.projectConfigStatus === 'invalid' && isDeliveryRequest(request)) {
+    const delivery = {
+      status: 'config-error',
+      workflow_mode: 'required',
+      request_hash: hash(request, 32),
+      revision: 1,
+      title: titleFromRequest(request, hash(request, 32)),
+      completion_method: null,
+      config_path: config.projectConfigPath
+    };
+    recordIncident({
+      type: 'delivery_project_config_invalid',
+      severity: 'critical',
+      hook_id: 'delivery-lifecycle',
+      message: 'The ECC project configuration could not be read or parsed; Delivery initialization failed closed.'
+    }, { cwd, env });
+    writeState(input, { delivery, project: projectFingerprint(cwd) }, env);
+    return delivery;
+  }
   if (config.deliveryWorkflow !== 'required') return null;
 
   const current = readState(input, env);
@@ -279,7 +298,8 @@ function initializeDelivery(input, request, options = {}) {
     issue_number: null,
     issue_url: null,
     branch: null,
-    draft_pr_url: null
+    draft_pr_url: null,
+    completion_method: config.deliveryCompletion
   };
   // レビュー結果はDelivery単位の証拠である。前のDeliveryの改善候補や
   // 収束上限を次の要求へ持ち越すと、無関係なIssue作成や誤停止になる。

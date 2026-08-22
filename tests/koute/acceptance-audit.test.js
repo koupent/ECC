@@ -2,6 +2,8 @@
 'use strict';
 
 const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { audit, parseArgs } = require('../../scripts/codex/acceptance-audit');
 
@@ -60,6 +62,7 @@ function validEntry() {
         branch: 'codex/issue-11-lock',
         base_branch: 'main',
         draft_pr_url: 'https://example.invalid/pull/24',
+        completion_method: 'draft-pr',
         completed_at: '2026-08-18T00:00:00.000Z'
       }
     }
@@ -81,6 +84,26 @@ test('fails when Stop Gate has not persisted draft-pr state', () => {
   const report = audit({ cwd: path.resolve('.'), issueNumber: 11 }, { entry, command: executor });
   assert.strictEqual(report.status, 'FAIL');
   assert.strictEqual(report.checks.find(item => item.id === 'delivery-stop-gate').pass, false);
+});
+
+test('squash-merge契約ではDraft PRだけを完了として受理しない', () => {
+  const entry = validEntry();
+  entry.state.delivery.completion_method = 'squash-merge';
+  const report = audit({ cwd: path.resolve('.'), issueNumber: 11 }, { entry, command: executor });
+  assert.strictEqual(report.status, 'FAIL');
+  assert.strictEqual(report.checks.find(item => item.id === 'delivery-stop-gate').pass, false);
+});
+
+test('legacy delivery reads a valid squash-merge project contract instead of accepting Draft PR', () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-acceptance-legacy-'));
+  fs.mkdirSync(path.join(cwd, '.ecc'), { recursive: true });
+  fs.writeFileSync(path.join(cwd, '.ecc', 'config.json'), JSON.stringify({ deliveryCompletion: 'squash-merge' }));
+  const entry = validEntry();
+  delete entry.state.delivery.completion_method;
+  const report = audit({ cwd, issueNumber: 11 }, { entry, command: executor });
+  assert.strictEqual(report.status, 'FAIL');
+  assert.strictEqual(report.checks.find(item => item.id === 'delivery-stop-gate').pass, false);
+  assert.strictEqual(report.checks.find(item => item.id === 'delivery-completion-contract').pass, true);
 });
 
 test('fails when an explicitly requested Issue was replaced', () => {
