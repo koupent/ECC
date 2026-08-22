@@ -901,10 +901,11 @@ test('local merge policy blocks merge bypasses and direct success status publica
     'gh api -X POST repos/acme/example/statuses/abc -F state=@status.txt',
     'curl -X POST https://api.github.com/repos/acme/example/statuses/abc -d \'{"st\\u0061te":"success"}\'',
     "curl -X POST https://api.github.com/repos/acme/example/statuses/abc -d 'context=ci&state=success'",
-    // A function body is a command list in both brace forms; the compact one
-    // writes no space between the definition and the opening brace.
+    // A function body runs once something calls the function; the compact brace
+    // form writes no space between the definition and the body.
     'f(){ gh pr merge 12 --squash;}; f',
-    'f() { gh pr merge 12 --squash; }',
+    'f() { gh pr merge 12 --squash; }\nf',
+    'function f { gh pr merge 12 --squash; }\nf',
     // A process substitution hands the caller a pipe whose content is generated,
     // so a script read from it cannot be checked and fails closed.
     "source <(printf '%s\\n' 'gh pr merge 12 --squash')",
@@ -916,7 +917,32 @@ test('local merge policy blocks merge bypasses and direct success status publica
     // so a status can be published without any method word.
     'http https://api.github.com/repos/acme/example/statuses/abc state=success',
     'https api.github.com/repos/acme/example/statuses/abc state=success',
-    'URL=https://api.github.com/repos/acme/example/statuses/abc; http "$URL" state:=success'
+    'URL=https://api.github.com/repos/acme/example/statuses/abc; http "$URL" state:=success',
+    // curl sends `--form-string` as written, so it carries the state field just
+    // as `-d` does, and `--data-urlencode name@file` reads the field value from
+    // a file that never appears in argv.
+    "curl -X POST https://api.github.com/repos/acme/example/statuses/abc --form-string 'state=success'",
+    'curl -X POST https://api.github.com/repos/acme/example/statuses/abc --data-urlencode state@state.txt',
+    // An httpie item can upload the field value from a file as well.
+    'URL=https://api.github.com/repos/acme/example/statuses/abc; http "$URL" state@state.txt',
+    // A program that runs its operand as a command line executes the merge just
+    // as a shell does.
+    "watch -n 5 'gh pr merge 12 --squash'",
+    "flock /tmp/merge.lock -c 'gh pr merge 12 --squash'",
+    // `gh alias set` stores a command line gh runs later under the alias name,
+    // in both the gh form and the shell form, and `gh alias import` takes its
+    // aliases from a file this gate cannot read.
+    "gh alias set m 'pr merge'",
+    "gh alias set m '!gh pr merge 12 --squash'",
+    'gh alias import aliases.yml',
+    // `xargs` appends words read from stdin, so a gh command line whose
+    // subcommand is still open can be completed into a merge.
+    "echo 'pr merge 12 --squash' | xargs gh",
+    // A script an interpreter runs inline can start the merge in a child
+    // process, whether it is written as an argument or as a heredoc.
+    'python3 -c "import subprocess; subprocess.run([\'gh\', \'pr\', \'merge\', \'12\', \'--squash\'])"',
+    'node -e "require(\'child_process\').execSync(\'gh pr merge 12 --squash\')"',
+    "python3 - <<'PY'\nimport subprocess\nsubprocess.run(['gh', 'pr', 'merge', '12', '--squash'])\nPY"
   ];
   for (const command of denied) {
     const decision = JSON.parse(localMergePolicy.run(bash(command), { cwd: fixture, env }));
@@ -987,7 +1013,36 @@ test('local merge policy blocks merge bypasses and direct success status publica
     // An httpie read publishes nothing: a query parameter and a header add no
     // request body, so no implicit POST is sent.
     'http https://api.github.com/repos/acme/example/statuses/abc',
-    'http https://api.github.com/repos/acme/example/statuses/abc per_page==1 Authorization:token'
+    'http https://api.github.com/repos/acme/example/statuses/abc per_page==1 Authorization:token',
+    // gh prints its help page instead of running the subcommand, wherever the
+    // words sit: `help` is the command group and `--help` short-circuits the
+    // dispatch, so neither merges (central Issue #75).
+    'gh help pr merge',
+    'gh pr merge --help',
+    // A comment executes nothing, at the end of a line and on a line of its own.
+    'git commit -m "release notes" # gh pr merge 12 --squash belongs to the gate',
+    'git status --porcelain\n# gh pr merge 12 --squash\ngit diff --stat',
+    // A function definition only registers a body: nothing calls it here, so
+    // nothing runs (central Issue #75).
+    'f() { gh pr merge 12 --squash; }',
+    'function f { gh pr merge 12 --squash; }',
+    // An inline script that starts a child process is ordinary work when the
+    // command it starts is none of the ones this policy reserves.
+    'python3 -c \'import subprocess; subprocess.run(["npm", "test"])\'',
+    // An interpreter given a script file reads the heredoc as that script's
+    // input data, so writing those words into a note runs nothing.
+    "python3 tools/write-note.py <<'EOF'\nsubprocess.run(['gh', 'pr', 'merge', '12'])\nEOF",
+    // A program that runs its operand as a command line runs what is written
+    // there, and that is not always a merge.
+    'watch -n 5 git status --porcelain',
+    // An alias is read by the command line it stores.
+    "gh alias set prs 'pr status'",
+    // Words appended by `xargs` can only add operands to a subcommand that is
+    // already written out, so an ordinary read stays available.
+    'git log --format=%h -1 | xargs gh pr view --json state',
+    // curl sends `--form-string` literally, so a readable field name that is not
+    // the commit state publishes no status.
+    "curl -X POST https://api.github.com/repos/acme/example/statuses/abc --form-string 'description=gh pr merge is gated'"
   ];
   for (const command of allowedCommands) {
     const allowed = bash(command);

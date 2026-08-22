@@ -66,6 +66,49 @@ const SCRIPT_INTERPRETERS = new Set(['bun', 'deno', 'node', 'nodejs', 'ts-node',
 // Subcommands those interpreters accept before the script path (`deno run app.ts`).
 const INTERPRETER_SUBCOMMANDS = new Set(['exec', 'run']);
 
+// Interpreters that run a script written inline in the command, or read from the
+// data written into them. Their scripts are not shell, so they are not parsed;
+// they are only searched for a child process that would run the policy commands.
+const INLINE_SCRIPT_INTERPRETERS = new Set([
+  'bun', 'deno', 'node', 'nodejs', 'perl', 'php', 'python', 'python2', 'python3', 'ruby', 'ts-node', 'tsx'
+]);
+
+// Options and subcommands whose value is such an inline script (`python3 -c`,
+// `node -e`, `php -r`, `deno eval`).
+const INLINE_SCRIPT_OPTIONS = new Set(['-c', '-e', '-E', '-p', '-r', '--eval', '--execute', '--print']);
+const INLINE_SCRIPT_SUBCOMMANDS = new Set(['eval']);
+
+// Calls that start a child process from such a script. The names are written out
+// instead of matched loosely, so ordinary prose in a note — the text that made
+// this gate misfire — cannot look like one (central Issue #75).
+const SPAWN_API = new RegExp([
+  'subprocess', 'os\\.system', 'os\\.popen', 'os\\.exec\\w*', 'os\\.spawn\\w*', 'pty\\.spawn',
+  'commands\\.getoutput', 'child_process', 'execSync', 'execFileSync', 'spawnSync', 'execFile',
+  'popen\\s*\\(', 'system\\s*\\(', 'passthru\\s*\\(', 'shell_exec', 'proc_open', 'qx[({\\[/|]',
+  'Open3', 'IO\\.popen', 'Kernel\\.(?:system|exec|spawn)', 'Deno\\.(?:Command|run)', 'Bun\\.spawn',
+  'execvp?e?\\b'
+].join('|'));
+
+// What such a child process would have to name for this gate to care. A script
+// that starts child processes and also names a merge, the statuses endpoint or
+// the role runner cannot be cleared by reading it, so it fails closed; one that
+// names none of them is ordinary work and stays allowed (central Issue #75).
+const POLICY_KEYWORD = /\bgh\b|\bpr[\s'",\]]+merge\b|\/statuses\/|run-role\.js/i;
+
+// Programs whose operands are a command line they run themselves: `watch 'gh pr
+// merge 12'` re-runs those words every couple of seconds.
+const COMMAND_STRING_BINARIES = new Set(['watch']);
+const COMMAND_STRING_VALUE_OPTIONS = {
+  watch: new Set(['-n', '--interval'])
+};
+
+// Options whose value is a command line the program hands to a shell
+// (`flock /tmp/lock -c 'gh pr merge 12'`).
+const COMMAND_STRING_OPTIONS = {
+  flock: new Set(['-c', '--command']),
+  script: new Set(['-c', '--command'])
+};
+
 // `find` actions that execute the words after them, up to `;` or `+`, as a
 // command of their own: `find . -exec gh pr merge 12 \;` really merges.
 const FIND_EXEC_ACTIONS = new Set(['-exec', '-execdir', '-ok', '-okdir']);
@@ -77,6 +120,13 @@ const FIND_EXEC_TERMINATORS = new Set([';', '+']);
 const COMMAND_PREFIX_WORDS = new Set([
   '!', 'coproc', 'do', 'done', 'elif', 'else', 'fi', 'if', 'then', 'until', 'while'
 ]);
+
+// Word that introduces a function definition (`function deploy { … }`).
+const FUNCTION_KEYWORD = 'function';
+// A name a function definition can carry. It holds no expansion and no shell
+// metacharacter, so `f()` is told apart from a subshell or a command word this
+// gate cannot read.
+const FUNCTION_NAME = /^[A-Za-z0-9_.:+-]+$/;
 
 // Reserved words whose clause head is a word list rather than a command:
 // `for file in src/*.ts` and `case $x in` execute nothing, so those words are
@@ -103,7 +153,8 @@ const METHOD_OPTIONS = {
 // Options whose value is the request body of the executed HTTP call.
 const BODY_OPTIONS = {
   curl: new Set([
-    '-d', '-F', '--data', '--data-ascii', '--data-binary', '--data-raw', '--data-urlencode', '--form', '--json'
+    '-d', '-F', '--data', '--data-ascii', '--data-binary', '--data-raw', '--data-urlencode', '--form',
+    '--form-string', '--json'
   ]),
   gh: new Set(['-F', '-f', '--field', '--raw-field']),
   wget: new Set(['--body-data', '--post-data'])
@@ -113,11 +164,23 @@ const BODY_OPTIONS = {
 // names a file whose content becomes the payload, so the payload is not in
 // argv: `gh api -F state=@state.txt` reads that file, while `gh api -f
 // state=@state.txt` posts the text `@state.txt` and sets no success state.
+// `--form-string` is curl's literal counterpart of `--form` and sends the value
+// as written, so it is a body option that reads no file (central Issue #75).
 const LITERAL_BODY_OPTIONS = {
-  curl: new Set(['--data-raw']),
+  curl: new Set(['--data-raw', '--form-string']),
   gh: new Set(['-f', '--raw-field']),
   wget: new Set(['--body-data', '--post-data'])
 };
+
+// Body options that also read a file when the `@` follows a field name:
+// `curl --data-urlencode state@state.txt` sends the content of that file as the
+// `state` field, so the payload never appears in argv and fails closed.
+const FILE_FIELD_BODY_OPTIONS = {
+  curl: new Set(['--data-urlencode'])
+};
+// A body value whose `@` comes before any `=`: `@file` and `name@file` both name
+// a file, while `name=@file` is the literal text `@file`.
+const FILE_FIELD_REFERENCE = /^[^=@]*@/;
 
 // Body options whose value is a urlencoded field list rather than a single
 // field, so `-d 'context=ci&state=success'` is read field by field.
@@ -192,6 +255,7 @@ function unionOptions(map) {
 METHOD_OPTIONS[UNRESOLVED_BINARY] = unionOptions(METHOD_OPTIONS);
 BODY_OPTIONS[UNRESOLVED_BINARY] = unionOptions(BODY_OPTIONS);
 FORM_BODY_OPTIONS[UNRESOLVED_BINARY] = unionOptions(FORM_BODY_OPTIONS);
+FILE_FIELD_BODY_OPTIONS[UNRESOLVED_BINARY] = unionOptions(FILE_FIELD_BODY_OPTIONS);
 FILE_BODY_OPTIONS[UNRESOLVED_BINARY] = unionOptions(FILE_BODY_OPTIONS);
 URL_OPTIONS[UNRESOLVED_BINARY] = unionOptions(URL_OPTIONS);
 
@@ -469,6 +533,14 @@ function isBraceGroupClose(source, index) {
   return index === 0 || /[\s;]/.test(source[index - 1]);
 }
 
+// The `()` of a function definition: an empty pair, spaces allowed inside.
+// Returns the index after `)`, or -1 when the parenthesis opens something else.
+function emptyParensEnd(source, index) {
+  let cursor = index + 1;
+  while (source[cursor] === ' ' || source[cursor] === '\t') cursor += 1;
+  return source[cursor] === ')' ? cursor + 1 : -1;
+}
+
 /**
  * Tokenize a Bash tool input into the simple commands it actually executes.
  *
@@ -484,14 +556,22 @@ function isBraceGroupClose(source, index) {
  * value goes through an unquoted expansion carries {@link SPLIT_MARK}, because
  * Bash turns such a value into several words before the command runs.
  *
+ * Shell grammar also decides what does not execute: a `#` comment ends the line,
+ * and a function body waits for a call, so neither is read as an execution.
+ *
  * @param {string} source
  * @returns {{ commands: string[][], nested: string[], unresolved: boolean }}
  */
 function tokenizeScript(source) {
-  const commands = [];
   const details = [];
   const substitutions = [];
   const heredocs = [];
+  // Open `{ … }` and `( … )` groups, and the function definitions whose bodies
+  // they are. A command inside such a body is only executed when the function is
+  // called, so it is recorded with the name that has to be called.
+  const functionScopes = [];
+  let groupDepth = 0;
+  let pendingFunction = null;
   let tokens = [];
   // Parallel to `tokens`: whether the token was built from a substitution.
   let expanded = [];
@@ -537,8 +617,10 @@ function tokenizeScript(source) {
       expanded = [];
     }
     if (tokens.length) {
-      lastDetail = { tokens, expanded, stdin: stdinData, inputFromUnknown };
-      commands.push(tokens);
+      // The outermost enclosing definition: an inner function is only defined
+      // once the outer body runs, so that is the name that has to be called.
+      const fn = functionScopes.length ? functionScopes[0].name : null;
+      lastDetail = { tokens, expanded, stdin: stdinData, inputFromUnknown, fn };
       details.push(lastDetail);
       tokens = [];
       expanded = [];
@@ -580,6 +662,35 @@ function tokenizeScript(source) {
     if (operator === '<') inputFromUnknown = true;
     redirectTarget = 'file';
     return next;
+  };
+  // `{ … }` and `( … )` both delimit a function body, so either form opens and
+  // closes a group the definition can be attached to.
+  const openGroup = () => {
+    groupDepth += 1;
+    if (pendingFunction) {
+      functionScopes.push({ name: pendingFunction, depth: groupDepth });
+      pendingFunction = null;
+    }
+  };
+  const closeGroup = () => {
+    const scope = functionScopes[functionScopes.length - 1];
+    if (scope && scope.depth === groupDepth) functionScopes.pop();
+    if (groupDepth > 0) groupDepth -= 1;
+  };
+  // The name a `name()` or `function name` definition gives to the body that
+  // follows. The words are consumed, because a definition executes nothing on
+  // its own: `f() { gh pr merge 12; }` merges only once something calls `f`.
+  const takeFunctionName = () => {
+    const words = started ? tokens.concat([token]) : tokens;
+    const name = words.length === 1
+      ? words[0]
+      : words.length === 2 && words[0] === FUNCTION_KEYWORD ? words[1] : null;
+    if (!name || !FUNCTION_NAME.test(name)) return null;
+    tokens = [];
+    expanded = [];
+    token = '';
+    started = false;
+    return name;
   };
 
   while (i < source.length) {
@@ -700,19 +811,51 @@ function tokenizeScript(source) {
       i += 1;
       continue;
     }
-    if (ch === ';' || ch === '&' || ch === '(' || ch === ')') {
+    // `f()` opens a function definition; any other parenthesis opens a subshell.
+    if (ch === '(') {
+      const close = emptyParensEnd(source, i);
+      const name = close === -1 ? null : takeFunctionName();
+      if (name) {
+        pendingFunction = name;
+        i = close;
+        continue;
+      }
+      endCommand();
+      openGroup();
+      i += 1;
+      continue;
+    }
+    if (ch === ')') {
+      endCommand();
+      closeGroup();
+      i += 1;
+      continue;
+    }
+    if (ch === ';' || ch === '&') {
       endCommand();
       i += 1;
       continue;
     }
     if (ch === '{' && isBraceGroupOpen(source, i)) {
+      endToken();
+      // `function name { … }` names its body without a `()` of its own.
+      if (tokens.length > 1 && tokens[0] === FUNCTION_KEYWORD) pendingFunction = takeFunctionName();
       endCommand();
+      openGroup();
       i += 1;
       continue;
     }
     if (ch === '}' && isBraceGroupClose(source, i)) {
       endCommand();
+      closeGroup();
       i += 1;
+      continue;
+    }
+    // A comment runs to the end of the line and executes nothing, so
+    // `git commit -m x  # gh pr merge 12` merges nothing (central Issue #75).
+    if (ch === '#' && !started && !redirectTarget) {
+      const end = source.indexOf('\n', i);
+      i = end === -1 ? source.length : end;
       continue;
     }
     token += ch;
@@ -723,28 +866,65 @@ function tokenizeScript(source) {
 
   const nested = [...substitutions];
   let unresolved = false;
-  // `details` grows while it is walked: a delegated command is analyzed like any
+  // A body whose function is never called executes nothing; one left open by an
+  // unbalanced group is read as executed instead of guessed at.
+  const called = calledFunctions(details, functionScopes);
+  const executed = details.filter(detail => !detail.fn || called.has(binaryName(detail.fn)));
+  // `executed` grows while it is walked: a delegated command is analyzed like any
   // other, so `find . -exec env -S 'gh pr merge 12' \;` is followed to the end.
   // Each delegation drops at least its own binary and action word, so the token
   // lists get strictly shorter and the walk terminates.
-  for (let index = 0; index < details.length; index += 1) {
-    const detail = details[index];
+  for (let index = 0; index < executed.length; index += 1) {
+    const detail = executed[index];
     const delegatedScripts = [];
     nested.push(...shellScriptArguments(detail.tokens, delegatedScripts));
     const stdin = shellStdinScripts(detail);
     nested.push(...stdin.scripts);
+    nested.push(...commandStringScripts(detail.tokens));
+    const alias = ghAliasScripts(detail.tokens);
+    nested.push(...alias.scripts);
     if (stdin.unresolved || executesDynamicScript(detail) || executesGeneratedScript(detail)) unresolved = true;
+    // A script an interpreter runs inline is not shell: it is only denied when
+    // it starts a child process that could run the policy commands.
+    if (alias.unresolved || spawnsPolicyCommand(detail) || appendsUnknownWords(detail.tokens)) unresolved = true;
     for (const delegation of delegatedScripts) {
       nested.push(delegatedScriptLine(delegation));
       // `env -S "$CMD"` runs a command line this gate cannot read.
       if (UNRESOLVED_TEXT.test(delegation.script)) unresolved = true;
     }
     for (const delegated of delegatedCommands(detail.tokens)) {
-      commands.push(delegated);
-      details.push({ tokens: delegated, expanded: [], stdin: [], inputFromUnknown: false });
+      executed.push({ tokens: delegated, expanded: [], stdin: [], inputFromUnknown: false, fn: detail.fn });
     }
   }
-  return { commands, nested, unresolved };
+  return { commands: executed.map(detail => detail.tokens), nested, unresolved };
+}
+
+/**
+ * Names of the functions a script really calls. A definition only registers a
+ * body; the body runs when the name is used as a command word, so an uncalled
+ * `f() { gh pr merge 12; }` executes nothing and must stay allowed (central
+ * Issue #75). A command word this gate cannot read could name any of them, and a
+ * body whose group is never closed cannot be delimited, so both are read as
+ * called. A definition made in one tool call and used in another is outside what
+ * a per-command gate can see.
+ *
+ * @param {{ tokens: string[] }[]} details
+ * @param {{ name: string }[]} openScopes definitions left unclosed by the input
+ * @returns {Set<string>}
+ */
+function calledFunctions(details, openScopes) {
+  const called = new Set(openScopes.map(scope => binaryName(scope.name)));
+  for (const detail of details) {
+    for (const execution of resolveExecutions(detail.tokens)) {
+      if (execution.name !== UNRESOLVED_BINARY) {
+        called.add(execution.name);
+        continue;
+      }
+      // A command word this gate cannot read could name any of the definitions.
+      for (const other of details) if (other.fn) called.add(binaryName(other.fn));
+    }
+  }
+  return called;
 }
 
 /**
@@ -815,13 +995,18 @@ function splitsIntoWords(word) {
  * @param {string[]} tokens
  * @param {{ script: string, rest: string[] }[]} [delegated] receives command
  *   lines a wrapper option runs
- * @returns {{ name: string, args: string[] }[]}
+ * @returns {{ name: string, args: string[], appendsInput: boolean }[]}
+ *   `appendsInput` marks an execution whose command line is completed by words
+ *   read from stdin, as `xargs` does.
  */
 function resolveExecutions(tokens, delegated) {
   const executions = [];
   const commandName = word => (UNRESOLVED_TEXT.test(word) ? UNRESOLVED_BINARY : binaryName(word));
+  // `xargs` appends the words it reads from stdin to the command line, so the
+  // execution it starts has arguments that are not in argv.
+  let appendsInput = false;
   const addExecution = position => {
-    executions.push({ name: commandName(tokens[position]), args: tokens.slice(position + 1) });
+    executions.push({ name: commandName(tokens[position]), args: tokens.slice(position + 1), appendsInput });
   };
   let index = 0;
 
@@ -836,6 +1021,7 @@ function resolveExecutions(tokens, delegated) {
       break;
     }
 
+    if (name === 'xargs') appendsInput = true;
     const values = WRAPPER_VALUE_OPTIONS[name] || NO_OPTIONS;
     const scripts = SPLIT_STRING_OPTIONS[name] || NO_OPTIONS;
     // Options of unknown arity that may still swallow the following word. Each
@@ -937,6 +1123,126 @@ function delegatedCommands(tokens) {
     }
   }
   return delegated;
+}
+
+/**
+ * Command lines a program runs as text instead of as argv: `watch 'gh pr merge
+ * 12'` re-runs those words on a timer, and `flock /tmp/lock -c '…'` hands its
+ * value to a shell. Both readings of an unknown flag's arity are kept, so an
+ * option this gate does not know cannot shift the command line out of view.
+ *
+ * @param {string[]} tokens
+ * @returns {string[]}
+ */
+function commandStringScripts(tokens) {
+  const scripts = [];
+  for (const execution of resolveExecutions(tokens)) {
+    const options = COMMAND_STRING_OPTIONS[execution.name];
+    if (options) scripts.push(...optionValues(execution.args, options));
+    if (!COMMAND_STRING_BINARIES.has(execution.name)) continue;
+    const values = COMMAND_STRING_VALUE_OPTIONS[execution.name] || NO_OPTIONS;
+    for (const unknownTakesValue of [false, true]) {
+      const operands = commandOperands(execution.args, values, unknownTakesValue);
+      if (operands.length) scripts.push(operands.join(' '));
+    }
+  }
+  return scripts.filter(Boolean);
+}
+
+/**
+ * Command lines stored by `gh alias set`. gh runs them later under the alias
+ * name, so `gh alias set m 'pr merge'` writes a merge one call ahead of time and
+ * is read as one. A shell alias keeps its `!` line as a script, and any other
+ * expansion is gh's own arguments; both readings are parsed, because the form is
+ * also chosen by a `--shell` flag. `gh alias import` takes its aliases from a
+ * file this gate cannot read and fails closed. An alias created before this
+ * command is outside what a per-command gate can see.
+ *
+ * @param {string[]} tokens
+ * @returns {{ scripts: string[], unresolved: boolean }}
+ */
+function ghAliasScripts(tokens) {
+  const scripts = [];
+  let unresolved = false;
+  for (const execution of resolveExecutions(tokens)) {
+    if (execution.name !== 'gh' && execution.name !== UNRESOLVED_BINARY) continue;
+    for (const operands of ghOperandResolutions(execution.args)) {
+      if (!operands.length || !operandMatches(operands[0], 'alias')) continue;
+      const action = operands[1] || '';
+      if (operandMatches(action, 'import')) unresolved = true;
+      if (!operandMatches(action, 'set') || !operands[3]) continue;
+      const line = operands[3].startsWith('!') ? operands[3].slice(1) : operands[3];
+      scripts.push(line, `gh ${line}`);
+    }
+  }
+  return { scripts, unresolved };
+}
+
+/**
+ * True when `xargs` appends words this gate cannot read to a `gh` invocation
+ * whose command group or subcommand is still open: `echo 'pr merge 12' | xargs
+ * gh` merges, while `echo 12 | xargs gh pr view` can only add an operand to a
+ * read whose subcommand is already written out.
+ *
+ * @param {string[]} tokens
+ * @returns {boolean}
+ */
+function appendsUnknownWords(tokens) {
+  return resolveExecutions(tokens).some(execution => {
+    if (!execution.appendsInput) return false;
+    if (execution.name !== 'gh' && execution.name !== UNRESOLVED_BINARY) return false;
+    return ghOperandResolutions(execution.args).some(operands => operands.length < 2);
+  });
+}
+
+/**
+ * True when a command runs a script inline in an interpreter that is not a
+ * shell — `python3 -c`, `node -e`, or a heredoc fed to either — and that script
+ * both starts a child process and names a command this policy reserves. Such a
+ * script is not shell, so it cannot be parsed here and fails closed. A script
+ * that starts no child process, or that names none of those commands, is
+ * ordinary work: the memory note this gate used to block writes `gh pr merge`
+ * as text and spawns nothing, so it stays allowed (central Issue #75).
+ *
+ * @param {{ tokens: string[], stdin: string[] }} detail
+ * @returns {boolean}
+ */
+function spawnsPolicyCommand({ tokens, stdin }) {
+  return inlineInterpreterScripts(tokens, stdin)
+    .some(script => SPAWN_API.test(script) && POLICY_KEYWORD.test(script));
+}
+
+function inlineInterpreterScripts(tokens, stdin) {
+  const scripts = [];
+  for (const execution of resolveExecutions(tokens)) {
+    if (!INLINE_SCRIPT_INTERPRETERS.has(execution.name)) continue;
+    scripts.push(...optionValues(execution.args, INLINE_SCRIPT_OPTIONS));
+    const operands = commandOperands(execution.args, NO_OPTIONS, false);
+    if (operands.length > 1 && INLINE_SCRIPT_SUBCOMMANDS.has(operands[0])) scripts.push(operands[1]);
+    // A heredoc or a here-string is the interpreter's script only when it reads
+    // one from stdin; otherwise it is input data of the script it was given.
+    if (interpreterReadsStdin(execution.args)) scripts.push(...(stdin || []));
+  }
+  return scripts;
+}
+
+/**
+ * True when an interpreter takes its script from the data written into it: it
+ * has no script operand at all, or its first operand names stdin itself
+ * (`python3 - <<'PY'`). A readable operand names the script on disk, so the
+ * heredoc is that script's input data rather than its text and a note written
+ * through `python3 tools/write-note.py <<'EOF'` keeps its words — the same
+ * treatment `bash script.sh <<'EOF'` already gets (central Issue #75). An
+ * operand that only appears in one reading of an unknown flag's arity leaves the
+ * script source ambiguous, so the data is read as a script instead.
+ *
+ * @param {string[]} args
+ * @returns {boolean}
+ */
+function interpreterReadsStdin(args) {
+  const operands = scriptOperands(args);
+  if (operands.length < 2) return true;
+  return operands.some(operand => STDIN_OPERANDS.has(operand) || UNRESOLVED_TEXT.test(operand));
 }
 
 /**
@@ -1138,20 +1444,22 @@ function optionValues(args, flags) {
 /**
  * Request bodies found in argv, each with how its option reads the value:
  * `literal` when a leading `@` is data rather than a file name, `form` when the
- * value is a urlencoded field list rather than a single field.
+ * value is a urlencoded field list rather than a single field, `fileField` when
+ * `name@path` also reads the payload from a file.
  *
  * @param {string} name
  * @param {string[]} args
- * @returns {{ value: string, literal: boolean, form: boolean }[]}
+ * @returns {{ value: string, literal: boolean, form: boolean, fileField: boolean }[]}
  */
 function requestBodies(name, args) {
   const all = BODY_OPTIONS[name] || NO_OPTIONS;
   const literal = LITERAL_BODY_OPTIONS[name] || NO_OPTIONS;
   const form = FORM_BODY_OPTIONS[name] || NO_OPTIONS;
+  const fileField = FILE_FIELD_BODY_OPTIONS[name] || NO_OPTIONS;
   const bodies = [];
   for (const flag of all) {
     for (const value of optionValues(args, new Set([flag]))) {
-      bodies.push({ value, literal: literal.has(flag), form: form.has(flag) });
+      bodies.push({ value, literal: literal.has(flag), form: form.has(flag), fileField: fileField.has(flag) });
     }
   }
   return bodies;
@@ -1210,11 +1518,14 @@ function isOpaqueBody(value, literal) {
  * A urlencoded body is read field by field, so `-d 'context=ci&state=success'`
  * is not mistaken for a single `context` field.
  *
- * @param {{ value: string, literal: boolean, form: boolean }} body
+ * @param {{ value: string, literal: boolean, form: boolean, fileField: boolean }} body
  * @returns {boolean}
  */
 function bodyMayCarrySuccess(body) {
   const value = String(body.value);
+  // `--data-urlencode state@state.txt` sends the content of that file as the
+  // field value, so the payload is not in argv and cannot be cleared.
+  if (body.fileField && FILE_FIELD_REFERENCE.test(value)) return true;
   const parts = body.form ? value.split('&') : [];
   const fields = parts.length > 1 && parts.every(part => REQUEST_FIELD.test(part)) ? parts : [value];
   return fields.some(field => fieldMayCarrySuccess(field, body.literal));
@@ -1330,22 +1641,34 @@ function publishesToStatusEndpoint(reach, bodies, files) {
   return bodies.some(bodyMayCarrySuccess);
 }
 
+// `gh` prints help instead of running the subcommand as soon as it is asked for,
+// so `gh pr merge 12 --help` merges nothing.
+const GH_HELP_OPTIONS = new Set(['-h', '--help']);
+
+function ghRequestsHelp(args) {
+  return args.some(argument => GH_HELP_OPTIONS.has(String(argument).replace(SPLIT_TOKEN, '')));
+}
+
 function mergesPullRequest(tokens) {
   return resolveExecutions(tokens).some(execution => {
     if (execution.name !== 'gh' && execution.name !== UNRESOLVED_BINARY) return false;
+    if (ghRequestsHelp(execution.args)) return false;
     return ghOperandResolutions(execution.args).some(operands => (
-      // `gh` reads its command group and subcommand from the first operands, and
-      // an unquoted expansion there is split into words at run time: `ARGS='pr
-      // merge'; gh $ARGS 12` runs the merge with a single written operand, so
-      // that reading fails closed.
-      splitsIntoWords(operands[0]) || operands.some((operand, index) => (
-        index + 1 < operands.length && operandMatches(operand, 'pr') && operandMatches(operands[index + 1], 'merge')
-      ))
+      // `gh` dispatches on its first two operands, the command group and the
+      // subcommand: `gh help pr merge` prints the help page of the `help` group
+      // and merges nothing, so `pr merge` further along is not an execution
+      // (central Issue #75). An unquoted expansion in the group position is
+      // split into words at run time — `ARGS='pr merge'; gh $ARGS 12` runs the
+      // merge with a single written operand — so that reading fails closed.
+      splitsIntoWords(operands[0]) || (
+        operands.length > 1 && operandMatches(operands[0], 'pr') && operandMatches(operands[1], 'merge')
+      )
     ));
   });
 }
 
 function ghPublishesSuccessStatus(args) {
+  if (ghRequestsHelp(args)) return false;
   const resolutions = ghOperandResolutions(args);
   if (!resolutions.some(operands => operands.length > 0 && operandMatches(operands[0], 'api'))) return false;
   const reach = statusEndpointReach(resolutions);
@@ -1391,7 +1714,7 @@ function mayBeHttpie(name) {
 // form of `state=success`, and a value written `@path` is read from that file.
 function httpieItemBody(item) {
   const raw = HTTPIE_RAW_ITEM.exec(item);
-  return { value: raw ? `${raw[1]}=${raw[2]}` : item, literal: false, form: false };
+  return { value: raw ? `${raw[1]}=${raw[2]}` : item, literal: false, form: false, fileField: true };
 }
 
 /**
@@ -1493,7 +1816,7 @@ function run(rawInput, options = {}) {
     return deny('success commit statusの直接投稿は禁止です。engineering-kit-merge-gateが検査結果に基づいて投稿します。');
   }
   if (unresolved) {
-    return deny('生成した文字列をそのままscriptとして実行するコマンドは、実行内容を確認できないため許可できません。eval・sh -c・shellへのpipe・process substitutionのsourceに渡さず、実行するコマンドを直接記述してください。');
+    return deny('実行内容を確認できないコマンドは許可できません。生成した文字列をそのままscriptとして実行する形（eval・sh -c・shellへのpipe・process substitutionのsource）や、python/nodeなどのinline scriptから子processでghを起動する形を避け、実行するコマンドを直接記述してください。');
   }
   return rawInput;
 }
