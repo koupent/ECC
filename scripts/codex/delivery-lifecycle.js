@@ -33,8 +33,19 @@ function isDeliveryRequest(prompt) {
   return DELIVERY_REQUEST.test(actionable) || completion;
 }
 
-function titleFromRequest(request, requestHash = '') {
+function titleFromRequest(request, requestHash = '', mode = 'opaque') {
   const fingerprint = requestHash || hash(String(request || ''), 32);
+  if (mode === 'meaningful') {
+    const firstLine = String(request || '').split(/\r?\n/).map(line => line.trim()).find(Boolean) || '';
+    const sanitized = firstLine
+      .replace(/https?:\/\/\S+/gi, 'リンク')
+      .replace(/(?:gh[pousr]_|sk-|npm_)[A-Za-z0-9_-]{12,}/g, '[秘密情報]')
+      .replace(/^[#>*`\s-]+/, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 72);
+    if (sanitized) return sanitized;
+  }
   return `ECC delivery ${fingerprint.slice(0, 10)}`;
 }
 
@@ -82,21 +93,23 @@ function assertSafeGitRef(value, label) {
   return ref;
 }
 
-function deliveryBranch(issueNumber, title, currentBranch = '') {
-  const issueBranch = new RegExp(`^codex/issue-${Number(issueNumber)}(?:-|$)`, 'i');
+function deliveryBranch(issueNumber, title, currentBranch = '', prefix = 'codex') {
+  const safePrefix = assertSafeGitRef(prefix, 'Delivery branch prefix').replace(/\/$/, '');
+  const issueBranch = new RegExp(`^${safePrefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/issue-${Number(issueNumber)}(?:-|$)`, 'i');
   return issueBranch.test(String(currentBranch || ''))
     ? currentBranch
-    : `codex/issue-${Number(issueNumber)}-${slug(title)}`;
+    : `${safePrefix}/issue-${Number(issueNumber)}-${slug(title)}`;
 }
 
-function selectDeliveryBranch(issueNumber, title, currentBranch = '', existingBranches = []) {
-  const issueBranch = new RegExp(`^codex/issue-${Number(issueNumber)}(?:-|$)`, 'i');
+function selectDeliveryBranch(issueNumber, title, currentBranch = '', existingBranches = [], prefix = 'codex') {
+  const safePrefix = assertSafeGitRef(prefix, 'Delivery branch prefix').replace(/\/$/, '');
+  const issueBranch = new RegExp(`^${safePrefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/issue-${Number(issueNumber)}(?:-|$)`, 'i');
   if (issueBranch.test(String(currentBranch || ''))) return currentBranch;
   const candidates = [...new Set(existingBranches.filter(branch => issueBranch.test(String(branch || ''))))];
   if (candidates.length > 1) {
     throw new Error(`Issue #${Number(issueNumber)} has multiple local branches (${candidates.join(', ')}); consolidate them before continuing.`);
   }
-  return candidates[0] || deliveryBranch(issueNumber, title, currentBranch);
+  return candidates[0] || deliveryBranch(issueNumber, title, currentBranch, safePrefix);
 }
 
 function initializeDelivery(input, request, options = {}) {
@@ -128,7 +141,7 @@ function initializeDelivery(input, request, options = {}) {
     // 実装へ移っても必須Deliveryを迂回できないよう意図だけを先に記録する。
     status: options.deferred ? 'deferred' : 'pending',
     request_hash: requestHash,
-    title: titleFromRequest(request, requestHash),
+    title: titleFromRequest(request, requestHash, config.deliveryNaming),
     requested_issue_number: explicitIssueNumber(request),
     requested_pr_number: explicitPrNumber(request),
     base_branch: config.deliveryBaseBranch,
@@ -303,14 +316,14 @@ function prepareDelivery(input = {}, options = {}) {
 
       const existingIssueBranches = runCommand(
         'git',
-        ['branch', '--list', `codex/issue-${issue.number}-*`, '--format=%(refname:short)'],
+        ['branch', '--list', `${config.deliveryBranchPrefix}/issue-${issue.number}-*`, '--format=%(refname:short)'],
         { cwd, env }
       ).split(/\r?\n/).filter(Boolean);
       // 再開時にタイトルやslugが変わっても、同じIssueの現在branchを優先する。
       // これにより同一Issueへ複数branchを作ることを防ぐ。
       branch = existingPr
         ? currentBranch
-        : selectDeliveryBranch(issue.number, delivery.title, currentBranch, existingIssueBranches);
+        : selectDeliveryBranch(issue.number, delivery.title, currentBranch, existingIssueBranches, config.deliveryBranchPrefix);
       draftPrUrl = existingPr ? existingPr.url : delivery.draft_pr_url;
     }
 
@@ -318,6 +331,7 @@ function prepareDelivery(input = {}, options = {}) {
       ...delivery,
       issue_number: Number(issue.number),
       issue_url: issue.url,
+      issue_title: issue.title || delivery.title,
       branch,
       draft_pr_url: draftPrUrl,
       prepared_at: new Date().toISOString()
