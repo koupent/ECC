@@ -1,6 +1,6 @@
 {
   "name": "ecc",
-  "version": "2.1.0-koute.27",
+  "version": "2.1.0-koute.28",
   "description": "Harness-native ECC plugin for engineering teams - 67 agents, 281 skills, 99 legacy command shims, reusable hooks, rules, MCP conventions, and operator workflows for Claude Code plus adjacent agent harnesses; Koupent fork adds Codex context, review, telemetry, and incidents",
   "author": {
     "name": "Affaan Mustafa",

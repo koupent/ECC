@@ -2,7 +2,7 @@
 
 Bu, yazılım geliştirme için 28 özel agent, 116 skill, 59 command ve otomatik hook iş akışları sağlayan **üretime hazır bir AI kodlama eklentisidir**.
 
-**Sürüm:** 2.1.0-koute.27
+**Sürüm:** 2.1.0-koute.28
 
 ## Temel İlkeler
 

@@ -2,7 +2,7 @@
 
 This is a **production-ready AI coding plugin** providing 67 specialized agents, 281 skills, 99 commands, and automated hook workflows for software development.
 
-**Version:** 2.1.0-koute.27
+**Version:** 2.1.0-koute.28
 
 ## Core Principles
 
@@ -63,12 +63,18 @@ Never claim an agent ran without invoking it and collecting its result.
 
 When delegation is permitted, consider the matching specialist for genuinely bounded work:
 - Complex feature requests → **planner**
-- Code just written/modified → **code-reviewer**
+- Independent implementation or specialist work → matching Claude sub-agent
 - Bug fix or new feature → **tdd-guide**
 - Architectural decision → **architect**
 - Security-sensitive code → **security-reviewer**
 - Brownfield project onboarding → **spec-miner**
 - Autonomous loops / loop monitoring → **loop-operator**
+
+The parent Claude session owns decisions, integration, product implementation, and completion.
+Codex owns the initial Context Builder packet and the mandatory independent release/security
+review. Reviewer-named Claude agents are advisory specialists only; do not use them to replace or
+duplicate the Codex review or to satisfy its evidence gate. Run the Context Builder before broad
+Claude or sub-agent repository exploration.
 - Harness config reliability and cost → **harness-optimizer**
 
 Use parallel execution only for independent operations when the runtime permits delegation and the
@@ -126,7 +132,7 @@ Troubleshoot failures: check test isolation → verify mocks → fix implementat
 
 1. **Plan** — Use planner agent, identify dependencies and risks, break into phases
 2. **TDD** — Use tdd-guide agent, write tests first, implement, refactor
-3. **Review** — Use code-reviewer agent immediately, address CRITICAL/HIGH issues
+3. **Review** — Run the independent Codex review; add a Claude specialist only for a distinct advisory perspective
 4. **Capture knowledge in the right place**
    - Personal debugging notes, preferences, and temporary context → auto memory
    - Team/project knowledge (architecture decisions, API changes, runbooks) → the project's existing docs structure

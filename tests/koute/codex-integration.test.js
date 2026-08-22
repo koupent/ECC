@@ -19,6 +19,7 @@ const {
 const { isTestPath, normalizeReviewResult, requireUsableResult, reviewSnapshot, roleInstructions, runRole, validateResult, workingTreeSignature } = require('../../scripts/codex/run-role');
 const {
   acquireLock,
+  centralIssuePayload,
   classifyTarget,
   eligible,
   publicIncident
@@ -1239,6 +1240,10 @@ test('review instructions require full-file and workflow-structure inspection', 
   assert.match(instructions, /Read every changed file in full/);
   assert.match(instructions, /ordered procedure/);
   assert.match(instructions, /owner-action/);
+  assert.match(instructions, /Do not run build, test, package, formatter, or generator commands/i);
+
+  const contextInstructions = roleInstructions('context-builder', 'inspect this delivery');
+  assert.match(contextInstructions, /Do not run build, test, package, formatter, or generator commands/i);
 });
 
 test('clean review snapshots are reused instead of rerunning Codex', () => {
@@ -1368,6 +1373,37 @@ test('the canonical delegation policy carries the project owner standing authori
   const rulesReadme = readRepoFile('rules', 'README.md');
   assert.match(rulesReadme, /Rule Priority/);
   assert.match(rulesReadme, /standing\s+request/);
+});
+
+test('Claude sub-agents and Codex have one non-overlapping review contract', () => {
+  // 中央Issue #141: Claude reviewerを必須Codex reviewの代替・重複として扱わない。
+  for (const file of [
+    ['rules', 'common', 'agents.md'],
+    ['AGENTS.md'],
+    ['.cursor', 'rules', 'common-agents.md'],
+    ['.opencode', 'instructions', 'INSTRUCTIONS.md'],
+    ['.kiro', 'steering', 'agents.md']
+  ]) {
+    const source = readRepoFile(...file);
+    const label = file.join('/');
+    assert.match(source, /Codex owns the initial Context Builder packet/i, label);
+    assert.match(source, /reviewer-named Claude agents are advisory/i, label);
+    assert.match(source, /(?:not|to) replace or\s+duplicate the (?:mandatory )?Codex review/i, label);
+  }
+
+  for (const file of [
+    ['rules', 'common', 'development-workflow.md'],
+    ['rules', 'common', 'security.md'],
+    ['.cursor', 'rules', 'common-development-workflow.md'],
+    ['.cursor', 'rules', 'common-security.md'],
+    ['.kiro', 'steering', 'development-workflow.md'],
+    ['.kiro', 'steering', 'security.md']
+  ]) {
+    const source = readRepoFile(...file);
+    const label = file.join('/');
+    assert.match(source, /independent Codex/i, label);
+    assert.match(source, /does not replace|do not\s+duplicate/i, label);
+  }
 });
 
 test('rules that name an agent stay conditional on the canonical delegation policy', () => {
@@ -1571,6 +1607,26 @@ test('incident target classification routes Kit, ECC, product, and explicit targ
   assert.strictEqual(classifyTarget({ type: 'duplicate_finding', role: 'review' }), 'ecc');
   assert.strictEqual(classifyTarget({ type: 'product_e2e_failure' }), 'product');
   assert.strictEqual(classifyTarget({ type: 'unknown', metadata: { target: 'kit' } }), 'kit');
+});
+
+test('central incident Issues use the Japanese report-only template without workflow status labels', () => {
+  const payload = centralIssuePayload({
+    fingerprint: '48be3a24636cd77006fdb4def3bfce03',
+    type: 'codex_role_failure',
+    severity: 'minor',
+    count: 2,
+    project: 'project-fingerprint',
+    message: 'read-only Codex role changed the working tree'
+  });
+  assert.strictEqual(payload.title, '[ECCインシデント][ECC] Codex役割の実行に失敗 (48be3a2463)');
+  assert.deepStrictEqual(payload.labels, ['harness-incident', 'target:ecc', 'severity:minor']);
+  assert.match(payload.body, /^## 概要/m);
+  assert.match(payload.body, /^## 分類/m);
+  assert.match(payload.body, /^## 匿名化済みメッセージ/m);
+  assert.match(payload.body, /^## 対応方針/m);
+  assert.match(payload.body, /製品セッションは報告だけ/);
+  assert.doesNotMatch(payload.body, /Background remediation|Follow-up must use/);
+  assert.ok(!payload.labels.some(label => label.startsWith('status:') || label.startsWith('automation:')));
 });
 
 test('incident worker lock prevents concurrent reporting and releases cleanly', () => {

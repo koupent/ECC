@@ -178,7 +178,9 @@ When creating PRs:
    - Verify 80%+ coverage
 
 3. **Code Review**
-   - Use **code-reviewer** agent immediately after writing code
+   - Run the mandatory independent Codex review after implementation and local verification
+   - Use a Claude **code-reviewer** only for a distinct advisory perspective; it does not replace
+     or duplicate the Codex review and cannot satisfy the release evidence gate
    - Address CRITICAL and HIGH issues
    - Fix MEDIUM issues when possible
 
@@ -226,9 +228,16 @@ always take precedence over this document. An unconditional prohibition, unavail
 security boundary, or task-specific opt-out still wins. A condition that merely requires a user
 request is satisfied by the standing request above.
 
+**Claude / Codex role boundary.** The parent Claude session owns decisions, integration, product
+implementation, and completion. Codex owns the initial Context Builder packet and the independent
+release/security review. Claude sub-agents handle bounded planning, implementation, tests,
+diagnosis, and distinct specialist analysis. Reviewer-named Claude agents are advisory only: they
+must not replace or duplicate the mandatory Codex review or satisfy its evidence gate. Run the
+Context Builder before broad Claude or sub-agent exploration.
+
 When delegation tools are available and higher-priority instructions permit their use:
 1. Complex feature requests - Consider the **planner** agent
-2. Code just written/modified - Consider the **code-reviewer** agent
+2. Independent implementation or specialist work - Consider a matching Claude sub-agent
 3. Bug fix or new feature - Consider the **tdd-guide** agent
 4. Architectural decision - Consider the **architect** agent
 

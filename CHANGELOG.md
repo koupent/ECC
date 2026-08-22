@@ -5,6 +5,8 @@
 ### Changed
 
 - 製品セッションのインシデント処理を`report-only`へ固定し、中央Operator専用の`central-remediate`、attestation、書込Codex roleを撤去しました。Kit／ECCの修正は対象repositoryを直接開いた対話セッションで行います。
+- Claude親セッション、Claudeサブエージェント、Codexの責務を一意にしました。CodexをContext Builderと独立release/security reviewの正本とし、Claude reviewerは異なる観点が必要な場合だけ使う助言役へ限定します。
+- 中央インシデントIssueのタイトルと本文を日本語の固定形式へ統一し、Operator用statusラベルを新規報告へ付けないようにしました。
 - 通常のPR／pushではGitHub Actions CIを起動せず、ローカル検証と明示的なrelease処理へ分離しました。
 - 独立Codexレビューが差分だけでなく変更ファイル全体、呼出元、利用側、手順順序、前提条件、ロールバック経路まで確認するようにしました。指摘は`release-blocker`、`owner-action`、`follow-up`へ分類します。
 - サブエージェントRulesは自動起動を保証せず、上位指示とランタイムで許可された場合だけモデルが明示的に委任する契約へ改めました。

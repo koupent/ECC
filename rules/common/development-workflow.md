@@ -32,7 +32,9 @@ The Feature Implementation Workflow describes the development pipeline: research
    - Verify 80%+ coverage
 
 3. **Code Review**
-   - Use **code-reviewer** agent immediately after writing code
+   - Run the mandatory independent Codex review after implementation and local verification
+   - Use a Claude **code-reviewer** only for a distinct, bounded advisory perspective; do not
+     duplicate the Codex review or treat the sub-agent result as release-gate evidence
    - Address CRITICAL and HIGH issues
    - Fix MEDIUM issues when possible
 

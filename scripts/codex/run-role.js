@@ -115,6 +115,7 @@ function roleInstructions(role, request) {
       'Do not execute the requested implementation, acceptance, migration, or state-changing command; only inspect and report the context the parent Claude session needs.',
       'If the request is only an explicit operational or acceptance command and needs no repository investigation, return status=ok with an empty files array and tell the parent Claude session to execute it; this is not insufficient context.',
       'Do not call GitHub write operations or repository commands whose purpose is to fulfill the user task.',
+      'Do not run build, test, package, formatter, or generator commands that can create caches or artifacts in the working tree.',
       'Do not edit any file.'
     );
   } else if (role === 'bug-reproduction-test' || role === 'contract-test') {
@@ -136,10 +137,15 @@ function roleInstructions(role, request) {
       'Use follow-up for non-blocking repository improvements. CRITICAL findings must be release-blocker; HIGH findings must be release-blocker or owner-action, never follow-up.',
       'Set review_complete=true only after the full requested review scope was inspected; otherwise set it to false.',
       'Set status=blocked only when a release-blocker remains or the review itself could not be completed.',
+      'Use read-only inspection commands only. Do not run build, test, package, formatter, or generator commands that can create caches or artifacts in the working tree.',
       'Report only evidence-backed findings that are actionable for this request.'
     );
   } else {
-    common.push('', 'Do not edit any file. Report only evidence-backed findings that are actionable for this request.');
+    common.push(
+      '',
+      'Do not edit any file or run commands that can create caches or artifacts in the working tree.',
+      'Report only evidence-backed findings that are actionable for this request.'
+    );
   }
   return common.join('\n');
 }
@@ -356,7 +362,9 @@ function runRole(options) {
     const after = workingTreePaths(cwd);
 
     if (!def.writePolicy && workingTreeSignature(cwd) !== beforeSignature) {
-      throw new Error('read-only Codex role changed the working tree');
+      const changedPaths = [...new Set([...before, ...after])].slice(0, 20);
+      const detail = changedPaths.length > 0 ? `: ${changedPaths.join(', ')}` : '';
+      throw new Error(`read-only Codex role changed the working tree${detail}`);
     }
     if (def.writePolicy === 'tests-only') {
       const violations = after.filter(file => !isTestPath(file));

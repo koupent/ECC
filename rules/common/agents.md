@@ -9,8 +9,8 @@ Located in `~/.claude/agents/`:
 | planner | Implementation planning | Complex features, refactoring |
 | architect | System design | Architectural decisions |
 | tdd-guide | Test-driven development | New features, bug fixes |
-| code-reviewer | Code review | After writing code |
-| security-reviewer | Security analysis | Before commits |
+| code-reviewer | Advisory code review | Optional scoped pre-check; never the release review authority |
+| security-reviewer | Advisory security analysis | Optional scoped pre-check; never the release security review authority |
 | build-error-resolver | Fix build errors | When build fails |
 | e2e-runner | E2E testing | Critical user flows |
 | refactor-cleaner | Dead code cleanup | Code maintenance |
@@ -44,9 +44,22 @@ always take precedence over this rule. The standing request does not override an
 prohibition, an unavailable tool, a security boundary, or a task-specific user instruction not to
 delegate. A condition that merely requires a user request is not an unconditional prohibition.
 
+## Claude / Codex Role Boundary
+
+- The parent Claude session owns decisions, integration, product implementation, and completion.
+- Codex owns the initial Context Builder packet and the independent release review. Use the Codex
+  `security-review` role when an independent security review is required.
+- Claude sub-agents are for bounded planning, implementation, tests, diagnosis, or specialist
+  analysis that can run independently. Reviewer-named Claude agents are advisory specialists;
+  they do not replace or duplicate the mandatory Codex review and do not satisfy its evidence gate.
+- Run the Context Builder before any broad Claude or sub-agent repository exploration. After its
+  packet is ready (or a recorded fallback opens the gate), give sub-agents bounded files and tasks.
+- Do not run a Claude reviewer and Codex over the same review scope by default. Add an advisory
+  specialist only when its distinct perspective is material, and hand its result to the parent.
+
 When delegation tools are available and higher-priority instructions permit their use:
 1. Complex feature requests - Consider the **planner** agent
-2. Code just written/modified - Consider the **code-reviewer** agent
+2. Independent implementation or specialist work - Consider a matching Claude sub-agent
 3. Bug fix or new feature - Consider the **tdd-guide** agent
 4. Architectural decision - Consider the **architect** agent
 
