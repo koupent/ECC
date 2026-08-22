@@ -25,9 +25,10 @@ const ROLE_DEFS = {
   review: { model: 'review', schema: 'assessment-result.schema.json', sandbox: 'read-only' },
   'security-review': { model: 'review', schema: 'assessment-result.schema.json', sandbox: 'read-only' },
   'bug-reproduction-test': { model: 'review', schema: 'assessment-result.schema.json', sandbox: 'workspace-write', writePolicy: 'tests-only' },
-  'contract-test': { model: 'review', schema: 'assessment-result.schema.json', sandbox: 'workspace-write', writePolicy: 'tests-only' },
-  'harness-remediation': { model: 'review', schema: 'assessment-result.schema.json', sandbox: 'workspace-write', writePolicy: 'fork-only' }
+  'contract-test': { model: 'review', schema: 'assessment-result.schema.json', sandbox: 'workspace-write', writePolicy: 'tests-only' }
 };
+
+const MAX_REVIEW_ROUNDS = 3;
 
 function git(cwd, args, options = {}) {
   return spawnSync('git', args, {
@@ -94,7 +95,7 @@ function removeUnauthorizedChanges(cwd, paths) {
   }
 }
 
-function roleInstructions(role, request) {
+function roleInstructions(role, request, reviewContext = {}) {
   const common = [
     `Role: ${role}.`,
     'Work only on the bounded request below.',
@@ -116,6 +117,7 @@ function roleInstructions(role, request) {
       'Do not execute the requested implementation, acceptance, migration, or state-changing command; only inspect and report the context the parent Claude session needs.',
       'If the request is only an explicit operational or acceptance command and needs no repository investigation, return status=ok with an empty files array and tell the parent Claude session to execute it; this is not insufficient context.',
       'Do not call GitHub write operations or repository commands whose purpose is to fulfill the user task.',
+      'Do not run build, test, package, formatter, or generator commands that can create caches or artifacts in the working tree.',
       'Do not edit any file.'
     );
   } else if (role === 'bug-reproduction-test' || role === 'contract-test') {
@@ -125,13 +127,6 @@ function roleInstructions(role, request) {
       'Do not edit product source, configuration, snapshots outside test trees, or existing implementation code.',
       'If a correct independent test cannot be written, return status=blocked without changing files.'
     );
-  } else if (role === 'harness-remediation') {
-    common.push(
-      '',
-      'This is a sanitized defect in the public koupent/ECC fork.',
-      'Add a failing regression test first, implement the smallest generic fix, and run relevant tests.',
-      'Do not add private paths, repository names, prompts, or customer data.'
-    );
   } else if (role === 'review' || role === 'security-review') {
     common.push(
       '',
@@ -139,15 +134,36 @@ function roleInstructions(role, request) {
       'When the worktree is clean, compare the current issue branch against its base branch and inspect the committed changes.',
       'Use the diff to identify the review surface, not as the boundary of inspection. Read every changed file in full and inspect relevant callers, consumers, tests, and configuration.',
       'For documentation, runbooks, migrations, release flows, and CI/CD, validate the complete ordered procedure, prerequisites, rollback path, and the point where each guard can actually run.',
-      'Classify each finding as release-blocker, owner-action, or follow-up. Only repository-fixable defects that make this merge unsafe are release-blocker findings.',
+      'Classify each finding as release-blocker, owner-action, or follow-up. Severity and release disposition are separate judgments.',
+      'Use release-blocker only when merging the current change would create an exploitable security/privacy/authorization defect, irreversible data loss or corruption, failure of a stated acceptance criterion or core user flow, a required check failure caused by the change, or an incompatible public contract without a safe migration or rollback.',
       'Use owner-action when the repository change can merge safely but an external host, credential, deployment, approval, or operator step remains. Put the required step in followups and do not block the review solely for it.',
-      'Use follow-up for non-blocking repository improvements. CRITICAL findings must be release-blocker; HIGH findings must be release-blocker or owner-action, never follow-up.',
+      'Use follow-up for style, readability, refactoring, optional hardening, extra tests beyond the acceptance criteria, speculative edge cases, unmeasured performance concerns, and documentation polish. A HIGH finding may be follow-up when the current merge remains safe. CRITICAL findings must be release-blocker.',
       'Set review_complete=true only after the full requested review scope was inspected; otherwise set it to false.',
       'Set status=blocked only when a release-blocker remains or the review itself could not be completed.',
+      'Use read-only inspection commands only. Do not run build, test, package, formatter, or generator commands that can create caches or artifacts in the working tree.',
+      'Report only evidence-backed findings that are actionable for this request.',
+      'Write the summary, finding titles, evidence, recommendations, and followups in Japanese so repository-facing follow-up records are readable by the project owner.'
+    );
+    if (reviewContext.focused === true) {
+      const prior = (reviewContext.blockers || [])
+        .map(item => `- ${item.fingerprint}: ${item.title || item.recommendation || 'previous blocker'}`)
+        .join('\n');
+      common.push(
+        '',
+        `This is focused re-review round ${reviewContext.round} of ${reviewContext.maxRounds}. Do not restart the full delivery review.`,
+        'Verify only whether the previous release blockers were fixed and whether those fixes introduced a release-blocking regression.',
+        'A newly noticed non-CRITICAL issue outside the blocker fixes cannot start another blocking loop; classify it as follow-up.',
+        'A newly discovered CRITICAL issue remains a release-blocker even when it was missed previously.',
+        'Previous release blockers:',
+        prior || '- No structured prior blocker was available; inspect only the latest blocker-fix delta and its direct consumers.'
+      );
+    }
+  } else {
+    common.push(
+      '',
+      'Do not edit any file or run commands that can create caches or artifacts in the working tree.',
       'Report only evidence-backed findings that are actionable for this request.'
     );
-  } else {
-    common.push('', 'Do not edit any file. Report only evidence-backed findings that are actionable for this request.');
   }
   return common.join('\n');
 }
@@ -194,9 +210,6 @@ function validateResult(result, schemaName) {
       const severity = String(finding.severity || '').toLowerCase();
       if (severity === 'critical' && finding.disposition !== 'release-blocker') {
         throw new Error('Critical findings must be classified as release-blocker');
-      }
-      if (severity === 'high' && finding.disposition === 'follow-up') {
-        throw new Error('High findings cannot be classified as follow-up');
       }
     }
     if (ownerActions.length > 0 && (!Array.isArray(result.followups) || result.followups.length === 0)) {
@@ -286,6 +299,18 @@ function runRole(options) {
 
   const model = def.model === 'context' ? config.contextModel : config.reviewModel;
   const priorState = readState(input, env);
+  const reviewCycle = priorState.delivery && priorState.delivery.review_cycle || {};
+  const priorReviewRound = Number.isInteger(reviewCycle.round) ? reviewCycle.round : 0;
+  const priorReviewBlockers = Array.isArray(reviewCycle.blockers) ? reviewCycle.blockers : [];
+  const focusedReview = isReviewRole(role) && priorReviewRound > 0 && priorReviewBlockers.length > 0;
+  const reviewInstructionContext = isReviewRole(role) ? {
+    focused: focusedReview,
+    round: priorReviewRound + 1,
+    maxRounds: MAX_REVIEW_ROUNDS,
+    blockers: priorReviewBlockers
+  } : {};
+  // 同じsnapshotの再呼出しは、直前結果がblockerでも再実行しない。focused/fullの違いを
+  // cache keyへ入れると、修正前の同一HEADをもう一度レビューする無駄ループになる。
   const currentReviewRequestHash = isReviewRole(role) ? hash(options.request || '', 32) : null;
   const currentReviewSnapshot = isReviewRole(role) && before.length === 0
     ? reviewSnapshot(cwd, priorState)
@@ -309,6 +334,29 @@ function runRole(options) {
       changedPaths: [],
       cached: true
     };
+  }
+  if (isReviewRole(role) && priorReviewRound >= MAX_REVIEW_ROUNDS && priorReviewBlockers.length > 0) {
+    const message = `独立レビューが${MAX_REVIEW_ROUNDS}回で収束しませんでした。自動再レビューを停止し、残っているrelease-blockerの方針判断が必要です。`;
+    if (reviewCycle.limit_reached !== true) {
+      writeState(input, {
+        delivery: {
+          ...priorState.delivery,
+          review_cycle: { ...reviewCycle, limit_reached: true, stopped_at: new Date().toISOString() }
+        },
+        review_limit_reached: true,
+        last_error: message
+      }, env);
+      recordIncident({
+        type: 'review_convergence_limit',
+        severity: 'minor',
+        target: 'ecc',
+        role,
+        promotable: false,
+        message,
+        metadata: { rounds: MAX_REVIEW_ROUNDS, blocker_count: priorReviewBlockers.length }
+      }, { cwd, env });
+    }
+    return { ok: false, role, model, error: message, fallback: false, needsHuman: true };
   }
   const runDir = path.join(stateRoot(env), 'runs', `${Date.now()}-${process.pid}-${crypto.randomBytes(4).toString('hex')}`);
   fs.mkdirSync(runDir, { recursive: true });
@@ -348,7 +396,7 @@ function runRole(options) {
   const result = spawnSync(env.ECC_CODEX_BINARY || 'codex', args, {
     cwd,
     env,
-    input: roleInstructions(role, options.request || ''),
+    input: roleInstructions(role, options.request || '', reviewInstructionContext),
     encoding: 'utf8',
     timeout: Math.max(1, config.timeoutSeconds) * 1000,
     maxBuffer: 32 * 1024 * 1024
@@ -364,7 +412,9 @@ function runRole(options) {
     const after = workingTreePaths(cwd);
 
     if (!def.writePolicy && workingTreeSignature(cwd) !== beforeSignature) {
-      throw new Error('read-only Codex role changed the working tree');
+      const changedPaths = [...new Set([...before, ...after])].slice(0, 20);
+      const detail = changedPaths.length > 0 ? `: ${changedPaths.join(', ')}` : '';
+      throw new Error(`read-only Codex role changed the working tree${detail}`);
     }
     if (def.writePolicy === 'tests-only') {
       const violations = after.filter(file => !isTestPath(file));
@@ -427,6 +477,43 @@ function runRole(options) {
       nextPatch.review_result = parsed;
       nextPatch.review_snapshot = currentReviewSnapshot || reviewSnapshot(cwd, state);
       nextPatch.review_request_hash = currentReviewRequestHash;
+      const nextRound = priorReviewRound + 1;
+      const blockerRecords = releaseBlockers.map(finding => ({
+        fingerprint: String(finding.fingerprint || hash(`${finding.title}|${finding.path}|${finding.evidence}`, 24)),
+        title: String(finding.title || '').slice(0, 200),
+        recommendation: String(finding.recommendation || '').slice(0, 500)
+      }));
+      nextPatch.review_round = nextRound;
+      nextPatch.review_limit_reached = releaseBlockers.length > 0 && nextRound >= MAX_REVIEW_ROUNDS;
+      const accumulatedFollowups = [
+        ...(Array.isArray(state.review_followups) ? state.review_followups : []),
+        ...parsed.findings
+          .filter(finding => finding.disposition === 'follow-up')
+          .map(finding => ({
+            fingerprint: String(finding.fingerprint || hash(`${finding.title}|${finding.path}|${finding.evidence}`, 24)),
+            severity: finding.severity,
+            title: finding.title,
+            path: finding.path,
+            recommendation: finding.recommendation
+          }))
+      ];
+      nextPatch.review_followups = [...new Map(
+        accumulatedFollowups.map(finding => [String(finding.fingerprint || finding.title), finding])
+      ).values()];
+      if (state.delivery) {
+        nextPatch.delivery = {
+          ...state.delivery,
+          review_cycle: {
+            round: nextRound,
+            max_rounds: MAX_REVIEW_ROUNDS,
+            mode: focusedReview ? 'focused' : 'full',
+            blockers: blockerRecords,
+            limit_reached: releaseBlockers.length > 0 && nextRound >= MAX_REVIEW_ROUNDS,
+            reviewed_head: gitOutput(cwd, ['rev-parse', 'HEAD']),
+            reviewed_at: new Date().toISOString()
+          }
+        };
+      }
     }
     writeState(input, nextPatch, env);
     appendEvent(
@@ -469,6 +556,7 @@ if (require.main === module) {
 
 module.exports = {
   ROLE_DEFS,
+  MAX_REVIEW_ROUNDS,
   diffFingerprint,
   isTestPath,
   parseArgs,

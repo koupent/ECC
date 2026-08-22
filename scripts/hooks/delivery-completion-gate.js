@@ -67,6 +67,69 @@ function verifyCommitStatus(execute, config, head, cwd, env) {
   return { ok: true, status };
 }
 
+function reviewFollowups(state) {
+  const seen = new Set();
+  return (Array.isArray(state.review_followups) ? state.review_followups : [])
+    .filter(item => item && typeof item.title === 'string' && item.title.trim())
+    .filter(item => {
+      const key = String(item.fingerprint || item.title).trim();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function ensureReviewFollowupIssue(execute, state, input, delivery, pr, cwd, env) {
+  const items = reviewFollowups(state);
+  if (items.length === 0 || !delivery.issue_number) return { ok: true, skipped: true };
+  if (state.review_followup_issue_url) return { ok: true, url: state.review_followup_issue_url, reused: true };
+
+  const marker = `<!-- ecc-review-followup:issue-${delivery.issue_number} -->`;
+  const existing = execute('gh', ['issue', 'list', '--state', 'all', '--limit', '200', '--json', 'number,url,body'], cwd, env);
+  if (existing.ok) {
+    try {
+      const match = parseJson(existing, 'follow-up issue list')
+        .find(issue => String(issue.body || '').includes(marker));
+      if (match && match.url) {
+        writeState(input, { review_followup_issue_url: match.url }, env);
+        return { ok: true, url: match.url, reused: true };
+      }
+    } catch {
+      // 一覧の取得・解析失敗は下の新規作成へ進めず、重複Issueを防ぐ。
+      return { ok: false, reason: '既存のフォローアップIssueを確認できませんでした。' };
+    }
+  } else {
+    return { ok: false, reason: existing.stderr || '既存のフォローアップIssueを確認できませんでした。' };
+  }
+
+  const lines = items.map(item => {
+    const location = item.path ? `（${item.path}）` : '';
+    const recommendation = item.recommendation ? ` — ${item.recommendation}` : '';
+    return `- [ ] ${item.title}${location}${recommendation}`;
+  });
+  const body = [
+    marker,
+    `Issue #${delivery.issue_number} の独立レビューで見つかった、今回のマージを止めない改善候補です。`,
+    '',
+    `元のIssue: #${delivery.issue_number}`,
+    `元のPR: ${pr.url}`,
+    '',
+    '## 改善候補',
+    ...lines,
+    '',
+    'このIssueは元のDeliveryとは分離して優先順位を判断してください。'
+  ].join('\n');
+  const created = execute('gh', [
+    'issue', 'create',
+    '--title', `[Follow-up] Issue #${delivery.issue_number} のレビュー改善候補`,
+    '--body', body
+  ], cwd, env);
+  if (!created.ok || !created.stdout) return { ok: false, reason: created.stderr || 'フォローアップIssueを作成できませんでした。' };
+  const url = created.stdout.split(/\r?\n/).find(line => /^https?:\/\//.test(line.trim())) || created.stdout.trim();
+  writeState(input, { review_followup_issue_url: url }, env);
+  return { ok: true, url };
+}
+
 function completeBySquashMerge(execute, config, delivery, pr, head, cwd, env) {
   if (config.mergeGate.provider !== 'commit-status' || config.mergeGate.strategy !== 'squash') {
     return { ok: false, reason: 'squash-merge completion requires mergeGate provider=commit-status and strategy=squash.' };
@@ -196,6 +259,16 @@ function run(rawInput, options = {}) {
     return block(`Draft PR #${candidate.number} is not linked to Issue #${delivery.issue_number}. Add \`Closes #${delivery.issue_number}\` to the PR body.`);
   }
 
+  // 非blocking改善は現在のDeliveryへ混ぜず、一つの後続Issueへまとめる。
+  // GitHub側の一時障害でリリース可能な修正を止めないが、incidentには残す。
+  const followup = ensureReviewFollowupIssue(execute, state, input, delivery, candidate, cwd, env);
+  if (!followup.ok) {
+    recordIncident(
+      { type: 'review_followup_issue_failure', severity: 'minor', message: followup.reason, hook_id: 'delivery-completion' },
+      { cwd, env }
+    );
+  }
+
   if (config.deliveryCompletion === 'squash-merge') {
     const completion = completeBySquashMerge(execute, config, delivery, candidate, head.stdout, cwd, env);
     if (!completion.ok) {
@@ -229,4 +302,14 @@ if (require.main === module) {
   process.stdin.on('end', () => process.stdout.write(run(raw)));
 }
 
-module.exports = { block, command, completeBySquashMerge, isTransientGitHubFailure, parseJson, run, verifyCommitStatus };
+module.exports = {
+  block,
+  command,
+  completeBySquashMerge,
+  ensureReviewFollowupIssue,
+  isTransientGitHubFailure,
+  parseJson,
+  reviewFollowups,
+  run,
+  verifyCommitStatus
+};

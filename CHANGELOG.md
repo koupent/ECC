@@ -4,13 +4,17 @@
 
 ### Changed
 
-- 製品セッションのインシデント処理を`report-only`へ固定し、Kit／ECC修正は専用attestationを持つ中央Operatorだけが開始できるようにしました。旧background Codex remediationは廃止しました。
+- 標準Deliveryを一人の実装担当と一回のCodex release reviewへ簡素化し、同じ差分に対するClaude側の全面再レビューを廃止しました。現在のマージを止める指摘を取り返しのつかないセキュリティ・データ・受入条件・必須検査・公開契約の欠陥へ限定し、それ以外は一つの後続Issueへ分離します。
+- blocker修正後は対象指摘と修正由来の回帰だけを再検証し、初回を含む最大3 review roundで収束しない場合に限って人の判断へ移します。全タスク一律のTDD、全テスト層、80% coverageは要求せず、変更リスクに比例した最小の検証を選びます。
+- 製品セッションのインシデント処理を`report-only`へ固定し、中央Operator専用の`central-remediate`、attestation、書込Codex roleを撤去しました。Kit／ECCの修正は対象repositoryを直接開いた対話セッションで行います。
+- Claude親セッション、Claudeサブエージェント、Codexの責務を一意にしました。CodexをContext Builderと独立release/security reviewの正本とし、Claude reviewerは異なる観点が必要な場合だけ使う助言役へ限定します。
+- 中央インシデントIssueのタイトルと本文を日本語の固定形式へ統一し、Operator用statusラベルを新規報告へ付けないようにしました。
 - 通常のPR／pushではGitHub Actions CIを起動せず、ローカル検証と明示的なrelease処理へ分離しました。
 - 独立Codexレビューが差分だけでなく変更ファイル全体、呼出元、利用側、手順順序、前提条件、ロールバック経路まで確認するようにしました。指摘は`release-blocker`、`owner-action`、`follow-up`へ分類します。
 - サブエージェントRulesは自動起動を保証せず、上位指示とランタイムで許可された場合だけモデルが明示的に委任する契約へ改めました。
 - Kit導入プロジェクト向けに、現HEADの`Local Merge Gate`成功後だけPRをReady化して通常squash mergeし、GitHub上の`MERGED`まで確認するCompletion方式を追加しました。従来のDraft PR停止は既定値として維持します。
 - PreToolUse Hookが直接の`gh pr merge`とsuccess commit status投稿を拒否し、Local Merge GateとCompletion Gateの決定論的経路へ統一します。
-- Harness incidents now route deterministically to ECC, Engineering Environment Kit, or product follow-up labels; product sessions only report them and the dedicated central Operator owns remediation.
+- Harness incidents route deterministically to ECC, Engineering Environment Kit, or product follow-up labels; product sessions only report them, and remediation starts only from an interactive session in the target repository.
 - Default MCP connector set reduced to a single connector (`chrome-devtools`) per the new connector policy (`docs/MCP-CONNECTOR-POLICY.md`). The six previous defaults (`github`, `context7`, `exa`, `memory`, `playwright`, `sequential-thinking`) were retired after the June 2026 audit: their jobs are covered by skills wrapping CLIs/REST APIs (`github-ops`, `documentation-lookup`, `exa-search`, e2e skills) or by harness-native features (memory, extended thinking, web search). All six remain opt-in via `mcp-configs/mcp-servers.json`.
 
 ### Fixed

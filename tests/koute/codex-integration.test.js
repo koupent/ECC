@@ -19,14 +19,11 @@ const {
 const { isTestPath, normalizeReviewResult, requireUsableResult, reviewSnapshot, roleInstructions, runRole, validateResult, workingTreeSignature } = require('../../scripts/codex/run-role');
 const {
   acquireLock,
+  centralIssuePayload,
   classifyTarget,
   eligible,
   publicIncident
 } = require('../../scripts/codex/incident-worker');
-const {
-  assertCentralRemediationAllowed,
-  readOperatorAttestation
-} = require('../../scripts/codex/incident-ownership');
 const { record } = require('../../scripts/codex/record-event');
 const contextGate = require('../../scripts/hooks/codex-context-gate');
 const contextBuilder = require('../../scripts/hooks/codex-context-builder');
@@ -193,14 +190,14 @@ test('project config opts into standard Codex integration', () => {
   });
 });
 
-test('operator may load an external central-remediate config without modifying the target clone', () => {
+test('incident handling remains report-only even when external config requests remediation', () => {
   const configFile = path.join(temp, 'operator-config.json');
   fs.writeFileSync(configFile, JSON.stringify({
     version: 1,
     profile: 'standard',
     rulePacks: ['common'],
     incidentHandling: {
-      mode: 'central-remediate',
+      mode: 'unsupported-write-mode',
       repository: 'koupent/engineering-environment-kit'
     },
     codex: { enabled: true }
@@ -208,7 +205,7 @@ test('operator may load an external central-remediate config without modifying t
   const config = loadConfig(repo, { ...env, ECC_PROJECT_CONFIG: configFile });
   assert.strictEqual(config.projectConfigPath, configFile);
   assert.strictEqual(config.projectRoot, repo);
-  assert.strictEqual(config.incidentHandling.mode, 'central-remediate');
+  assert.strictEqual(config.incidentHandling.mode, 'report-only');
 });
 
 test('project config opts into commit-status backed squash merge completion', () => {
@@ -357,6 +354,32 @@ test('follow-up prompts preserve the active delivery and reuse its Context Build
   assert.strictEqual(reran, false);
   assert.match(output.hookSpecificOutput.additionalContext, /cached packet/);
   assert.match(output.hookSpecificOutput.additionalContext, /active Delivery/);
+});
+
+test('a new delivery clears review convergence and follow-up state from the prior delivery', () => {
+  const fixture = createGitFixture('delivery-review-reset-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-review-reset-state') };
+  const input = { session_id: 'delivery-review-reset', cwd: fixture };
+  writeState(input, {
+    delivery: { status: 'merged', request_hash: 'prior' },
+    review_round: 3,
+    review_limit_reached: true,
+    review_followups: [{ fingerprint: 'prior', title: '前回の改善候補' }],
+    review_followup_issue_url: 'https://example.invalid/issues/1'
+  }, fixtureEnv);
+
+  const delivery = initializeDelivery(input, '新しい不具合を修正してください', { cwd: fixture, env: fixtureEnv });
+  const state = readState(input, fixtureEnv);
+  assert.strictEqual(delivery.status, 'pending');
+  assert.strictEqual(state.review_round, 0);
+  assert.strictEqual(state.review_limit_reached, false);
+  assert.deepStrictEqual(state.review_followups, []);
+  assert.strictEqual(state.review_followup_issue_url, null);
 });
 
 test('Context Builder distinguishes unavailable evidence from verified absence and avoids delivery diagnostics', () => {
@@ -883,7 +906,7 @@ test('a clean commit is recorded and further edits wait for an independent revie
     tool_input: { command: 'git commit -m "fix product"' },
     tool_response: { exit_code: 0 }
   }), { cwd: fixture, env: fixtureEnv });
-  assert.match(progress.additionalContext, /independent Codex review/);
+  assert.match(progress.additionalContext, /独立したCodexレビュー/);
   const recorded = readState(input, fixtureEnv);
   assert.strictEqual(recorded.delivery.committed_head, spawnSync('git', ['rev-parse', 'HEAD'], { cwd: fixture, encoding: 'utf8' }).stdout.trim());
 
@@ -1172,15 +1195,14 @@ test('role result validator rejects malformed output', () => {
     }, 'assessment-result.schema.json'),
     /Critical findings must be classified as release-blocker/
   );
-  assert.throws(
+  assert.doesNotThrow(
     () => validateResult({
       status: 'ok',
       review_complete: true,
       summary: 'high follow-up',
       findings: [{ severity: 'high', disposition: 'follow-up' }],
       followups: ['fix later']
-    }, 'assessment-result.schema.json'),
-    /High findings cannot be classified as follow-up/
+    }, 'assessment-result.schema.json')
   );
   assert.throws(
     () => validateResult({
@@ -1243,6 +1265,22 @@ test('review instructions require full-file and workflow-structure inspection', 
   assert.match(instructions, /Read every changed file in full/);
   assert.match(instructions, /ordered procedure/);
   assert.match(instructions, /owner-action/);
+  assert.match(instructions, /HIGH finding may be follow-up/);
+  assert.match(instructions, /Write the summary.*in Japanese/i);
+  assert.match(instructions, /Do not run build, test, package, formatter, or generator commands/i);
+
+  const focused = roleInstructions('review', 'review blocker fix', {
+    focused: true,
+    round: 2,
+    maxRounds: 3,
+    blockers: [{ fingerprint: 'known-blocker', title: '既知のblocker' }]
+  });
+  assert.match(focused, /focused re-review round 2 of 3/i);
+  assert.match(focused, /Do not restart the full delivery review/i);
+  assert.match(focused, /known-blocker/);
+
+  const contextInstructions = roleInstructions('context-builder', 'inspect this delivery');
+  assert.match(contextInstructions, /Do not run build, test, package, formatter, or generator commands/i);
 });
 
 test('clean review snapshots are reused instead of rerunning Codex', () => {
@@ -1331,8 +1369,134 @@ test('run-role persists a contradictory release blocker as blocked', () => {
   assert.strictEqual(state.review_blocking_findings, 1);
 });
 
+test('focused review rounds preserve follow-up findings from earlier rounds', () => {
+  const fixture = createGitFixture('review-followup-accumulation-repo');
+  const fixtureEnv = {
+    ...env,
+    ECC_KOUTE_STATE_DIR: path.join(temp, 'review-followup-accumulation-state'),
+    ECC_CODEX_BINARY: createCodexShim('review-cache', fixture)
+  };
+  const input = { session_id: 'review-followup-accumulation' };
+  writeState(input, {
+    review_followups: [{ fingerprint: 'earlier', severity: 'medium', title: '先の改善候補' }]
+  }, fixtureEnv);
+
+  const result = runRole({
+    role: 'review',
+    request: 'review follow-up accumulation',
+    cwd: fixture,
+    sessionId: input.session_id,
+    env: fixtureEnv
+  });
+  assert.strictEqual(result.ok, true, JSON.stringify(result));
+  assert.deepStrictEqual(
+    readState(input, fixtureEnv).review_followups.map(item => item.fingerprint),
+    ['earlier']
+  );
+});
+
+test('review cycle reuses the same snapshot, focuses blocker fixes, and stops after three rounds', () => {
+  const fixture = createGitFixture('review-convergence-cap-repo');
+  const fixtureEnv = {
+    ...env,
+    ECC_KOUTE_STATE_DIR: path.join(temp, 'review-convergence-cap-state'),
+    ECC_CODEX_BINARY: createCodexShim('contradictory-blocker', fixture)
+  };
+  const sessionId = 'review-convergence-cap';
+  const input = { session_id: sessionId };
+  writeState(input, {
+    delivery: {
+      status: 'ready',
+      issue_number: 88,
+      branch: spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim(),
+      base_branch: 'main'
+    }
+  }, fixtureEnv);
+
+  const first = runRole({ role: 'review', request: 'review convergence', cwd: fixture, sessionId, env: fixtureEnv });
+  assert.strictEqual(first.ok, true, JSON.stringify(first));
+  assert.strictEqual(readState(input, fixtureEnv).delivery.review_cycle.round, 1);
+
+  const cached = runRole({ role: 'review', request: 'review convergence', cwd: fixture, sessionId, env: fixtureEnv });
+  assert.strictEqual(cached.cached, true, JSON.stringify(cached));
+  assert.strictEqual(readState(input, fixtureEnv).delivery.review_cycle.round, 1);
+
+  for (let round = 2; round <= 3; round += 1) {
+    fs.appendFileSync(path.join(fixture, 'src', 'product.ts'), `// blocker fix ${round}\n`, 'utf8');
+    assert.strictEqual(spawnSync('git', ['add', 'src/product.ts'], { cwd: fixture }).status, 0);
+    assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', `blocker fix ${round}`], { cwd: fixture }).status, 0);
+    const rerun = runRole({ role: 'review', request: 'review convergence', cwd: fixture, sessionId, env: fixtureEnv });
+    assert.strictEqual(rerun.ok, true, JSON.stringify(rerun));
+    assert.strictEqual(readState(input, fixtureEnv).delivery.review_cycle.round, round);
+    assert.strictEqual(readState(input, fixtureEnv).delivery.review_cycle.mode, 'focused');
+  }
+
+  fs.appendFileSync(path.join(fixture, 'src', 'product.ts'), '// fourth attempt\n', 'utf8');
+  assert.strictEqual(spawnSync('git', ['add', 'src/product.ts'], { cwd: fixture }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'fourth attempt'], { cwd: fixture }).status, 0);
+  const stopped = runRole({ role: 'review', request: 'review convergence', cwd: fixture, sessionId, env: fixtureEnv });
+  assert.strictEqual(stopped.ok, false);
+  assert.strictEqual(stopped.needsHuman, true);
+  assert.strictEqual(readState(input, fixtureEnv).codex_calls, 3);
+  assert.strictEqual(readState(input, fixtureEnv).review_limit_reached, true);
+});
+
+test('non-blocking review findings are grouped into one Japanese follow-up Issue', () => {
+  const fixture = createGitFixture('review-followup-issue-repo');
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'review-followup-issue-state') };
+  const input = { session_id: 'review-followup-issue' };
+  const state = {
+    review_followups: [
+      { fingerprint: 'docs', severity: 'medium', title: '運用文書を補足する', path: 'docs/runbook.md', recommendation: '例を追加する' },
+      { fingerprint: 'docs', severity: 'medium', title: '重複', recommendation: '重複' }
+    ]
+  };
+  const calls = [];
+  const result = deliveryCompletion.ensureReviewFollowupIssue(
+    (binary, args) => {
+      calls.push([binary, ...args]);
+      if (args[0] === 'issue' && args[1] === 'list') return { ok: true, stdout: '[]', stderr: '' };
+      if (args[0] === 'issue' && args[1] === 'create') return { ok: true, stdout: 'https://example.invalid/issues/90', stderr: '' };
+      throw new Error(`unexpected command: ${binary} ${args.join(' ')}`);
+    },
+    state,
+    input,
+    { issue_number: 89 },
+    { url: 'https://example.invalid/pulls/12' },
+    fixture,
+    fixtureEnv
+  );
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.url, 'https://example.invalid/issues/90');
+  const create = calls.find(call => call[1] === 'issue' && call[2] === 'create');
+  assert.ok(create);
+  assert.match(create.join('\n'), /Issue #89 のレビュー改善候補/);
+  assert.match(create.join('\n'), /運用文書を補足する/);
+  assert.doesNotMatch(create.join('\n'), /重複/);
+  assert.strictEqual(readState(input, fixtureEnv).review_followup_issue_url, result.url);
+});
+
 const repoRoot = path.join(__dirname, '..', '..');
 const readRepoFile = (...segments) => fs.readFileSync(path.join(repoRoot, ...segments), 'utf8');
+
+test('standard delivery keeps one implementation owner and one independent release review', () => {
+  const workflow = readRepoFile('rules', 'common', 'development-workflow.md');
+  const testing = readRepoFile('rules', 'common', 'testing.md');
+  const reviewRule = readRepoFile('rules', 'common', 'code-review.md');
+  const reviewCommand = readRepoFile('commands', 'code-review.md');
+  const rootAgents = readRepoFile('AGENTS.md');
+
+  assert.match(workflow, /same implementation owner carries the task/i);
+  assert.match(workflow, /One independent release review/i);
+  assert.match(workflow, /initial review plus two focused re-reviews/i);
+  assert.doesNotMatch(workflow, /mandatory before any new implementation/i);
+  assert.doesNotMatch(testing, /Minimum Test Coverage:\s*80%/i);
+  assert.doesNotMatch(testing, /MANDATORY workflow/i);
+  assert.match(reviewRule, /Fix only release blockers/i);
+  assert.match(reviewCommand, /must not read the complete diff again/i);
+  assert.match(reviewCommand, /Do not run Codex and a\s+full native review for the same snapshot/i);
+  assert.doesNotMatch(rootAgents, /80%\+ coverage required/i);
+});
 
 test('distributed agent rules defer to runtime capabilities and do not claim automatic spawning', () => {
   const agentsRule = readRepoFile('rules', 'common', 'agents.md');
@@ -1372,6 +1536,37 @@ test('the canonical delegation policy carries the project owner standing authori
   const rulesReadme = readRepoFile('rules', 'README.md');
   assert.match(rulesReadme, /Rule Priority/);
   assert.match(rulesReadme, /standing\s+request/);
+});
+
+test('Claude sub-agents and Codex have one non-overlapping review contract', () => {
+  // 中央Issue #141: Claude reviewerを必須Codex reviewの代替・重複として扱わない。
+  for (const file of [
+    ['rules', 'common', 'agents.md'],
+    ['AGENTS.md'],
+    ['.cursor', 'rules', 'common-agents.md'],
+    ['.opencode', 'instructions', 'INSTRUCTIONS.md'],
+    ['.kiro', 'steering', 'agents.md']
+  ]) {
+    const source = readRepoFile(...file);
+    const label = file.join('/');
+    assert.match(source, /Codex owns the initial Context Builder packet/i, label);
+    assert.match(source, /reviewer-named Claude agents are advisory/i, label);
+    assert.match(source, /(?:not|to) replace or\s+duplicate the (?:mandatory )?Codex review/i, label);
+  }
+
+  for (const file of [
+    ['rules', 'common', 'development-workflow.md'],
+    ['rules', 'common', 'security.md'],
+    ['.cursor', 'rules', 'common-development-workflow.md'],
+    ['.cursor', 'rules', 'common-security.md'],
+    ['.kiro', 'steering', 'development-workflow.md'],
+    ['.kiro', 'steering', 'security.md']
+  ]) {
+    const source = readRepoFile(...file);
+    const label = file.join('/');
+    assert.match(source, /independent Codex/i, label);
+    assert.match(source, /does not replace|do not\s+duplicate/i, label);
+  }
 });
 
 test('rules that name an agent stay conditional on the canonical delegation policy', () => {
@@ -1577,6 +1772,26 @@ test('incident target classification routes Kit, ECC, product, and explicit targ
   assert.strictEqual(classifyTarget({ type: 'unknown', metadata: { target: 'kit' } }), 'kit');
 });
 
+test('central incident Issues use the Japanese report-only template without workflow status labels', () => {
+  const payload = centralIssuePayload({
+    fingerprint: '48be3a24636cd77006fdb4def3bfce03',
+    type: 'codex_role_failure',
+    severity: 'minor',
+    count: 2,
+    project: 'project-fingerprint',
+    message: 'read-only Codex role changed the working tree'
+  });
+  assert.strictEqual(payload.title, '[ECCインシデント][ECC] Codex役割の実行に失敗 (48be3a2463)');
+  assert.deepStrictEqual(payload.labels, ['harness-incident', 'target:ecc', 'severity:minor']);
+  assert.match(payload.body, /^## 概要/m);
+  assert.match(payload.body, /^## 分類/m);
+  assert.match(payload.body, /^## 匿名化済みメッセージ/m);
+  assert.match(payload.body, /^## 対応方針/m);
+  assert.match(payload.body, /製品セッションは報告だけ/);
+  assert.doesNotMatch(payload.body, /Background remediation|Follow-up must use/);
+  assert.ok(!payload.labels.some(label => label.startsWith('status:') || label.startsWith('automation:')));
+});
+
 test('incident worker lock prevents concurrent reporting and releases cleanly', () => {
   const lockEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'incident-lock-state') };
   const release = acquireLock(lockEnv);
@@ -1612,45 +1827,7 @@ test('project quality runners record evidence and incidents in external state', 
   assert.throws(() => record(['incident', 'ai_qa_abort', 'unsafe', 'x'], { cwd: repo, env }), /usage/);
 });
 
-test('central remediation requires a private operator attestation and a permitted target', () => {
-  const operatorState = path.join(temp, 'operator-state');
-  fs.mkdirSync(operatorState, { recursive: true });
-  const attestation = path.join(operatorState, 'attestation.json');
-  fs.writeFileSync(attestation, JSON.stringify({
-    schemaVersion: 1,
-    owner: 'engineering-environment-kit-operator',
-    repositories: ['koupent/engineering-environment-kit', 'koupent/ECC']
-  }), { mode: 0o600 });
-  const operatorEnv = {
-    ...env,
-    ECC_OPERATOR_STATE_ROOT: operatorState,
-    ECC_OPERATOR_ATTESTATION: attestation
-  };
-
-  assert.strictEqual(readOperatorAttestation(operatorEnv).owner, 'engineering-environment-kit-operator');
-  assert.doesNotThrow(() => assertCentralRemediationAllowed({
-    mode: 'central-remediate',
-    targetRepository: 'koupent/ECC',
-    env: operatorEnv
-  }));
-  assert.throws(() => assertCentralRemediationAllowed({
-    mode: 'central-remediate',
-    targetRepository: 'koupent/av-cast-link',
-    env: operatorEnv
-  }), /許可されていません/);
-  assert.throws(() => assertCentralRemediationAllowed({
-    mode: 'central-remediate',
-    targetRepository: 'koupent/ECC',
-    env
-  }), /state root|attestation/);
-  assert.throws(() => assertCentralRemediationAllowed({
-    mode: 'report-only',
-    targetRepository: 'koupent/ECC',
-    env: operatorEnv
-  }), /report-only/);
-});
-
-test('incident ownership Hook rejects product-side remediation and accepts an attested operator', () => {
+test('incident ownership Hook rejects product-side remediation without a background bypass', () => {
   const raw = JSON.stringify({
     tool_name: 'Bash',
     cwd: repo,
@@ -1659,29 +1836,6 @@ test('incident ownership Hook rejects product-side remediation and accepts an at
   const denied = JSON.parse(incidentOwnershipGate.run(raw, { cwd: repo, env }));
   assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny');
 
-  const operatorState = path.join(temp, 'operator-hook-state');
-  fs.mkdirSync(operatorState, { recursive: true });
-  const attestation = path.join(operatorState, 'attestation.json');
-  const configFile = path.join(operatorState, 'config.json');
-  fs.writeFileSync(attestation, JSON.stringify({
-    schemaVersion: 1,
-    owner: 'engineering-environment-kit-operator',
-    repositories: ['koupent/engineering-environment-kit', 'koupent/ECC']
-  }), { mode: 0o600 });
-  fs.writeFileSync(configFile, JSON.stringify({
-    version: 1,
-    profile: 'standard',
-    rulePacks: ['common'],
-    incidentHandling: { mode: 'central-remediate', repository: 'koupent/engineering-environment-kit' }
-  }));
-  const operatorEnv = {
-    ...env,
-    ECC_OPERATOR_STATE_ROOT: operatorState,
-    ECC_PROJECT_CONFIG: configFile,
-    ECC_OPERATOR_ATTESTATION: attestation,
-    ECC_OPERATOR_TARGET_REPOSITORY: 'koupent/ECC'
-  };
-  assert.strictEqual(incidentOwnershipGate.run(raw, { cwd: repo, env: operatorEnv }), raw);
   const productClone = JSON.stringify({
     tool_name: 'Bash',
     cwd: repo,
@@ -1689,7 +1843,6 @@ test('incident ownership Hook rejects product-side remediation and accepts an at
   });
   const cloneDenied = JSON.parse(incidentOwnershipGate.run(productClone, { cwd: repo, env }));
   assert.strictEqual(cloneDenied.hookSpecificOutput.permissionDecision, 'deny');
-  assert.strictEqual(incidentOwnershipGate.run(productClone, { cwd: repo, env: operatorEnv }), productClone);
   assert.ok(PRE_BASH_HOOKS.some(hook => hook.id === 'pre:bash:incident-ownership'));
 });
 

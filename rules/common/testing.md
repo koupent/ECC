@@ -1,21 +1,21 @@
 # Testing Requirements
 
-## Minimum Test Coverage: 80%
+## Risk-Based Test Coverage
 
-Test Types (ALL required):
-1. **Unit Tests** - Individual functions, utilities, components
-2. **Integration Tests** - API endpoints, database operations
-3. **E2E Tests** - Critical user flows (framework chosen per language)
+Choose the smallest test layer that proves the acceptance criteria:
+1. **Unit tests** - Pure logic and bounded utilities
+2. **Integration tests** - Contracts between components, APIs, or persistence
+3. **E2E tests** - Changed critical user flows, not every change
 
 ## Test-Driven Development
 
-MANDATORY workflow:
-1. Write test first (RED)
-2. Run test - it should FAIL
-3. Write minimal implementation (GREEN)
-4. Run test - it should PASS
-5. Refactor (IMPROVE)
-6. Verify coverage (80%+)
+Use RED/GREEN when it provides independent evidence: bug reproduction, public/API contracts, and
+stable acceptance behavior. Do not require a ceremonial RED step for documentation, configuration,
+mechanical refactors, generated files, or behavior already covered by an existing test.
+
+Coverage is a diagnostic signal, not a universal release gate. Preserve any product-specific
+threshold already configured, but do not introduce or chase an 80% target solely because ECC is
+installed. Prefer tests that cover the changed risk over broad low-value line coverage.
 
 ## Troubleshooting Test Failures
 
@@ -23,15 +23,15 @@ MANDATORY workflow:
 > available and higher-priority instructions permit it, and otherwise work through the same steps
 > in the parent context.
 
-1. Use **tdd-guide** agent
+1. Use a **tdd-guide** only when an independent test design materially reduces implementation bias
 2. Check test isolation
 3. Verify mocks are correct
 4. Fix implementation, not tests (unless tests are wrong)
 
 ## Agent Support
 
-- **tdd-guide** - Consider it for new features whenever [agents.md](agents.md) permits delegation;
-  it enforces write-tests-first
+- **tdd-guide** - Optional for bug reproduction and public-contract test design; it is not a
+  mandatory handoff for every feature
 
 ## Test Structure (AAA Pattern)
 

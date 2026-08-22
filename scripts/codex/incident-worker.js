@@ -13,12 +13,27 @@ const LABELS = {
   'harness-incident': { color: 'B60205', description: 'ECC共通ハーネスが自動報告したインシデント' },
   'severity:critical': { color: 'B60205', description: '初回からフォローアップが必要な重大インシデント' },
   'severity:minor': { color: 'FBCA04', description: '反復後にフォローアップへ昇格した軽微インシデント' },
-  'status:queued': { color: '1D76DB', description: 'Claude Code CLIの通常ワークフローで対応待ち' },
-  'status:needs-human': { color: 'D93F0B', description: '自動処理に失敗し人の判断が必要' },
-  'status:draft-pr': { color: '0E8A16', description: '修正Draft PRが作成済み' },
   'target:ecc': { color: '5319E7', description: 'koupent/ECCでの修正候補' },
   'target:kit': { color: '0052CC', description: 'Engineering Environment Kitでの修正候補' },
   'target:product': { color: 'C5DEF5', description: '発生元の製品リポジトリでの確認候補' }
+};
+
+const INCIDENT_TITLES = {
+  codex_role_failure: 'Codex役割の実行に失敗',
+  codex_review_role_schema_invalid: 'Codexレビュー結果の形式が不正',
+  repeated_tool_call: '同一ツール呼び出しが反復',
+  delivery_squash_merge_blocked: 'Deliveryのsquash mergeが停止',
+  delivery_branch_mismatch: 'Deliveryブランチが不一致',
+  delivery_session_incomplete: 'Deliveryが未完了のまま終了',
+  ecc_no_worktree_isolation_for_delivery: 'Deliveryが独立worktreeを使用していない',
+  ecc_merge_policy_gate_matches_command_text: 'Merge Policy Gateが説明文を操作として誤検知',
+  ecc_delivery_prepare_hijacks_branch: 'Delivery準備が作業ブランチを意図せず変更'
+};
+
+const TARGET_TITLES = {
+  ecc: 'ECC',
+  kit: 'Environment Kit',
+  product: '製品'
 };
 
 function exec(command, args, options = {}) {
@@ -139,15 +154,47 @@ function issueNumber(url) {
 function reconcileDuplicates(canonical, matches, config, env) {
   for (const duplicate of matches.filter(issue => issue.number !== canonical.number && issue.state === 'OPEN')) {
     assertSuccess(
-      exec('gh', ['issue', 'close', String(duplicate.number), '--repo', config.centralIncidentRepo, '--comment', `Duplicate of #${canonical.number}; the incident fingerprint is identical.`], { env }),
+      exec('gh', ['issue', 'close', String(duplicate.number), '--repo', config.centralIncidentRepo, '--comment', `同じfingerprintの重複報告です。正本は #${canonical.number} です。`], { env }),
       `close duplicate issue #${duplicate.number}`
     );
   }
 }
 
-function createCentralIssue(event, config, env) {
+function centralIssuePayload(event) {
   const target = classifyTarget(event);
-  const labels = ['harness-incident', `target:${target}`, `severity:${event.severity}`, 'status:queued'];
+  const labels = ['harness-incident', `target:${target}`, `severity:${event.severity}`];
+  const incidentTitle = INCIDENT_TITLES[event.type] || 'ハーネス動作異常を検出';
+  const title = `[ECCインシデント][${TARGET_TITLES[target]}] ${incidentTitle} (${event.fingerprint.slice(0, 10)})`;
+  const body = [
+    '## 概要',
+    '',
+    'プライバシーを保護したローカル計測から、自動的に報告されたハーネスのインシデントです。',
+    '',
+    '## 分類',
+    '',
+    `- fingerprint: \`${event.fingerprint}\``,
+    `- 内部種別: \`${event.type}\``,
+    `- 修正候補: ${TARGET_TITLES[target]} (\`${target}\`)`,
+    `- 重大度: \`${event.severity}\``,
+    `- 発生回数: ${event.count}`,
+    `- 発生元fingerprint: \`${event.project || 'unknown'}\``,
+    '',
+    '## 匿名化済みメッセージ',
+    '',
+    redactText(event.message || ''),
+    '',
+    '## 対応方針',
+    '',
+    '製品セッションは報告だけを行って製品開発へ戻ります。修正方針は対象リポジトリの対話セッションで確認してください。',
+    '',
+    '> 元のprompt、秘密情報、絶対path、製品リポジトリ名は含みません。'
+  ].join('\n');
+  return { target, labels, title, body };
+}
+
+function createCentralIssue(event, config, env) {
+  const payload = centralIssuePayload(event);
+  const { target, labels, title, body } = payload;
   ensureLabels(config.centralIncidentRepo, labels, env);
   const existing = listCentralIssues(event.fingerprint, config, env);
   if (existing[0]) {
@@ -155,24 +202,6 @@ function createCentralIssue(event, config, env) {
     return { ...existing[0], target, created: false };
   }
 
-  const title = `[ECC incident][${target}] ${event.type} (${event.fingerprint.slice(0, 10)})`;
-  const body = [
-    'This incident was promoted automatically from privacy-preserving local telemetry.',
-    '',
-    `- Fingerprint: \`${event.fingerprint}\``,
-    `- Type: \`${event.type}\``,
-    `- Target: \`${target}\``,
-    `- Severity: \`${event.severity}\``,
-    `- Occurrences: ${event.count}`,
-    `- Project fingerprint: \`${event.project || 'unknown'}\``,
-    '',
-    'Sanitized message:',
-    '',
-    redactText(event.message || ''),
-    '',
-    'Follow-up is owned by the dedicated central Operator. Product sessions report only and return to product work.',
-    'No source prompt, secret, absolute path, or product repository name is included.'
-  ].join('\n');
   const args = ['issue', 'create', '--repo', config.centralIncidentRepo, '--title', title, '--body', body];
   for (const label of labels) args.push('--label', label);
   const url = assertSuccess(exec('gh', args, { env }), 'central issue creation');
@@ -224,6 +253,7 @@ if (require.main === module) {
 
 module.exports = {
   acquireLock,
+  centralIssuePayload,
   classifyTarget,
   createCentralIssue,
   eligible,

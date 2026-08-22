@@ -1,6 +1,6 @@
 ---
 name: code-reviewer
-description: Expert code review specialist. Proactively reviews code for quality, security, and maintainability. Use immediately after writing or modifying code. MUST BE USED for all code changes.
+description: Advisory code review specialist for a distinct, explicitly bounded perspective. Do not invoke during the standard Delivery review, which uses the independent Codex reviewer as its single release-review authority.
 tools: Read, Grep, Glob, Bash
 model: sonnet
 ---
