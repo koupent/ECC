@@ -222,22 +222,27 @@ function listProjectSessions(cwd = process.cwd(), env = process.env) {
   return entries;
 }
 
+// worktreeを一度も記録していない `ready` のDeliveryは、worktree払い出し以前に始まった
+// 共有ツリー上の作業である。ここを作業場所として認め続けると、Issueが報告した「全ての
+// 作業が単一ツリーに集中する」状態がそのまま残り、隔離は新しいDeliveryだけの話になる。
+// 移行待ちとして扱い、prepareが同じIssueとbranchを専用worktreeへ移すまでfail-closeさせる
+// （delivery-lifecycle.js の isPreparableDelivery）。
+function needsWorktreeMigration(delivery) {
+  return Boolean(delivery && delivery.status === 'ready' && !delivery.worktree_path);
+}
+
 // 進行中のDeliveryが払い出されたworktreeを持つ場合、branch・HEAD・作業ツリーの
 // 検証はそのworktreeで行う。記録済みのworktreeが消えている、あるいは別リポジトリを
 // 指しているときはnullを返してfail-closeさせる。ここで共有ツリーへ戻すと、隔離したはずの
 // Deliveryを共有ツリーのbranchとHEADで判定し、Issueが指摘した衝突を再現してしまう。
 // 素性の確認は呼ばれるたびにやり直す。一度通ったpathを覚えておくと、その後で中身が別の
 // リポジトリへ差し替えられても、覚えている答えを返し続けてしまう。
-//
-// worktreeを一度も記録していないDeliveryは、worktree払い出し以前に始まった作業である。
-// これは共有ツリーが作業場所のまま従来どおり扱う。ここでfail-closeさせると、進行中の
-// 作業が記録済みのIssueとbranchごと止まり、resetで捨てる以外の道がなくなるためである。
-// 隔離へ移すときは prepare を再実行する（delivery-lifecycle.js の isPreparableDelivery）。
-// 新しく払い出されるDeliveryは必ずworktreeを記録するので、この経路は移行中だけ通る。
+// 移行待ちのDeliveryも同じくnullを返す。まだDeliveryを始めていないSessionだけが、
+// 従来どおりcwdを作業場所として受け取る。
 function deliveryWorkspace(state, cwd = process.cwd()) {
   const fallback = path.resolve(cwd || process.cwd());
   const recorded = state && state.delivery && state.delivery.worktree_path;
-  if (!recorded) return fallback;
+  if (!recorded) return needsWorktreeMigration(state && state.delivery) ? null : fallback;
   const target = path.resolve(recorded);
   try {
     if (!fs.statSync(target).isDirectory()) return null;
@@ -346,6 +351,7 @@ module.exports = {
   listProjectSessions,
   logPath,
   matchesProject,
+  needsWorktreeMigration,
   projectFingerprint,
   readEvents,
   readJson,

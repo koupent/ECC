@@ -49,9 +49,12 @@ Worktree handling is deliberately fail-closed:
   preparation instead of silently dirtying the shared `git status`. Symbolic links
   are resolved on both sides first, so a root that only looks outside the
   repository (a link that points back into it) is rejected too.
-- A delivery that was prepared before worktree isolation existed is still bound to
-  the shared tree: it records an Issue and a branch but no `worktree_path`. Running
-  preparation again moves that same Issue and branch into a worktree without
+- A delivery that was prepared before worktree isolation existed records an Issue and
+  a branch but no `worktree_path`. It is treated as waiting for migration, not as a
+  delivery that may keep using the shared tree: the Delivery Gate, the commit observer,
+  the Completion Gate, the acceptance audit and every Codex role stop until it has a
+  worktree, and only `delivery-lifecycle.js prepare` and `reset.js` stay available.
+  Running preparation again moves that same Issue and branch into a worktree without
   searching GitHub or creating a second Issue. Commit or stash the work first if the
   shared tree still has that branch checked out; committed work follows the branch
   into the new worktree, uncommitted changes stay behind.
@@ -68,8 +71,11 @@ replaced by a directory that belongs to another repository, they stop and ask yo
 restore it or reset the delivery; none of them falls back to the shared working tree. Recovery stays
 reachable while the gate is closed: the exact `delivery-lifecycle.js prepare` and
 `reset.js` commands are always allowed, and when the worktree is on the wrong branch
-a command that provably acts inside it (`git -C "<worktree_path>" switch <branch>`)
-is allowed so the branch can be restored there. While the delivery is
+the branch can be restored there. That recovery is narrow: only a `git switch` or
+`git checkout` whose single argument is the recorded branch
+(`git -C "<worktree_path>" switch <branch>`) and side-effect-free inspection are
+allowed, so editing, deleting or committing on the wrong branch stays rejected inside
+the worktree as well. While the delivery is
 isolated, a command is allowed only when the gate can read out of the command line
 itself that it acts on the worktree (`cd "<worktree_path>" && ...` or
 `git -C "<worktree_path>" ...`); mentioning the path elsewhere in the command line is
@@ -90,7 +96,12 @@ have run in the worktree:
   `git diff --output="<shared tree>/x"` are rejected there too. Arguments only a
   shell expansion could resolve (`$VAR`, `~/…`, an environment prefix such as
   `PATH=…`) and inline code (`node -e`, `node -p`, `python -c`, `perl -e`, …) are
-  rejected because the gate cannot read their target. A command that only reads
+  rejected because the gate cannot read their target. An unquoted glob is read as
+  what it can expand to, not as its literal path: `rm -rf node_modules/*` stays
+  allowed inside the worktree because every match stays under `node_modules`, while
+  `rm -rf ../../*/src` is rejected because the expansion reaches the shared tree. A
+  brace expansion (`{a,b}`) is rejected outright, since it can also produce `..`.
+  A command that only reads
   (`cat`, `grep`, `ls`, …) may still take a shared-tree path as an argument.
   Scripts inside the worktree (`node tests/run-all.js`, `npm test`) run as before;
   what such a script does at runtime is beyond a command-line gate, so treat
@@ -122,6 +133,11 @@ have run in the worktree:
 - A tool call whose hook payload exceeds the 1 MiB limit and is truncated: the gate
   cannot read the call, so it is denied instead of passed through. Reissue it in
   smaller pieces.
+- Anything that writes this shell's variables, aliases or functions (`export`,
+  `set`, `unset`, `source`, a bare `PATH=…` segment, `printf -v PATH …`). The
+  assignment outlives the command that made it, so after it the gate can no longer
+  tell which program a bare command name resolves to; every later command in the same
+  command line that is not provably inside the worktree is rejected.
 - A `cd` that is not chained to the command with `&&`, or that happens inside a
   subshell; `cd <worktree>; git ...` and `cd <worktree> || git ...` both run `git`
   in the shared tree when the `cd` fails.

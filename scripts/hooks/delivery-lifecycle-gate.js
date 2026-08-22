@@ -5,7 +5,14 @@ const { spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { loadConfig } = require('../codex/config');
-const { deliveryWorkspace, readState, recordIncident, resolveSessionId, writeState } = require('../codex/runtime-state');
+const {
+  deliveryWorkspace,
+  needsWorktreeMigration,
+  readState,
+  recordIncident,
+  resolveSessionId,
+  writeState
+} = require('../codex/runtime-state');
 
 // worktreeの外で走らせるとDeliveryのbranchではなく共有ツリーを変更してしまうGit操作。
 // 判定は読み取り側を列挙するfail-closeにする。書き込み側を列挙すると、列挙から漏れた
@@ -107,9 +114,19 @@ const SHELL_READ_SAFE_NEGATION = /^--no-[a-z][a-z0-9-]*$/;
 // 認める。数字はheadやtailの行数指定。`-o/tmp/x` のように値が続く形は文字集合から外れる。
 const SHELL_READ_SAFE_SHORT = /^-[a-np-zA-NP-Z0-9]+$/;
 // 形としては読み取りでも、このcommandのこのoptionだけは書き込みや実行になる。
+// bashの `printf -v PATH …` は外部programを呼ばずにshell変数を書き換えるため、以後の
+// commandが解決する実行ファイルごと差し替えられる。
 const SHELL_UNSAFE_OPTIONS = new Map([
   ['date', new Set(['-s', '--set'])],
-  ['file', new Set(['-C', '--compile'])]
+  ['file', new Set(['-C', '--compile'])],
+  ['printf', new Set(['-v'])]
+]);
+// このshellの変数・別名・関数を書き換えるcommand。実行位置がworktreeの中でも、効果は
+// 同じcommand行の後続segmentに残り、共有ツリーで走るcommandがどのprogramに解決されるかを
+// 変えてしまう（`PATH` の差し替え）。以後は共有ツリーで走る形を通さない。
+const SHELL_STATE_COMMANDS = new Set([
+  '.', 'alias', 'declare', 'export', 'hash', 'let', 'local', 'read', 'readonly', 'set',
+  'shopt', 'source', 'typeset', 'unalias', 'unset'
 ]);
 // operandが出力先や状態変更になるcommand。`uniq <in> <out>` は二つ目にファイルを作る。
 const SHELL_MAX_OPERANDS = new Map([['hostname', 0], ['uniq', 1]]);
@@ -139,6 +156,8 @@ const UNTRACEABLE_EXPANSION = /\$\(|\$\{|`|<\(|>\(/;
 const SEGMENT_SEPARATORS = ';&|\n\r';
 // 二重引用符の中でバックスラッシュが意味を消せる文字。
 const DOUBLE_QUOTE_ESCAPES = new Set(['"', '\\', '$', '`', '\n']);
+// 引用されていなければ、字面とは別の名前へ展開される文字。
+const SHELL_EXPANSION_CHARACTERS = '*?[]{}';
 // 共有ツリーへ書き込みうるtool。MultiEditのように編集ごとにpathを持つ形もあるため、
 // トップレベルのfile_pathだけを見ない。
 const WRITE_TOOLS = new Set(['Edit', 'MultiEdit', 'NotebookEdit', 'Write']);
@@ -425,12 +444,16 @@ function splitRedirectionParts(part) {
   const quoted = (part && part.quoted) || [];
   const items = [];
   let buffer = '';
+  // 語のどの文字が引用されていたかは、後段の展開判定で要る。語を組み立てる間、同じ順で
+  // 引用状態も持ち回る。
+  let bufferQuoted = [];
   let pending = null;
   const flush = () => {
     if (pending) items.push({ operator: pending, target: buffer });
-    else if (buffer) items.push({ word: buffer });
+    else if (buffer) items.push({ word: buffer, quoted: bufferQuoted });
     pending = null;
     buffer = '';
+    bufferQuoted = [];
   };
   for (let index = 0; index < value.length; index += 1) {
     const character = value[index];
@@ -440,15 +463,40 @@ function splitRedirectionParts(part) {
         operator += character;
         index += 1;
       }
-      if (!pending && (/^\d+$/.test(buffer) || buffer === '&')) buffer = '';
+      if (!pending && (/^\d+$/.test(buffer) || buffer === '&')) {
+        buffer = '';
+        bufferQuoted = [];
+      }
       flush();
       pending = operator;
       continue;
     }
     buffer += character;
+    bufferQuoted.push(Boolean(quoted[index]));
   }
   flush();
   return items;
+}
+
+// globが広がる範囲の根。`node_modules/*` なら `node_modules`、`*` だけなら実行directory
+// そのものである。globは `..` へは展開されないので、展開後のpathはこのprefixの下に留まる。
+function globPrefix(value) {
+  const segments = String(value || '').split(/[\\/]/);
+  const index = segments.findIndex(segment => /[*?[\]]/.test(segment));
+  if (index < 0) return String(value || '');
+  return index === 0 ? '.' : segments.slice(0, index).join(path.sep);
+}
+
+// 引用されていないglobとbrace展開を持つ語かどうか。`rm -rf ../*/src` は共有ツリーの
+// srcへ広がるが、引用された `git commit -m "why?"` は語のまま渡る。字面のpathだけで
+// 境界を測ると前者を見落とすので、展開しうる語を別に見分ける。
+function hasUnquotedExpansion(item) {
+  const value = String(item && item.word || '');
+  const quoted = (item && item.quoted) || [];
+  for (let index = 0; index < value.length; index += 1) {
+    if (!quoted[index] && SHELL_EXPANSION_CHARACTERS.includes(value[index])) return true;
+  }
+  return false;
 }
 
 // リダイレクトはcommandの種類に関わらずファイルを作る。`git status > src/x` のように
@@ -456,6 +504,8 @@ function splitRedirectionParts(part) {
 function scanRedirections(parts) {
   const tokens = [];
   const writes = [];
+  // 展開しうる語は、同じ字面の語が引用付きで現れても展開する側に寄せて数える。
+  const expanded = new Set();
   // 書き込み演算子のtargetが次の語にある状態。読み取れないまま終わったら空文字を
   // 書き込み先として残し、呼び出し側でfail-closeさせる。
   let awaiting = false;
@@ -480,17 +530,19 @@ function scanRedirections(parts) {
         continue;
       }
       tokens.push(item.word);
+      if (hasUnquotedExpansion(item)) expanded.add(item.word);
     }
   }
   if (awaiting) writes.push('');
-  return { tokens, writes };
+  return { tokens, writes, expanded };
 }
 
 // 展開が必要なtokenは実際のdirectoryを決められない。追跡不能をnullで表し、
-// worktreeの中だと決めつけない。
+// worktreeの中だと決めつけない。glob（`*` `?` `[…]`）とbrace展開（`{a,b}`）は、字面とは
+// 別の名前へ広がるため、字面で境界を測っても意味がない。
 function resolveDirectory(base, target) {
   const value = String(target || '');
-  if (!value || /[$`~*?]/.test(value)) return null;
+  if (!value || /[$`~*?[\]{}]/.test(value)) return null;
   if (path.isAbsolute(value)) return path.resolve(value);
   return base ? path.resolve(base, value) : null;
 }
@@ -521,7 +573,7 @@ function eccScriptPath(token, base, env) {
     if (!replacement) return '';
     value = replacement + value.slice(variable[0].length);
   }
-  if (/[$`~*?]/.test(value)) return '';
+  if (/[$`~*?[\]{}]/.test(value)) return '';
   if (!path.isAbsolute(value) && !base) return '';
   return realPath(path.isAbsolute(value) ? value : path.resolve(base, value));
 }
@@ -554,10 +606,11 @@ function toolWorkspaceOptions(tokens, base, workspace) {
 // （`cd <worktree> && rm -rf <共有ツリー>/src`、`ln -s <共有ツリー> link`）。実行位置だけで
 // 任意のcommandを通さず、語として現れるpathを実行directoryから解決し、守る根へ届く形を
 // 拒否する。`--name=<path>` のように値を抱えた形も同じに見る。
-// glob（`*` `?`）は一つ以上の名前へ展開されるだけで字面より浅いpathにはならないため、
-// 字面のまま解決して判定できる。先頭の `~` と変数展開は展開結果が決まらないので、
-// worktreeの中だと言い切れず拒否する。
-function confinedOperands(tokens, base, workspace, shared) {
+// 先頭の `~` と変数展開は展開結果が決まらないので、worktreeの中だと言い切れず拒否する。
+// 引用されていないglobは字面のままでは判定できない。`../../*/src` は字面としては守る根の
+// どれも指さないのに、展開されると共有ツリーのsrcへ届く。globが広がる範囲は、glob要素より
+// 前のpath（prefix）の下に限られるので、そのprefixがworktreeの中にあることを求める。
+function confinedOperands(tokens, base, workspace, shared, expanded) {
   for (const token of tokens) {
     const value = String(token || '');
     if (!value) continue;
@@ -566,6 +619,12 @@ function confinedOperands(tokens, base, workspace, shared) {
     for (const candidate of candidates) {
       if (!candidate) continue;
       if (candidate.startsWith('~') || candidate.includes('$')) return false;
+      if (expanded && expanded.has(value)) {
+        // brace展開は `{..,x}` のように上へ抜ける語も作るため、広がる範囲を決められない。
+        if (/[{}]/.test(candidate)) return false;
+        if (!confinedToWorktree(workspace, path.resolve(base, globPrefix(candidate)))) return false;
+        continue;
+      }
       if (escapesWorktree(workspace, shared, path.resolve(base, candidate))) return false;
     }
   }
@@ -678,15 +737,24 @@ function gitInvocation(args, cwd) {
   }
   const subcommand = args[index];
   const rest = args.slice(index + 1);
-  if (!untraceable && isReadOnlyGit(subcommand, rest)) return { write: false, location, args: rest };
+  if (!untraceable && isReadOnlyGit(subcommand, rest)) return { write: false, location, subcommand, args: rest };
   // 設定への書き込みは、worktreeの中で走ってもリポジトリ共通の設定に残り、後から
   // `alias.x=!<command>` や `include.path` として共有ツリーへ届くcommandを呼び出せる。
   // 書き込んだ値が何をするかはこのGateでは読めないので、実行directoryを問わず拒否する。
-  if (GIT_UNCONFINABLE_SUBCOMMANDS.has(subcommand)) return { write: true, location: null, args: rest };
+  if (GIT_UNCONFINABLE_SUBCOMMANDS.has(subcommand)) return { write: true, location: null, subcommand, args: rest };
   // subcommandより前の引数に展開が残っていると、どのツリーを書き換えるか決まらない。
   // subcommand以降はcommit messageなどが入るため、実行directoryの判定には使わない。
-  if (args.slice(0, index + 1).some(arg => /[$`]/.test(arg))) return { write: true, location: null, args: rest };
-  return { write: true, location, args: rest };
+  if (args.slice(0, index + 1).some(arg => /[$`]/.test(arg))) {
+    return { write: true, location: null, subcommand, args: rest };
+  }
+  return { write: true, location, subcommand, args: rest };
+}
+
+// このsegmentが、後続のcommandに残るshellの状態を書き換えるか。
+function mutatesShellState(name, args) {
+  if (SHELL_STATE_COMMANDS.has(name)) return true;
+  // `printf -v VAR …` はprintf自身の出力ではなく、shell変数への代入である。
+  return name === 'printf' && args.some(argument => /^-[A-Za-z]*v/.test(String(argument || '')));
 }
 
 // worktreeを払い出しても、親CLIのcwdは共有ツリーのままである。隔離中は、実行directoryが
@@ -709,10 +777,13 @@ function targetsWorkspace(command, workspace, cwd = process.cwd(), options = {})
   // 次のcommandなのかを決められない。共有ツリーを書き換えないとは言えないので拒否する。
   if (!scanQuoting(command).valid) return false;
   let current = start;
+  // 直前までのsegmentがこのshellの変数や別名を書き換えたか。書き換えた後は、command名が
+  // どの実行ファイルへ解決されるかをcommand文字列から読めない。
+  let shellStateMutated = false;
   for (const { text, separator } of splitCommand(command)) {
     // 展開してからでないと、何がどのdirectoryで走るか決まらない。
     if (UNTRACEABLE_EXPANSION.test(text)) return false;
-    const { tokens, writes } = scanRedirections(tokenizeParts(text));
+    const { tokens, writes, expanded } = scanRedirections(tokenizeParts(text));
     for (const target of writes) {
       const resolved = resolveDirectory(current, target);
       // 書き込み先を読み取れない形と、worktreeの外にある共有ツリーのファイルを拒否する。
@@ -732,7 +803,12 @@ function targetsWorkspace(command, workspace, cwd = process.cwd(), options = {})
     }
     const executable = tokens[0];
     const name = commandName(executable);
-    if (!name) continue;
+    // 語を持たない代入だけのsegment（`PATH=<worktree>` 単独）は、このshellに値を残す。
+    // 何も実行しないのでここでは拒否せず、以後のcommandを共有ツリーで通さない。
+    if (!name) {
+      if (overridesEnvironment) shellStateMutated = true;
+      continue;
+    }
     if (name === 'cd' || name === 'pushd') {
       // subshellの中のcdは呼び出し元のdirectoryを動かさない。
       const target = /[(){}]/.test(text) ? null : resolveDirectory(current, tokens[1]);
@@ -749,12 +825,17 @@ function targetsWorkspace(command, workspace, cwd = process.cwd(), options = {})
     if (COMMAND_WRAPPERS.has(name)) return false;
     const inWorktree = confinedToWorktree(workspace, current);
     if (overridesEnvironment && !inWorktree) return false;
+    // 変数を書き換えた後の共有ツリーは、`git` や `cat` という名前が本当にそのprogramだと
+    // 言えない（`printf -v PATH <worktree>` の後の `git status` はworktreeの同名ファイルを
+    // 起動しうる）。worktreeの中で走ることが読み取れるcommandだけを通す。
+    if (shellStateMutated && !inWorktree) return false;
+    if (mutatesShellState(name, tokens.slice(1))) shellStateMutated = true;
     if (name === 'git' && isBareCommand(executable)) {
       const { write, location, args } = gitInvocation(tokens.slice(1), current);
       if (write && !confinedToWorktree(workspace, location)) return false;
       // worktreeで走るgitでも、引数は外のpathを指せる（`git diff --output=<共有ツリー>/x`）。
       // subcommand以降の引数はgitの実行directoryから解決して境界を検査する。
-      if (write && !confinedOperands(args, location, workspace, shared)) return false;
+      if (write && !confinedOperands(args, location, workspace, shared, expanded)) return false;
       continue;
     }
     // ECC自身のcommandは記録済みDeliveryのworktreeを解決して、そこだけを読み書きする。
@@ -770,12 +851,45 @@ function targetsWorkspace(command, workspace, cwd = process.cwd(), options = {})
       // 副作用がないと引数まで確認できた読み取りは、共有ツリーのファイルを引数に取っても
       // 何も書き換えない。環境変数の前置きがあると、どのprogramが走るか決まらない。
       if (!overridesEnvironment && isBareCommand(executable) && isReadOnlyShellCommand(name, tokens.slice(1))) continue;
-      if (!confinedOperands([...assignments, ...tokens], current, workspace, shared)) return false;
+      if (!confinedOperands([...assignments, ...tokens], current, workspace, shared, expanded)) return false;
       continue;
     }
     // git以外のcommandも共有ツリーのファイルを書き換える。worktreeの中で走ることが
     // 読み取れないなら、引数まで見て副作用がないと言える読み取りcommandだけを通す。
     if (!isBareCommand(executable) || !isReadOnlyShellCommand(name, tokens.slice(1))) return false;
+  }
+  return true;
+}
+
+// 記録済みworktreeが別branchにある間に通してよいcommandか。worktreeの中で走ることだけを
+// 条件にすると、誤ったbranchのまま編集も削除もコミットもできてしまう（`cd <worktree> &&
+// rm -rf src`）。ここでは期待branchへ戻す `git switch`／`git checkout` と、状況を確かめる
+// 読み取りだけを認める。実際にそのcommandがworktreeの中で走るかどうかは、
+// targetsWorkspaceが別に判定する。
+function isBranchRestoreCommand(command, branch, cwd) {
+  const expected = String(branch || '');
+  if (!expected || !scanQuoting(command).valid) return false;
+  for (const text of splitSegments(command)) {
+    if (UNTRACEABLE_EXPANSION.test(text)) return false;
+    const { tokens, writes } = scanRedirections(tokenizeParts(text));
+    // 復旧の途中でファイルを作る必要はない。
+    if (writes.length > 0) return false;
+    // 環境変数の前置きは、どのprogramが走るかを変える。
+    if (tokens.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(String(tokens[0]))) return false;
+    const name = commandName(tokens[0]);
+    if (!name) continue;
+    // 実行directoryの移動そのものは、何も書き換えない。
+    if (name === 'cd' || name === 'pushd' || name === 'popd') continue;
+    if (name === 'git' && isBareCommand(tokens[0])) {
+      const { write, subcommand, args } = gitInvocation(tokens.slice(1), cwd);
+      if (!write) continue;
+      if (subcommand !== 'switch' && subcommand !== 'checkout') return false;
+      // 引数は期待branchちょうどに限る。`-B`、`--detach`、pathspecを許すと、復旧の顔で
+      // 別branchの作成やファイルの巻き戻しが通る。
+      if (args.length !== 1 || args[0] !== expected) return false;
+      continue;
+    }
+    if (!isBareCommand(tokens[0]) || !isReadOnlyShellCommand(name, tokens.slice(1))) return false;
   }
   return true;
 }
@@ -862,6 +976,19 @@ function run(rawInput, options = {}) {
   }
 
   const workspace = deliveryWorkspace(state, cwd);
+  // worktree払い出し以前に `ready` となったDeliveryは、共有作業ツリーの上で進んでいる。
+  // 記録済みのIssueとbranchのままprepareを実行すれば専用worktreeへ移せるので、移行が
+  // 済むまでprepareとreset以外を止める。ここを通すと、Issueが報告した衝突経路が
+  // 移行期のDeliveryにだけ残り続ける。
+  if (!workspace && needsWorktreeMigration(state.delivery)) {
+    if (isLifecycleRecovery) return rawInput;
+    return deny(
+      `[ECC Delivery Gate] Issue #${state.delivery.issue_number} was prepared before deliveries were isolated, so no worktree is bound to it and work would land in the shared working tree. ` +
+        `Run node "${prepareScript}" prepare --session "${sessionId}" to check the recorded branch ${state.delivery.branch} out in its own worktree, then continue there. ` +
+        'Preparation keeps the recorded Issue and branch; if the shared working tree still has that branch checked out, commit or stash that work and switch it to another branch first. ' +
+        `If the recorded Delivery is stale or unrecoverable, explicitly reset it with node "${resetScript}" "${sessionId}".`
+    );
+  }
   if (!workspace) {
     // 隔離済みDeliveryのworktreeが失われた。ここで共有ツリーへ戻すと、他の作業を
     // 抱えたツリーをDeliveryのbranchとして扱ってしまう。復旧かresetまで停止する。
@@ -932,6 +1059,7 @@ function run(rawInput, options = {}) {
     if (
       toolName === 'Bash' &&
       isolated &&
+      isBranchRestoreCommand(command, state.delivery.branch, cwd) &&
       targetsWorkspace(command, workspace, cwd, { shared: shared(), env })
     ) {
       return rawInput;
@@ -939,7 +1067,8 @@ function run(rawInput, options = {}) {
     return deny(
       `[ECC Delivery Gate] Expected issue-linked branch ${state.delivery.branch} in ${workspace}, but its current branch is ${actualBranch || '<none>'}. ` +
         `Restore it with \`git -C "${workspace}" switch ${state.delivery.branch}\` before editing; ` +
-        'this gate never falls back to the shared working tree.'
+        'until that branch is back, this gate only allows that exact switch and side-effect-free inspection inside the worktree, ' +
+        'and it never falls back to the shared working tree.'
     );
   }
 
@@ -991,6 +1120,8 @@ function run(rawInput, options = {}) {
           'Running inside that worktree is not enough on its own: every argument must resolve inside it, ' +
           'so a path that reaches the shared working tree or a sibling worktree (`rm -rf <shared>/src`, `ln -s <shared> link`, ' +
           '`git diff --output=<shared>/file`), an argument only a shell expansion could resolve (`$VAR`, `~/…`), ' +
+          'a glob whose expansion can leave the worktree (`rm -rf ../../*/src`) or any brace expansion (`{a,b}`), ' +
+          'a write to this shell\'s variables that changes how later commands resolve (`export`, `set`, a bare `PATH=…`, `printf -v PATH …`), ' +
           'and inline code (`node -e`, `python -c`) are rejected. ' +
           'In the shared working tree only side-effect-free inspection is allowed (read-only `git` subcommands, `ls`, `cat`, `grep`, …), ' +
           'checked argument by argument, so an option that writes a file or starts another program (`sort -o …`, `rg --pre …`) is rejected, ' +
@@ -1050,6 +1181,7 @@ if (require.main === module) {
 module.exports = {
   branchAt,
   gitValue,
+  isBranchRestoreCommand,
   isExactLifecycleCommand,
   isInside,
   run,

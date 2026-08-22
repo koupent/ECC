@@ -298,10 +298,14 @@ function runRole(options) {
   const projectDir = path.resolve(options.projectDir || options.cwd || process.cwd());
   const explicitCwd = options.projectDir ? '' : String(options.cwd || '');
   const workspace = deliveryWorkspace(deliveryState, projectDir);
-  if (isolated && !workspace) {
+  if (!workspace) {
     throw new Error(
-      'The worktree recorded for the active delivery is missing or belongs to another repository. ' +
-        'Restore that worktree or reset the delivery; Codex roles never fall back to the shared working tree.'
+      isolated
+        ? 'The worktree recorded for the active delivery is missing or belongs to another repository. ' +
+            'Restore that worktree or reset the delivery; Codex roles never fall back to the shared working tree.'
+        : 'The active delivery was prepared before deliveries were isolated, so no worktree is bound to it. ' +
+            'Run the delivery preparation again to check the recorded branch out in its own worktree; ' +
+            'Codex roles never fall back to the shared working tree.'
     );
   }
   // 明示的な --cwd は、記録済みworktreeそのものを指す場合だけ受け付ける。ここでcwdを

@@ -49,13 +49,17 @@ function run(rawInput, options = {}) {
   // コミットを取り逃してレビュー要求が出ないまま進む。
   const workspace = deliveryWorkspace(state, cwd);
   if (!workspace) {
-    // 記録済みworktreeが失われている間は、共有ツリーのHEADをDeliveryのコミットとして
-    // 記録しない。ここで拾うと、別作業のコミットにレビュー証拠が結び付く。
+    // 記録済みworktreeが失われている間と、worktreeへ移していないDeliveryの間は、共有ツリーの
+    // HEADをDeliveryのコミットとして記録しない。ここで拾うと、別作業のコミットに
+    // レビュー証拠が結び付く。
     return {
       additionalContext: [
         '[ECC Delivery Progress]',
-        `The worktree recorded for Issue #${state.delivery.issue_number} (${state.delivery.worktree_path}) is missing or belongs to another repository.`,
-        'The shared working tree is never read as delivery evidence. Restore that worktree or reset the delivery before continuing.'
+        state.delivery.worktree_path
+          ? `The worktree recorded for Issue #${state.delivery.issue_number} (${state.delivery.worktree_path}) is missing or belongs to another repository.`
+          : `Issue #${state.delivery.issue_number} has no delivery worktree bound to it yet, so this commit is not read as delivery evidence.`,
+        'The shared working tree is never read as delivery evidence. ' +
+          'Run `/ecc:delivery-prepare` to move the recorded Issue and branch into their own worktree, or restore the recorded worktree, before continuing.'
       ].join('\n')
     };
   }

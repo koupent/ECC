@@ -137,8 +137,11 @@ function run(rawInput, options = {}) {
   const workspace = deliveryWorkspace(state, cwd);
   if (!workspace) {
     return block(
-      `Issue #${delivery.issue_number} is bound to the delivery worktree ${delivery.worktree_path}, but that path is no longer a working tree of this repository. ` +
-        'Restore it with `git worktree add` or reset the delivery; completion is never verified against the shared working tree.'
+      delivery.worktree_path
+        ? `Issue #${delivery.issue_number} is bound to the delivery worktree ${delivery.worktree_path}, but that path is no longer a working tree of this repository. ` +
+            'Restore it with `git worktree add` or reset the delivery; completion is never verified against the shared working tree.'
+        : `Issue #${delivery.issue_number} was prepared before deliveries were isolated, so no worktree is bound to it. ` +
+            'Run `/ecc:delivery-prepare` to check the recorded branch out in its own worktree and continue there; completion is never verified against the shared working tree.'
     );
   }
 

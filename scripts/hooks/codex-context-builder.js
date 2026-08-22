@@ -4,7 +4,7 @@
 const { loadConfig } = require('../codex/config');
 const { explicitIssueNumber, initializeDelivery, isActiveDelivery, runCommand } = require('../codex/delivery-lifecycle');
 const { runRole } = require('../codex/run-role');
-const { hash, readState, resolveSessionId } = require('../codex/runtime-state');
+const { hash, needsWorktreeMigration, readState, resolveSessionId } = require('../codex/runtime-state');
 
 const MAX_STDIN = 1024 * 1024;
 const MAX_ISSUE_BODY = 64 * 1024;
@@ -15,9 +15,12 @@ function shouldSkip(prompt) {
 }
 
 // awaiting-branchは、worktree払い出し以前のstateにIssueとbranchだけが記録された状態である。
-// prepareの案内を外すと、worktreeを持たないまま止まる。
+// prepareの案内を外すと、worktreeを持たないまま止まる。worktreeを記録していない `ready` も
+// 同じで、共有作業ツリーの上で始まったDeliveryをprepareで専用worktreeへ移す必要がある。
 function needsPreparation(delivery) {
-  return Boolean(delivery && ['deferred', 'pending', 'awaiting-branch'].includes(delivery.status));
+  if (!delivery) return false;
+  if (['deferred', 'pending', 'awaiting-branch'].includes(delivery.status)) return true;
+  return needsWorktreeMigration(delivery);
 }
 
 function isPlanMode(input) {
@@ -107,16 +110,23 @@ function run(rawInput, options = {}) {
     runCommand: options.runCommand
   });
   const roleRunner = options.runRole || runRole;
-  const output = roleRunner({
-    role: 'context-builder',
-    request: roleRequest,
-    requestHash: delivery ? delivery.request_hash : hash(prompt, 32),
-    // Hookが知っているのはSessionのproject directoryだけで、作業場所の指定ではない。
-    // 隔離済みDeliveryのContext Builderは、ここではなく記録済みworktreeで走る。
-    projectDir: cwd,
-    sessionId: input.session_id,
-    env: options.env || process.env
-  });
+  let output;
+  try {
+    output = roleRunner({
+      role: 'context-builder',
+      request: roleRequest,
+      requestHash: delivery ? delivery.request_hash : hash(prompt, 32),
+      // Hookが知っているのはSessionのproject directoryだけで、作業場所の指定ではない。
+      // 隔離済みDeliveryのContext Builderは、ここではなく記録済みworktreeで走る。
+      projectDir: cwd,
+      sessionId: input.session_id,
+      env: options.env || process.env
+    });
+  } catch (error) {
+    // 作業場所を決められないDeliveryではroleが起動しない。ここでHookごと落とすと、
+    // 理由も次の手順も届かないまま入力が失われる。理由を添えて先へ進める。
+    output = { ok: false, error: String(error && error.message || error) };
+  }
   const additionalContext = output.ok
     ? [
         '[ECC Codex Context Builder]',
@@ -128,6 +138,7 @@ function run(rawInput, options = {}) {
     : [
         '[ECC Codex Context Builder fallback]',
         `Codex was unavailable or invalid: ${output.error}`,
+        needsPreparation(delivery) ? prepareInstruction : '',
         'Continue with ECC native Claude investigation. This fallback has been recorded as an incident.'
       ].join('\n');
 

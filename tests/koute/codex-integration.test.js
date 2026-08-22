@@ -482,8 +482,26 @@ test('required delivery gate blocks edits until issue and branch evidence are re
 
   const branch = 'codex/issue-42-worktree-lint';
   assert.strictEqual(spawnSync('git', ['switch', '-c', branch], { cwd: fixture }).status, 0);
+  // worktreeを記録していない `ready` は、払い出し以前に共有作業ツリーで始まったDeliveryで
+  // ある。そのまま編集を通すと、Issueが報告した「全ての作業が単一ツリーに集中する」経路が
+  // 移行期のDeliveryにだけ残る。移行が済むまでprepareとreset以外を止める。
   writeState(input, { delivery: { ...delivery, status: 'ready', issue_number: 42, branch } }, fixtureEnv);
-  assert.strictEqual(deliveryGate.run(raw, { cwd: fixture, env: fixtureEnv }), raw);
+  const migrationPending = JSON.parse(deliveryGate.run(raw, { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(migrationPending.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(migrationPending.hookSpecificOutput.permissionDecisionReason, /prepared before deliveries were isolated/);
+  assert.match(migrationPending.hookSpecificOutput.permissionDecisionReason, new RegExp(branch));
+  assert.strictEqual(
+    JSON.parse(deliveryGate.run(bash, { cwd: fixture, env: fixtureEnv })).hookSpecificOutput.permissionDecision,
+    'deny'
+  );
+  // 拒否理由が案内するECC自身のcommandだけは、移行の間も実行できる。
+  for (const command of [
+    `node "${path.join(pluginRoot, 'scripts', 'codex', 'delivery-lifecycle.js')}" prepare --session delivery-gate`,
+    `node "${path.join(pluginRoot, 'scripts', 'codex', 'reset.js')}" delivery-gate`
+  ]) {
+    const recovery = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command } });
+    assert.strictEqual(deliveryGate.run(recovery, { cwd: fixture, env: fixtureEnv }), recovery, command);
+  }
   writeState(input, { delivery: { ...delivery, status: 'draft-pr', issue_number: 42, branch } }, fixtureEnv);
   assert.strictEqual(deliveryGate.run(bash, { cwd: fixture, env: fixtureEnv }), bash);
   assert.strictEqual(deliveryGate.run(raw, { cwd: fixture, env: fixtureEnv }), raw);
@@ -1096,6 +1114,39 @@ test('a delivery still bound to the shared working tree is migrated into a workt
   // 共有ツリーが対象branchをcheckoutしたまま進んでいる状態。
   assert.strictEqual(spawnSync('git', ['switch', '--quiet', '-c', branch], { cwd: fixture }).status, 0);
 
+  // 移行が済むまで、Gateも進捗記録も完了GateもCodexレビューも、共有ツリーを作業場所として
+  // 扱わない。ここで共有ツリーへ落とすと、隔離は新しいDeliveryだけの話になる。
+  assert.strictEqual(deliveryWorkspace(readState(input, fixtureEnv), fixture), null);
+  const sharedEdit = JSON.stringify({
+    ...input,
+    tool_name: 'Edit',
+    tool_input: { file_path: path.join(fixture, 'src', 'product.ts') }
+  });
+  const deniedEdit = JSON.parse(deliveryGate.run(sharedEdit, { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(deniedEdit.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(deniedEdit.hookSpecificOutput.permissionDecisionReason, /prepared before deliveries were isolated/);
+  const sharedCommit = JSON.stringify({
+    ...input,
+    tool_name: 'Bash',
+    tool_input: { command: 'git commit -m "shared tree work"' },
+    tool_response: { exit_code: 0 }
+  });
+  assert.match(
+    deliveryProgress.run(sharedCommit, { cwd: fixture, env: fixtureEnv }).additionalContext,
+    /no delivery worktree bound to it yet/
+  );
+  const blockedCompletion = JSON.parse(deliveryCompletion.run(JSON.stringify(input), {
+    cwd: fixture,
+    env: fixtureEnv,
+    command: () => { throw new Error('completion must not inspect any working tree'); }
+  }));
+  assert.strictEqual(blockedCompletion.decision, 'block');
+  assert.match(blockedCompletion.reason, /prepared before deliveries were isolated/);
+  assert.throws(
+    () => runRole({ role: 'review', request: 'review the delivery', cwd: fixture, sessionId: input.session_id, env: fixtureEnv }),
+    /no worktree is bound to it/
+  );
+
   // このstateは再度prepareできる。共有ツリーがbranchを握っている間はfail-closeする。
   assert.strictEqual(pendingSessionForProject(fixture, fixtureEnv), 'delivery-migration');
   assert.throws(
@@ -1112,6 +1163,18 @@ test('a delivery still bound to the shared working tree is migrated into a workt
   assert.strictEqual(migrated.worktree_created, true);
   assert.strictEqual(deliveryWorkspace(readState(input, fixtureEnv), fixture), migrated.worktree_path);
   assert.strictEqual(spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim(), baseBranch);
+
+  // 移行後は、払い出されたworktreeの中でだけ作業できる。
+  const migratedEdit = JSON.stringify({
+    ...input,
+    tool_name: 'Edit',
+    tool_input: { file_path: path.join(migrated.worktree_path, 'src', 'product.ts') }
+  });
+  assert.strictEqual(deliveryGate.run(migratedEdit, { cwd: fixture, env: fixtureEnv }), migratedEdit);
+  assert.match(
+    JSON.parse(deliveryGate.run(sharedEdit, { cwd: fixture, env: fixtureEnv })).hookSpecificOutput.permissionDecisionReason,
+    /delivery worktree/
+  );
 
   // 隔離済みになったDeliveryは、もうworktreeを作り直さない。
   assert.throws(() => prepareDelivery(input, { cwd: fixture, env: fixtureEnv }), /already prepared/);
@@ -1171,6 +1234,29 @@ test('a worktree on the wrong branch can be restored inside that worktree', () =
     `git -C "${worktreePath}" switch ${branch}`,
     `cd "${worktreePath}" && git switch ${branch}`,
     `node "${path.join(pluginRoot, 'scripts', 'codex', 'reset.js')}" delivery-branch-restore`
+  ]) {
+    assert.strictEqual(deliveryGate.run(bash(command), { cwd: fixture, env: fixtureEnv }), bash(command), command);
+  }
+  // worktreeの中で走ることだけを条件にすると、誤ったbranchのまま編集も削除もコミットも
+  // 通ってしまう。通すのは期待branchへ戻す操作と、状況を確かめる読み取りだけである。
+  for (const command of [
+    `cd "${worktreePath}" && rm -rf src`,
+    `cd "${worktreePath}" && git commit -am "work on the wrong branch"`,
+    `git -C "${worktreePath}" switch codex/issue-79-other`,
+    `git -C "${worktreePath}" switch -c ${branch}-again`,
+    `git -C "${worktreePath}" checkout -- src/product.ts`,
+    `cd "${worktreePath}" && npm test`,
+    `cd "${worktreePath}" && git switch ${branch} && rm -rf src`,
+    `cd "${worktreePath}" && git status --porcelain > status.txt`
+  ]) {
+    const decision = JSON.parse(deliveryGate.run(bash(command), { cwd: fixture, env: fixtureEnv }));
+    assert.strictEqual(decision.hookSpecificOutput.permissionDecision, 'deny', command);
+    assert.match(decision.hookSpecificOutput.permissionDecisionReason, /Expected issue-linked branch/);
+  }
+  // 状況を確かめる読み取りは、復旧の判断材料として通し続ける。
+  for (const command of [
+    `git -C "${worktreePath}" status --porcelain`,
+    `cd "${worktreePath}" && git branch --show-current`
   ]) {
     assert.strictEqual(deliveryGate.run(bash(command), { cwd: fixture, env: fixtureEnv }), bash(command), command);
   }
@@ -1549,7 +1635,14 @@ test('an isolated delivery only allows commands that provably act inside the wor
     `cd "${workspace}" && node tests/run-all.js`,
     `cd "${workspace}" && git diff --output=review.diff`,
     // 共有ツリーを読むだけのcommandは、worktreeの中からでも通す。
-    `cd "${workspace}" && cat "${shared}/src/product.ts"`
+    `cd "${workspace}" && cat "${shared}/src/product.ts"`,
+    // globが広がる範囲がworktreeの中に収まる形は通り続ける。
+    `cd "${workspace}" && rm -rf node_modules/*`,
+    `cd "${workspace}" && rm -rf *.log`,
+    `cd "${workspace}" && git add src/*.ts`,
+    `git -C "${workspace}" add "${workspace}"/src/*.ts`,
+    // 引用された `*` や `?` は展開されない。ただの語として通す。
+    `git -C "${workspace}" commit -m "why? handle a*b"`
   ]) {
     assert.strictEqual(deliveryGate.targetsWorkspace(command, workspace, shared, { env: gateEnv }), true, command);
   }
@@ -1682,6 +1775,21 @@ test('an isolated delivery only allows commands that provably act inside the wor
     // 展開してからでないと、引数が何を指すか決まらない。
     `cd "${workspace}" && rm -rf "$SHARED_TREE"`,
     `cd "${workspace}" && rm -rf ~/repo/src`,
+    // globとbrace展開は、字面ではworktreeの外を指していなくても共有ツリーへ広がる。
+    `cd "${workspace}" && rm -rf ../../*/src`,
+    `cd "${workspace}" && rm -rf ../*/src`,
+    `cd "${workspace}" && rm -rf ../../targets-share?/src`,
+    `cd "${workspace}" && rm -rf ../../targets-shared/[s]rc`,
+    `cd "${workspace}" && rm -rf ../../{targets-shared,other}/src`,
+    `cd "${workspace}" && git checkout -- ../../*/src`,
+    `git -C "${workspace}" add ../../*/src`,
+    // shell変数の書き換えは、以後のcommand名がどの実行ファイルに解決されるかを変える。
+    `printf -v PATH "${workspace}"`,
+    `printf -v PATH "${workspace}"; git status --porcelain`,
+    `printf -vPATH "${workspace}"; cat src/product.ts`,
+    `PATH="${workspace}"; git status --porcelain`,
+    `cd "${workspace}" && printf -v PATH .; cd "${shared}" && git status --porcelain`,
+    `cd "${workspace}" && export PATH="${workspace}"; cd "${shared}" && cat src/product.ts`,
     `cd "${workspace}" && PATH="${shared}/bin" npm test`,
     // 引数のcodeをそのまま実行する形は、worktreeの中で走っていても対象を追えない。
     `cd "${workspace}" && node -e "require('fs').writeFileSync('x', '')"`,
@@ -1898,9 +2006,14 @@ test('delivery completion gate rejects a review that is not bound to the current
   const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-completion-state') };
   const input = { session_id: 'delivery-completion', cwd: fixture };
   const branch = 'codex/issue-7-task';
-  assert.strictEqual(spawnSync('git', ['switch', '-c', branch], { cwd: fixture }).status, 0);
+  // 完了判定は払い出したworktreeで行う。共有ツリーはDeliveryのbranchを握らない。
+  const worktreePath = path.join(temp, 'delivery-completion-worktree');
+  assert.strictEqual(
+    spawnSync('git', ['worktree', 'add', '--quiet', '-b', branch, worktreePath], { cwd: fixture }).status,
+    0
+  );
   writeState(input, {
-    delivery: { status: 'ready', issue_number: 7, branch, base_branch: 'main' },
+    delivery: { status: 'ready', issue_number: 7, branch, base_branch: 'main', worktree_path: worktreePath },
     last_role: 'review',
     review_role: 'review',
     review_status: 'ok',
@@ -1912,7 +2025,7 @@ test('delivery completion gate rejects a review that is not bound to the current
   assert.strictEqual(output.decision, 'block');
   assert.match(output.reason, /current clean commit/);
 
-  const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: worktreePath, encoding: 'utf8' }).stdout.trim();
   writeState(input, {
     review_role: 'review',
     review_status: 'ok',
@@ -1995,12 +2108,16 @@ test('squash completion requires a current Local Merge Gate status and confirms 
   assert.strictEqual(spawnSync('git', ['add', '.ecc/config.json'], { cwd: fixture }).status, 0);
   assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'enable squash completion'], { cwd: fixture }).status, 0);
   const branch = 'codex/issue-73-local-gate';
-  assert.strictEqual(spawnSync('git', ['switch', '-c', branch], { cwd: fixture }).status, 0);
-  const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  const worktreePath = path.join(temp, 'delivery-squash-worktree');
+  assert.strictEqual(
+    spawnSync('git', ['worktree', 'add', '--quiet', '-b', branch, worktreePath], { cwd: fixture }).status,
+    0
+  );
+  const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: worktreePath, encoding: 'utf8' }).stdout.trim();
   const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-squash-state') };
   const input = { session_id: 'delivery-squash', cwd: fixture };
   writeState(input, {
-    delivery: { status: 'ready', issue_number: 73, branch, base_branch: 'main' },
+    delivery: { status: 'ready', issue_number: 73, branch, base_branch: 'main', worktree_path: worktreePath },
     review_role: 'review',
     review_status: 'ok',
     review_complete: true,
@@ -2036,7 +2153,9 @@ test('squash completion requires a current Local Merge Gate status and confirms 
   assert.ok(calls.some(call => call.join(' ') === 'gh pr ready 8'));
   assert.ok(calls.some(call => call.join(' ') === 'gh pr merge 8 --squash'));
 
-  writeState(input, { delivery: { status: 'ready', issue_number: 73, branch, base_branch: 'main' } }, fixtureEnv);
+  writeState(input, {
+    delivery: { status: 'ready', issue_number: 73, branch, base_branch: 'main', worktree_path: worktreePath }
+  }, fixtureEnv);
   const stale = JSON.parse(deliveryCompletion.run(raw, {
     cwd: fixture,
     env: fixtureEnv,
