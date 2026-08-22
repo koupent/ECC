@@ -6,7 +6,7 @@
   "plugins": [
     {
       "name": "ecc",
-      "version": "2.1.0-koute.25",
+      "version": "2.1.0-koute.26",
       "source": {
         "source": "local",
         "path": "./plugins/ecc"
