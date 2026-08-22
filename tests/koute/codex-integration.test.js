@@ -880,7 +880,27 @@ test('local merge policy blocks merge bypasses and direct success status publica
     // in the separate form and in the attached one.
     'curl --url https://api.github.com/repos/acme/example/statuses/abc -d \'{"state":"success"}\'',
     'curl --url=https://api.github.com/repos/acme/example/statuses/abc -d \'{"state":"success"}\'',
-    'curl --url=https://api.github.com/repos/acme/example/statuses/abc -X POST -T status.json'
+    'curl --url=https://api.github.com/repos/acme/example/statuses/abc -X POST -T status.json',
+    // An unquoted expansion is split into words, so a single written operand can
+    // still become the `pr merge` pair gh dispatches on.
+    "ARGS='pr merge'; gh $ARGS 12 --squash",
+    "gh $(printf 'pr merge') 12 --squash",
+    // A shell reads its script from stdin even when operands follow it: `-s`
+    // turns them into positional parameters, and `-` and `/dev/stdin` name
+    // stdin itself.
+    "bash -s marker <<'EOF'\ngh pr merge 12 --squash\nEOF",
+    "bash - marker <<'EOF'\ngh pr merge 12 --squash\nEOF",
+    "bash /dev/stdin <<'EOF'\ngh pr merge 12 --squash\nEOF",
+    // curl's `-O` takes no value of its own, so it cannot swallow the endpoint,
+    // wherever the flags sit around it.
+    'curl -O https://api.github.com/repos/acme/example/statuses/abc -X POST -d \'{"state":"success"}\'',
+    'curl -X POST -O https://api.github.com/repos/acme/example/statuses/abc -d \'{"state":"success"}\'',
+    'curl -X POST https://api.github.com/repos/acme/example/statuses/abc -O -d \'{"state":"success"}\'',
+    // A payload read from a file, hidden behind a JSON escape, or carried in a
+    // urlencoded field list cannot be cleared as non-success.
+    'gh api -X POST repos/acme/example/statuses/abc -F state=@status.txt',
+    'curl -X POST https://api.github.com/repos/acme/example/statuses/abc -d \'{"st\\u0061te":"success"}\'',
+    "curl -X POST https://api.github.com/repos/acme/example/statuses/abc -d 'context=ci&state=success'"
   ];
   for (const command of denied) {
     const decision = JSON.parse(localMergePolicy.run(bash(command), { cwd: fixture, env }));
@@ -930,7 +950,19 @@ test('local merge policy blocks merge bypasses and direct success status publica
     // An endpoint this gate cannot read is not a status post when the field the
     // request writes is readable and is not the commit state.
     'gh api "repos/$REPO/issues/1/comments" -f body="$MSG"',
-    'curl -X POST "$WEBHOOK" -d "text=delivery ready"'
+    'curl -X POST "$WEBHOOK" -d "text=delivery ready"',
+    // Word splitting is only read where gh takes its command group and its
+    // subcommand, so an expansion in a later operand stays an ordinary read.
+    'gh pr view $NUM --json state',
+    // Per-client option arity: curl writes to a remote-named file with `-O` and
+    // wget names its output file, so neither reading hides the endpoint.
+    'curl -O https://example.invalid/artifact.tgz',
+    'wget -O status.json https://api.github.com/repos/acme/example/statuses/abc',
+    // A readable field name that is not the commit state publishes no status,
+    // even next to a value this gate cannot read.
+    'gh api repos/acme/example/statuses/abc -f state=failure -f description="$SUMMARY"',
+    // A shell given a script file runs that file: the heredoc is its input data.
+    "bash scripts/ci/project-verify.sh <<'EOF'\ngh pr merge 12 --squash\nEOF"
   ];
   for (const command of allowedCommands) {
     const allowed = bash(command);

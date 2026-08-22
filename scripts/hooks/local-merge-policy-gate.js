@@ -45,6 +45,14 @@ const SPLIT_STRING_OPTIONS = {
 // as its own command instead of being treated as inert text.
 const SHELL_BINARIES = new Set(['bash', 'busybox', 'dash', 'ksh', 'sh', 'zsh']);
 
+// Shell options that take a value of their own, so the word after them is not
+// the script operand (`bash --rcfile init.sh -s`).
+const SHELL_VALUE_OPTIONS = new Set(['-O', '+O', '--init-file', '--rcfile']);
+
+// Operands that name stdin itself: the script still comes from the heredoc or
+// the here-string, so it is parsed (`bash /dev/stdin <<EOF`).
+const STDIN_OPERANDS = new Set(['-', '/dev/stdin', '/proc/self/fd/0']);
+
 // Interpreters that execute the script file named by their first operand. The
 // role runner is only started from that position: `echo scripts/codex/run-role.js`
 // names the same path and starts nothing (central Issue #75).
@@ -96,6 +104,23 @@ const BODY_OPTIONS = {
   wget: new Set(['--body-data', '--post-data'])
 };
 
+// Body options whose value is taken literally. Everywhere else a leading `@`
+// names a file whose content becomes the payload, so the payload is not in
+// argv: `gh api -F state=@state.txt` reads that file, while `gh api -f
+// state=@state.txt` posts the text `@state.txt` and sets no success state.
+const LITERAL_BODY_OPTIONS = {
+  curl: new Set(['--data-raw']),
+  gh: new Set(['-f', '--raw-field']),
+  wget: new Set(['--body-data', '--post-data'])
+};
+
+// Body options whose value is a urlencoded field list rather than a single
+// field, so `-d 'context=ci&state=success'` is read field by field.
+const FORM_BODY_OPTIONS = {
+  curl: new Set(['-d', '--data', '--data-ascii', '--data-binary', '--data-raw', '--data-urlencode']),
+  wget: new Set(['--body-data', '--post-data'])
+};
+
 // Options whose value is a path: the payload never appears in argv, so a
 // mutation aimed at a commit-status endpoint cannot be cleared and fails closed.
 const FILE_BODY_OPTIONS = {
@@ -113,12 +138,40 @@ const URL_OPTIONS = {
 
 // Options of the HTTP clients whose value is not the request target. They are
 // consumed so a header or an output path is never read as the endpoint, and so
-// the endpoint operand of `curl -H "$AUTH" "$URL"` stays visible.
-const CLIENT_VALUE_OPTIONS = new Set([
-  '-A', '-C', '-D', '-E', '-H', '-K', '-O', '-P', '-U', '-b', '-c', '-e', '-m', '-o', '-u', '-w', '-y', '-z',
-  '--connect-timeout', '--cookie', '--directory-prefix', '--header', '--max-time', '--output',
-  '--output-document', '--referer', '--retry', '--user', '--user-agent', '--write-out'
+// the endpoint operand of `curl -H "$AUTH" "$URL"` stays visible. Arity belongs
+// to one client at a time: curl's `-O` writes to a remote-named file and takes
+// no value while wget's `-O` names the output file, so a shared table let
+// `curl -O <statuses URL>` swallow the endpoint (central Issue #75).
+const HTTPIE_VALUE_OPTIONS = new Set([
+  '-A', '-a', '-o', '-p',
+  '--auth', '--auth-type', '--cert', '--cert-key', '--format-options', '--max-redirects', '--output',
+  '--print', '--proxy', '--session', '--session-read-only', '--style', '--timeout', '--verify'
 ]);
+
+const CLIENT_VALUE_OPTIONS = {
+  curl: new Set([
+    '-A', '-C', '-D', '-E', '-H', '-K', '-P', '-U', '-Y', '-b', '-c', '-e', '-m', '-o', '-u', '-w', '-x', '-y', '-z',
+    '--cacert', '--capath', '--cert', '--connect-timeout', '--cookie', '--cookie-jar', '--dump-header', '--header',
+    '--interface', '--key', '--limit-rate', '--max-filesize', '--max-redirs', '--max-time', '--oauth2-bearer',
+    '--output', '--output-dir', '--proxy', '--proxy-user', '--referer', '--retry', '--user', '--user-agent',
+    '--write-out'
+  ]),
+  wget: new Set([
+    '-A', '-D', '-O', '-P', '-Q', '-R', '-T', '-U', '-e', '-i', '-o', '-t', '-w',
+    '--accept', '--bind-address', '--ca-certificate', '--certificate', '--connect-timeout', '--directory-prefix',
+    '--dns-timeout', '--domains', '--header', '--input-file', '--limit-rate', '--load-cookies', '--max-redirect',
+    '--output-document', '--output-file', '--password', '--private-key', '--proxy-password', '--proxy-user',
+    '--read-timeout', '--referer', '--reject', '--save-cookies', '--timeout', '--tries', '--user', '--user-agent',
+    '--wait'
+  ]),
+  http: HTTPIE_VALUE_OPTIONS,
+  https: HTTPIE_VALUE_OPTIONS
+};
+
+// The clients an unresolved command word could name. Every reading is kept
+// instead of merging the tables, so one client's option arity cannot hide the
+// endpoint another client would send the request to.
+const CLIENT_NAMES = ['curl', 'wget', 'http'];
 
 const NO_OPTIONS = new Set();
 
@@ -128,9 +181,12 @@ function unionOptions(map) {
 }
 
 // An unresolved command word could be any client, so it is measured against
-// every option table at once.
+// every option table at once. `LITERAL_BODY_OPTIONS` stays per client on
+// purpose: an unknown client is read with no literal body option, so an `@file`
+// payload fails closed instead of being read as the text of a file name.
 METHOD_OPTIONS[UNRESOLVED_BINARY] = unionOptions(METHOD_OPTIONS);
 BODY_OPTIONS[UNRESOLVED_BINARY] = unionOptions(BODY_OPTIONS);
+FORM_BODY_OPTIONS[UNRESOLVED_BINARY] = unionOptions(FORM_BODY_OPTIONS);
 FILE_BODY_OPTIONS[UNRESOLVED_BINARY] = unionOptions(FILE_BODY_OPTIONS);
 URL_OPTIONS[UNRESOLVED_BINARY] = unionOptions(URL_OPTIONS);
 
@@ -161,6 +217,16 @@ const SUBSTITUTION = '$()';
 // request body carrying one resolves to unknown text at run time, so both fail
 // closed rather than being read literally (`"$GH" pr merge`, `-f state="$S"`).
 const UNRESOLVED_TEXT = /\$\S|`/;
+// Marker appended to an argument whose value comes from an unquoted expansion or
+// substitution. Bash splits such a value into words at run time, so one written
+// argument can become several: `ARGS='pr merge'; gh $ARGS 12` runs `gh pr merge
+// 12`. The marker keeps a `$`, so a marked argument also stays unresolved text;
+// input that happens to contain the marker is unresolved text as well and can
+// therefore only make the decision stricter.
+const SPLIT_MARK = '$<split>';
+const SPLIT_TOKEN = /\$<split>/;
+// `$@`, `$*` and `${files[@]}` are split into words even inside double quotes.
+const SPLIT_EXPANSION = /\$[@*]|\$\{[^{}]*\[[@*]/;
 const WRAPPER_OPERAND = /^\d+(?:\.\d+)?[smhd]?$/i;
 // The Codex role runner, matched against a command word or the script operand
 // of an interpreter. Text that only mentions the path — a heredoc body, a note,
@@ -172,6 +238,7 @@ const STATUS_ENDPOINT = /(?:\/statuses\/|\/status$)/i;
 // status apart from one that writes another field (`-f body="$MSG"`).
 const REQUEST_FIELD = /^([A-Za-z_][A-Za-z0-9_.-]*)=([\s\S]*)$/;
 const STATE_FIELD_NAME = /^state$/i;
+const SUCCESS_STATE = /^success$/i;
 const SUCCESS_FIELD = /(?:^|=)state=success$/i;
 const SUCCESS_JSON = /["']state["']\s*:\s*["']success["']/i;
 const MUTATING_METHOD = /^(?:post|put|patch)$/i;
@@ -389,7 +456,9 @@ function isBraceGroupClose(source, index) {
  * dropped (`gh pr </dev/null merge 12` still merges), and command
  * substitutions are returned for separate parsing. A command another program
  * runs on behalf of the caller (`env -S`, `find -exec`) is an argument position
- * that still executes, so it joins the returned commands.
+ * that still executes, so it joins the returned commands. An argument whose
+ * value goes through an unquoted expansion carries {@link SPLIT_MARK}, because
+ * Bash turns such a value into several words before the command runs.
  *
  * @param {string} source
  * @returns {{ commands: string[][], nested: string[], unresolved: boolean }}
@@ -405,6 +474,7 @@ function tokenizeScript(source) {
   // Heredoc bodies and here-strings feeding this command's stdin.
   let stdinData = [];
   let tokenExpanded = false;
+  let tokenSplits = false;
   let inputFromUnknown = false;
   let lastDetail = null;
   let token = '';
@@ -417,13 +487,15 @@ function tokenizeScript(source) {
     // A redirection target is a file, not an argument of the command; a
     // here-string is data the command reads.
     if (!redirectTarget) {
-      tokens.push(token);
+      // Word splitting only applies to the arguments the command receives.
+      tokens.push(tokenSplits || SPLIT_EXPANSION.test(token) ? token + SPLIT_MARK : token);
       expanded.push(tokenExpanded);
     } else if (redirectTarget === 'stdin') {
       stdinData.push(token);
     }
     redirectTarget = null;
     tokenExpanded = false;
+    tokenSplits = false;
     token = '';
     started = false;
   };
@@ -451,6 +523,7 @@ function tokenizeScript(source) {
     }
     stdinData = [];
     tokenExpanded = false;
+    tokenSplits = false;
     inputFromUnknown = false;
   };
   // A substitution leaves a placeholder in the token it belongs to, so a
@@ -459,6 +532,7 @@ function tokenizeScript(source) {
     token += SUBSTITUTION;
     started = true;
     tokenExpanded = true;
+    tokenSplits = true;
   };
   // Consumes `>`, `>>`, `<`, `>|`, `<>`, `>&2`, and any `N` file-descriptor
   // prefix already accumulated in the current token.
@@ -468,6 +542,7 @@ function tokenizeScript(source) {
       token = '';
       started = false;
       tokenExpanded = false;
+      tokenSplits = false;
     }
     endToken();
     let next = index + 1;
@@ -543,6 +618,15 @@ function tokenizeScript(source) {
       substitutions.push(span.body);
       noteSubstitution();
       i = span.next;
+      continue;
+    }
+    // An unquoted parameter expansion: Bash splits its value into words before
+    // the command runs, so the argument is marked as one that can become several.
+    if (ch === '$') {
+      token += ch;
+      started = true;
+      tokenSplits = true;
+      i += 1;
       continue;
     }
     // `<<<` is a here-string, not a heredoc: its operand is data on the same line.
@@ -661,6 +745,12 @@ function executedCommands(command) {
 
 function binaryName(token) {
   return String(token).split(/[\\/]/).pop().replace(/\.(?:exe|cmd|bat|ps1)$/i, '').toLowerCase();
+}
+
+// True when an argument is split into words at run time, so one written word can
+// become several (`ARGS='pr merge'; gh $ARGS 12`).
+function splitsIntoWords(word) {
+  return SPLIT_TOKEN.test(String(word || ''));
 }
 
 /**
@@ -854,6 +944,38 @@ function shellScriptFlagIndex(args) {
 }
 
 /**
+ * True when a shell invocation takes its script from stdin instead of from a
+ * script file: it has no operand at all, `-s` turns every operand into a
+ * positional parameter (`bash -s marker <<EOF`), or the first operand names
+ * stdin itself (`bash - <<EOF`, `bash /dev/stdin <<EOF`). Any other first
+ * operand is a script file, which is not read here.
+ *
+ * @param {string[]} args
+ * @returns {boolean}
+ */
+function shellReadsStdin(args) {
+  let optionsEnded = false;
+  for (let index = 0; index < args.length; index += 1) {
+    // The word-splitting marker is not part of the option letters.
+    const argument = args[index].replace(SPLIT_TOKEN, '');
+    if (!optionsEnded && argument === '--') {
+      optionsEnded = true;
+      continue;
+    }
+    if (!optionsEnded && argument.length > 1 && (argument[0] === '-' || argument[0] === '+')) {
+      // `-s` reads the script from stdin, on its own or inside a group (`-es`).
+      if (!argument.startsWith('--') && argument.includes('s')) return true;
+      const separator = argument.indexOf('=');
+      const flag = separator === -1 ? argument : argument.slice(0, separator);
+      if (separator === -1 && SHELL_VALUE_OPTIONS.has(flag)) index += 1;
+      continue;
+    }
+    return STDIN_OPERANDS.has(argument);
+  }
+  return true;
+}
+
+/**
  * Scripts a shell reads from stdin instead of from `-c`: `bash <<'EOF' ... EOF`
  * and `bash <<< "gh pr merge 12"` both execute their data, so it is parsed as a
  * command. When the same shell is fed by a pipe or a file redirection the
@@ -869,7 +991,11 @@ function shellStdinScripts({ tokens, stdin, inputFromUnknown }) {
   for (const execution of resolveExecutions(tokens)) {
     if (!runsShellScripts(execution.name)) continue;
     if (shellScriptFlagIndex(execution.args) !== -1) continue;
-    if (execution.args.some(argument => !argument.startsWith('-'))) continue;
+    // A script operand this gate cannot read could name stdin itself, so data
+    // written into the command is parsed as well. A file or a pipe behind such
+    // an operand stays the caller's own script and is not guessed at.
+    const opaqueOperand = stdin.length > 0 && execution.args.some(argument => UNRESOLVED_TEXT.test(argument));
+    if (!shellReadsStdin(execution.args) && !opaqueOperand) continue;
     if (stdin.length) scripts.push(...stdin);
     else if (inputFromUnknown) unresolved = true;
   }
@@ -931,45 +1057,98 @@ function optionValues(args, flags) {
   return values;
 }
 
-function hasSuccessValue(values) {
-  return values.some(value => SUCCESS_FIELD.test(value) || SUCCESS_JSON.test(value));
-}
-
-// `@file`, `-` and an expanded value read the payload from elsewhere, so its
-// content cannot be cleared here.
-function isOpaqueBody(value) {
-  return value === '' || value === '-' || value.startsWith('@') || UNRESOLVED_TEXT.test(value);
+/**
+ * Request bodies found in argv, each with how its option reads the value:
+ * `literal` when a leading `@` is data rather than a file name, `form` when the
+ * value is a urlencoded field list rather than a single field.
+ *
+ * @param {string} name
+ * @param {string[]} args
+ * @returns {{ value: string, literal: boolean, form: boolean }[]}
+ */
+function requestBodies(name, args) {
+  const all = BODY_OPTIONS[name] || NO_OPTIONS;
+  const literal = LITERAL_BODY_OPTIONS[name] || NO_OPTIONS;
+  const form = FORM_BODY_OPTIONS[name] || NO_OPTIONS;
+  const bodies = [];
+  for (const flag of all) {
+    for (const value of optionValues(args, new Set([flag]))) {
+      bodies.push({ value, literal: literal.has(flag), form: form.has(flag) });
+    }
+  }
+  return bodies;
 }
 
 /**
- * True when the request body sent to a status endpoint cannot be read as a
- * non-success payload: a body file, no body in argv at all, or a value built by
- * an expansion (`-f state="$STATE"` posts `success` when `STATE=success`).
+ * How a JSON request body reads: `success` when it sets the commit state to
+ * success, `unreadable` when it looks like JSON but cannot be decoded, `no`
+ * otherwise. The decision is made on the decoded data, so a field name or a
+ * value written with JSON escapes cannot pass as text that matches nothing
+ * (central Issue #75).
  *
- * @param {string[]} bodies values of the body options found in argv
- * @param {string[]} files values of the file-body options found in argv
- * @returns {boolean}
+ * @param {string} value
+ * @returns {'success'|'unreadable'|'no'}
  */
-function hasUnreadablePayload(bodies, files) {
-  return files.length > 0 || bodies.length === 0 || bodies.some(isOpaqueBody);
+function jsonBodyReading(value) {
+  const text = String(value).trim();
+  if (!text.startsWith('{') && !text.startsWith('[')) return 'no';
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return 'unreadable';
+  }
+  return carriesSuccessState(parsed) ? 'success' : 'no';
+}
+
+function carriesSuccessState(node) {
+  if (Array.isArray(node)) return node.some(carriesSuccessState);
+  if (!node || typeof node !== 'object') return false;
+  return Object.keys(node).some(key => {
+    const value = node[key];
+    if (STATE_FIELD_NAME.test(key) && typeof value === 'string' && SUCCESS_STATE.test(value)) return true;
+    return carriesSuccessState(value);
+  });
+}
+
+// True when a readable value sets the commit state to success.
+function valueCarriesSuccess(value) {
+  return SUCCESS_FIELD.test(value) || SUCCESS_JSON.test(value) || jsonBodyReading(value) === 'success';
+}
+
+// `@file`, `-` and an expanded value read the payload from elsewhere, so its
+// content cannot be cleared here. An option that takes its value literally
+// sends the text itself, so `@` starts no file read there.
+function isOpaqueBody(value, literal) {
+  if (value === '' || UNRESOLVED_TEXT.test(value)) return true;
+  return !literal && (value === '-' || value.startsWith('@'));
 }
 
 /**
  * True when a request body could still carry `state=success` at run time: the
  * payload is not in argv, its field name is unknown, or the `state` field's own
- * value comes from an expansion. A readable field name that is not `state`
- * cannot publish a commit status, so `-f body="$MSG"` stays allowed.
+ * value comes from an expansion or from a file. A readable field name that is
+ * not `state` cannot publish a commit status, so `-f body="$MSG"` stays allowed.
+ * A urlencoded body is read field by field, so `-d 'context=ci&state=success'`
+ * is not mistaken for a single `context` field.
  *
- * @param {string} value
+ * @param {{ value: string, literal: boolean, form: boolean }} body
  * @returns {boolean}
  */
-function bodyMayCarrySuccess(value) {
+function bodyMayCarrySuccess(body) {
+  const value = String(body.value);
+  const parts = body.form ? value.split('&') : [];
+  const fields = parts.length > 1 && parts.every(part => REQUEST_FIELD.test(part)) ? parts : [value];
+  return fields.some(field => fieldMayCarrySuccess(field, body.literal));
+}
+
+function fieldMayCarrySuccess(value, literal) {
   const field = REQUEST_FIELD.exec(value);
   if (field && !UNRESOLVED_TEXT.test(field[1])) {
     if (!STATE_FIELD_NAME.test(field[1])) return false;
-    return isOpaqueBody(field[2]) || /^success$/i.test(field[2]);
+    return isOpaqueBody(field[2], literal) || SUCCESS_STATE.test(field[2]);
   }
-  return isOpaqueBody(value) || SUCCESS_FIELD.test(value) || SUCCESS_JSON.test(value);
+  return isOpaqueBody(value, literal) || valueCarriesSuccess(value) || jsonBodyReading(value) === 'unreadable';
 }
 
 /**
@@ -1010,21 +1189,23 @@ function ghOperandResolutions(args) {
 
 // The endpoint of a `curl`/`wget`/httpie call is an operand; the known options
 // that take a value of their own are consumed so they are not mistaken for it.
-function clientOperands(name, args) {
-  const valueOptions = new Set([
-    ...CLIENT_VALUE_OPTIONS,
-    ...(METHOD_OPTIONS[name] || NO_OPTIONS),
-    ...(BODY_OPTIONS[name] || NO_OPTIONS),
-    ...(FILE_BODY_OPTIONS[name] || NO_OPTIONS),
-    ...(URL_OPTIONS[name] || NO_OPTIONS)
-  ]);
-  return commandOperands(args, valueOptions, false);
+// A command word this gate cannot resolve could name any of the clients, so
+// every client's arity is read separately instead of merged into one table.
+function clientOperandResolutions(name, args) {
+  const clients = name === UNRESOLVED_BINARY ? CLIENT_NAMES : [name];
+  return clients.map(client => commandOperands(args, new Set([
+    ...(CLIENT_VALUE_OPTIONS[client] || NO_OPTIONS),
+    ...(METHOD_OPTIONS[client] || NO_OPTIONS),
+    ...(BODY_OPTIONS[client] || NO_OPTIONS),
+    ...(FILE_BODY_OPTIONS[client] || NO_OPTIONS),
+    ...(URL_OPTIONS[client] || NO_OPTIONS)
+  ]), false));
 }
 
-// Everything a client call can send the request to: the operands plus the value
-// of an explicit URL option, in both the separate and the attached form.
+// Everything a client call can send the request to: the operands of every
+// reading plus the value of an explicit URL option, separate or attached.
 function clientTargets(name, args) {
-  return [...clientOperands(name, args), ...optionValues(args, URL_OPTIONS[name] || NO_OPTIONS)];
+  return [...clientOperandResolutions(name, args), optionValues(args, URL_OPTIONS[name] || NO_OPTIONS)];
 }
 
 /**
@@ -1058,23 +1239,31 @@ function statusEndpointReach(resolutions) {
 
 /**
  * Decide a mutation whose target may be a commit-status endpoint. A readable
- * endpoint keeps the strict reading: any payload that cannot be cleared as
- * non-success is denied. An endpoint this gate cannot read is only treated as a
- * status endpoint when the payload could still carry `state=success`, so
- * ordinary writes such as `gh api "$REPO/issues/1/comments" -f body="$MSG"`
- * stay allowed (central Issue #75).
+ * endpoint keeps the strict reading: the request is denied unless every body in
+ * argv is readable and writes a field other than the commit state. An endpoint
+ * this gate cannot read is treated the same way once a payload could still
+ * carry `state=success`, so ordinary writes such as `gh api
+ * "$REPO/issues/1/comments" -f body="$MSG"` stay allowed (central Issue #75).
  */
 function publishesToStatusEndpoint(reach, bodies, files) {
-  if (reach === 'definite') return hasSuccessValue(bodies) || hasUnreadablePayload(bodies, files);
-  return files.length > 0 || bodies.some(bodyMayCarrySuccess);
+  // A body read from a file never appears in argv, so it cannot be cleared.
+  if (files.length > 0) return true;
+  if (reach === 'definite' && bodies.length === 0) return true;
+  return bodies.some(bodyMayCarrySuccess);
 }
 
 function mergesPullRequest(tokens) {
   return resolveExecutions(tokens).some(execution => {
     if (execution.name !== 'gh' && execution.name !== UNRESOLVED_BINARY) return false;
-    return ghOperandResolutions(execution.args).some(operands => operands.some((operand, index) => (
-      index + 1 < operands.length && operandMatches(operand, 'pr') && operandMatches(operands[index + 1], 'merge')
-    )));
+    return ghOperandResolutions(execution.args).some(operands => (
+      // `gh` reads its command group and subcommand from the first operands, and
+      // an unquoted expansion there is split into words at run time: `ARGS='pr
+      // merge'; gh $ARGS 12` runs the merge with a single written operand, so
+      // that reading fails closed.
+      splitsIntoWords(operands[0]) || operands.some((operand, index) => (
+        index + 1 < operands.length && operandMatches(operand, 'pr') && operandMatches(operands[index + 1], 'merge')
+      ))
+    ));
   });
 }
 
@@ -1083,7 +1272,7 @@ function ghPublishesSuccessStatus(args) {
   if (!resolutions.some(operands => operands.length > 0 && operandMatches(operands[0], 'api'))) return false;
   const reach = statusEndpointReach(resolutions);
   if (reach === 'no') return false;
-  const bodies = optionValues(args, BODY_OPTIONS.gh);
+  const bodies = requestBodies('gh', args);
   const files = optionValues(args, FILE_BODY_OPTIONS.gh);
   const methods = optionValues(args, METHOD_OPTIONS.gh);
   // `gh api` only sends a request body for field/input flags or an explicit
@@ -1093,9 +1282,9 @@ function ghPublishesSuccessStatus(args) {
 }
 
 function clientPublishesSuccessStatus(name, args) {
-  const reach = statusEndpointReach([clientTargets(name, args)]);
+  const reach = statusEndpointReach(clientTargets(name, args));
   if (reach === 'no') return false;
-  const bodies = optionValues(args, BODY_OPTIONS[name] || NO_OPTIONS);
+  const bodies = requestBodies(name, args);
   const files = optionValues(args, FILE_BODY_OPTIONS[name] || NO_OPTIONS);
   const methods = optionValues(args, METHOD_OPTIONS[name] || NO_OPTIONS);
   // httpie takes the method and `key=value` items as operands.
@@ -1105,9 +1294,11 @@ function clientPublishesSuccessStatus(name, args) {
     || methods.some(method => MUTATING_METHOD.test(method))
     || operands.some(operand => MUTATING_METHOD.test(operand));
   if (!mutating) return false;
-  if (hasSuccessValue(operands)) return true;
+  if (operands.some(valueCarriesSuccess)) return true;
   // An httpie item can also be the field that sets the state.
-  const items = reach === 'definite' ? [] : operands.filter(operand => REQUEST_FIELD.test(operand));
+  const items = reach === 'definite'
+    ? []
+    : operands.filter(operand => REQUEST_FIELD.test(operand)).map(value => ({ value, literal: false, form: false }));
   return publishesToStatusEndpoint(reach, bodies, files) || items.some(bodyMayCarrySuccess);
 }
 
