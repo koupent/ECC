@@ -29,7 +29,9 @@ another commit.
 Worktree handling is deliberately fail-closed:
 
 - An existing linked worktree for the branch is reused, never deleted or
-  overwritten.
+  overwritten. It is still checked against the same boundary: a registered
+  worktree that resolves inside the shared working tree stops preparation instead
+  of being adopted.
 - When the shared working tree itself has the branch checked out, preparation
   stops instead of adopting that tree: a delivery always runs in a worktree of
   its own. Switch the shared tree to another branch yourself (its uncommitted
@@ -44,7 +46,9 @@ Worktree handling is deliberately fail-closed:
   tree. Set `deliveryWorktreeRoot` in `.ecc/config.json` or
   `ECC_DELIVERY_WORKTREE_ROOT` to place it elsewhere. A relative value is resolved
   against the shared working tree, and a root that lands inside that tree stops
-  preparation instead of silently dirtying the shared `git status`.
+  preparation instead of silently dirtying the shared `git status`. Symbolic links
+  are resolved on both sides first, so a root that only looks outside the
+  repository (a link that points back into it) is rejected too.
 - A delivery that was prepared before worktree isolation existed is still bound to
   the shared tree: it records an Issue and a branch but no `worktree_path`. Running
   preparation again moves that same Issue and branch into a worktree without
@@ -66,8 +70,12 @@ itself that it acts on the worktree (`cd "<worktree_path>" && ...` or
 `git -C "<worktree_path>" ...`); mentioning the path elsewhere in the command line is
 not enough. `Edit`, `Write`, `MultiEdit` and `NotebookEdit` are checked the same way,
 including every path inside a `MultiEdit` edit list, and a write whose target path the
-gate cannot read is rejected. The gate fails closed, so these forms are rejected even
-when they would have run in the worktree:
+gate cannot read is rejected. The check does not depend on where the session runs: once
+a delivery records a worktree, the shared working tree and every sibling worktree stay
+protected even when the CLI itself already runs inside the delivery worktree, so an
+absolute-path `Edit` of the shared tree or a `git -C "<shared tree>" …` is rejected
+there as well. The gate fails closed, so these forms are rejected even when they would
+have run in the worktree:
 
 - Anything that can create or change a file while the gate cannot prove it runs in
   the worktree: `npm test`, `touch`, `rm`, `mv`, `sed -i`, `node script.js`, …
@@ -95,6 +103,9 @@ when they would have run in the worktree:
 - A `cd` that is not chained to the command with `&&`, or that happens inside a
   subshell; `cd <worktree>; git ...` and `cd <worktree> || git ...` both run `git`
   in the shared tree when the `cd` fails.
+- Quoting the gate cannot parse: an unclosed quote or a trailing backslash. Escapes
+  are read the way the shell reads them, so `echo "a\""; git reset --hard` is two
+  commands and the `git reset --hard` is rejected.
 
 Side-effect-free inspection of the shared tree stays available: read-only `git`
 subcommands (`git status`, `git log`, `git diff`, `git branch --show-current`,

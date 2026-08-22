@@ -119,6 +119,8 @@ const WORKTREE_AWARE_TOOLS = ['acceptance-audit', 'delivery-lifecycle', 'doctor'
 // 展開してからでないと中身が決まらない記法。
 const UNTRACEABLE_EXPANSION = /\$\(|\$\{|`|<\(|>\(/;
 const SEGMENT_SEPARATORS = ';&|\n\r';
+// 二重引用符の中でバックスラッシュが意味を消せる文字。
+const DOUBLE_QUOTE_ESCAPES = new Set(['"', '\\', '$', '`', '\n']);
 // 共有ツリーへ書き込みうるtool。MultiEditのように編集ごとにpathを持つ形もあるため、
 // トップレベルのfile_pathだけを見ない。
 const WRITE_TOOLS = new Set(['Edit', 'MultiEdit', 'NotebookEdit', 'Write']);
@@ -175,25 +177,97 @@ function sharedRoot(cwd, env, fallback) {
   return path.resolve(toplevel || fallback || cwd);
 }
 
-function hasExecutableShellControl(command) {
+// 守るべき境界は、このリポジトリの主作業ツリーと、Delivery以外のlinked worktreeである。
+// cwdの作業ツリーだけを境界にすると、手順書どおりDeliveryのworktreeの中から起動した
+// 瞬間に共有ツリーも兄弟worktreeも境界の外に見え、絶対pathの書き込みや
+// `git -C <共有ツリー>` が検査されないまま通ってしまう。
+function protectedRoots(cwd, env, fallback, workspace) {
+  const roots = gitValue(cwd, env, ['worktree', 'list', '--porcelain'])
+    .split(/\r?\n/)
+    .filter(line => line.startsWith('worktree '))
+    .map(line => path.resolve(line.slice('worktree '.length).trim()));
+  // Gitが一覧を返せない場所でも、少なくとも実行中の作業ツリーの根は守る。
+  if (roots.length === 0) roots.push(sharedRoot(cwd, env, fallback));
+  const workspaceRoots = new Set([path.resolve(workspace), realPath(workspace)]);
+  return roots.filter(root => !workspaceRoots.has(root) && !workspaceRoots.has(realPath(root)));
+}
+
+// bashはバックスラッシュで次の1文字の特別な意味を消す。二重引用符の中でも `"` に効くため、
+// 引用符の開閉だけを追うと `echo "a\""; git reset --hard` の `;` を引用の中と読み違え、
+// 共有ツリーへ届くcommandを安全と判定してしまう。commandの各文字がshellにとってどの状態に
+// あるかを一度に読み出し、以降の解析はこの結果だけを使う。
+//   operative: 引用もエスケープもされておらず、区切りやリダイレクトとして働く
+//   quoted:    引用の中にある文字
+//   escaped:   バックスラッシュで意味を消された文字
+//   syntax:    引用符やバックスラッシュ自身（語には残らない）
+// 引用が閉じない、行末がバックスラッシュで終わるといった読み切れない形はvalid=falseで返し、
+// 呼び出し側でfail-closeさせる。
+function scanQuoting(value) {
+  const text = String(value || '');
+  const kinds = new Array(text.length).fill('operative');
+  const quotes = new Array(text.length).fill(null);
   let quote = null;
-  for (let index = 0; index < command.length; index += 1) {
-    const character = command[index];
+  let valid = true;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index];
+    quotes[index] = quote;
+    if (character === '\\' && quote !== "'") {
+      const next = text[index + 1];
+      // 続きの行が無い行末のバックスラッシュは、次に何が来るのか読み切れない。
+      if (next === undefined) {
+        valid = false;
+        break;
+      }
+      // 二重引用符の中でバックスラッシュが意味を消せる文字は限られており、それ以外の前では
+      // バックスラッシュ自身が文字として残る。
+      if (quote === '"' && !DOUBLE_QUOTE_ESCAPES.has(next)) {
+        kinds[index] = 'quoted';
+        continue;
+      }
+      kinds[index] = 'syntax';
+      kinds[index + 1] = 'escaped';
+      quotes[index + 1] = quote;
+      index += 1;
+      continue;
+    }
     if (quote) {
-      if (character === quote) quote = null;
-      else if (
-        quote === '"' &&
-        (character === '`' || (character === '$' && ['(', '{'].includes(command[index + 1])))
-      ) return true;
+      if (character === quote) {
+        kinds[index] = 'syntax';
+        quote = null;
+      } else {
+        kinds[index] = 'quoted';
+      }
       continue;
     }
     if (character === '"' || character === "'") {
+      kinds[index] = 'syntax';
       quote = character;
-      continue;
     }
-    if ('\r\n;&|<>`(){}^'.includes(character) || (character === '$' && command[index + 1] === '(')) return true;
   }
-  return quote !== null;
+  // 閉じない引用符が残る形は、どこまでが一つのcommandなのかを決められない。
+  if (quote) valid = false;
+  return { kinds, quotes, valid };
+}
+
+function hasExecutableShellControl(command) {
+  const value = String(command || '');
+  const { kinds, quotes, valid } = scanQuoting(value);
+  // 読み切れない形は、制御文字が残っていないと言い切れない。
+  if (!valid) return true;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (
+      kinds[index] === 'operative' &&
+      ('\r\n;&|<>`(){}^'.includes(character) || (character === '$' && value[index + 1] === '('))
+    ) return true;
+    // 二重引用符の中でも、command置換と `${...}` 展開はそのまま動く。
+    if (
+      kinds[index] === 'quoted' &&
+      quotes[index] === '"' &&
+      (character === '`' || (character === '$' && ['(', '{'].includes(value[index + 1])))
+    ) return true;
+  }
+  return false;
 }
 
 function isExactLifecycleCommand(command, action) {
@@ -239,9 +313,13 @@ const WORKTREE_AWARE_TOOL_PATHS = new Set(
 );
 
 // worktreeの中のsymlinkが共有ツリーを指していると、字面のpathだけではworktreeの中に
-// 見える。書き込み先は字面と実体の両方で判定し、どちらかが共有ツリーへ抜けるなら拒否する。
+// 見える。書き込み先は字面と実体の両方で判定し、どちらかが守るべきツリーへ抜けるなら
+// 拒否する。守る側は主作業ツリーだけでなく、兄弟worktreeも含む複数の根になりうる。
 function escapesWorktree(workspace, shared, target) {
-  const sharedRoots = [path.resolve(shared), realPath(shared)];
+  const sharedRoots = [];
+  for (const root of Array.isArray(shared) ? shared : [shared]) {
+    sharedRoots.push(path.resolve(root), realPath(root));
+  }
   const workspaceRoots = [path.resolve(workspace), realPath(workspace)];
   return [path.resolve(target), realPath(target)].some(
     candidate =>
@@ -263,23 +341,14 @@ function confinedToWorktree(workspace, target) {
 // 直前のcommandが成功したかどうかで次のcommandの実行directoryが変わる。
 function splitCommand(command) {
   const value = String(command || '');
+  const { kinds } = scanQuoting(value);
   const segments = [];
   let current = '';
-  let quote = null;
   for (let index = 0; index < value.length; index += 1) {
     const character = value[index];
-    if (quote) {
-      current += character;
-      if (character === quote) quote = null;
-      continue;
-    }
-    if (character === '"' || character === "'") {
-      quote = character;
-      current += character;
-      continue;
-    }
-    if (SEGMENT_SEPARATORS.includes(character)) {
-      const doubled = value[index + 1] === character;
+    // 区切りとして働くのは、引用もエスケープもされていない演算子だけである。
+    if (kinds[index] === 'operative' && SEGMENT_SEPARATORS.includes(character)) {
+      const doubled = value[index + 1] === character && kinds[index + 1] === 'operative';
       segments.push({ text: current, separator: doubled ? character + character : character });
       if (doubled) index += 1;
       current = '';
@@ -298,34 +367,29 @@ function splitSegments(command) {
 // tokenを、文字ごとに引用されていたかどうかと一緒に持ち帰る。`git commit -m ">note"` の
 // `>` はリダイレクトではなく引数であり、両者を取り違えると判定が狂う。
 function tokenizeParts(segment) {
+  const value = String(segment || '');
+  const { kinds } = scanQuoting(value);
   const parts = [];
   let current = null;
-  let quote = null;
   const start = () => {
     if (current === null) current = { value: '', quoted: [] };
   };
-  const append = (character, quoted) => {
-    start();
-    current.value += character;
-    current.quoted.push(quoted);
-  };
-  for (const character of String(segment || '')) {
-    if (quote) {
-      if (character === quote) quote = null;
-      else append(character, true);
-      continue;
-    }
-    if (character === '"' || character === "'") {
-      quote = character;
+  for (let index = 0; index < value.length; index += 1) {
+    const kind = kinds[index];
+    // 引用符とバックスラッシュ自身は語に残らないが、`""` のような空の語は語として数える。
+    if (kind === 'syntax') {
       start();
       continue;
     }
-    if (/\s/.test(character)) {
+    if (kind === 'operative' && /\s/.test(value[index])) {
       if (current !== null) parts.push(current);
       current = null;
       continue;
     }
-    append(character, false);
+    // エスケープされた文字も引用された文字と同じく、演算子ではなく語の一部である。
+    start();
+    current.value += value[index];
+    current.quoted.push(kind !== 'operative');
   }
   if (current !== null) parts.push(current);
   return parts;
@@ -560,9 +624,14 @@ function gitInvocation(args, cwd) {
 function targetsWorkspace(command, workspace, cwd = process.cwd(), options = {}) {
   const env = options.env || process.env;
   const start = path.resolve(cwd || process.cwd());
-  // 共有ツリーの境界はGitの主作業ツリーの根であって、hookに渡されたcwdではない。
+  // 守る境界はGitの主作業ツリーと兄弟worktreeの根であって、hookに渡されたcwdではない。
   // subdirectoryを実行directoryにすると、`../../src/x` が境界の外に見えてしまう。
-  const shared = path.resolve(options.shared || start);
+  const shared = (Array.isArray(options.shared) ? options.shared : [options.shared || start]).map(root =>
+    path.resolve(root)
+  );
+  // 引用が閉じない、行末がバックスラッシュで終わるといった読み切れない形は、どこからが
+  // 次のcommandなのかを決められない。共有ツリーを書き換えないとは言えないので拒否する。
+  if (!scanQuoting(command).valid) return false;
   let current = start;
   for (const { text, separator } of splitCommand(command)) {
     // 展開してからでないと、何がどのdirectoryで走るか決まらない。
@@ -728,13 +797,17 @@ function run(rawInput, options = {}) {
         'This gate never falls back to the shared working tree.'
     );
   }
-  // 共有ツリーの境界はGitの主作業ツリーの根であって、hookに渡されたcwdではない。
+  // 守る境界はGitの主作業ツリーと兄弟worktreeの根であって、hookに渡されたcwdではない。
   // 判定に必要になったときだけ解決し、Deliveryごとに一度で済ませる。
-  let sharedCache = '';
+  let sharedCache = null;
   const shared = () => {
-    if (!sharedCache) sharedCache = sharedRoot(cwd, env, config.projectRoot);
+    if (!sharedCache) sharedCache = protectedRoots(cwd, env, config.projectRoot, workspace);
     return sharedCache;
   };
+  // 隔離が成立しているかは、Deliveryがworktreeを記録しているかで決まる。cwdがworktreeと
+  // 違うかどうかで判定すると、手順書どおりworktreeの中から起動した通常経路で境界検査が
+  // まるごと消え、共有ツリーへの絶対path書き込みも `git -C <共有ツリー>` も素通りする。
+  const isolated = Boolean(state.delivery.worktree_path);
   const actualBranch = branchAt(workspace, env);
   if (!actualBranch || actualBranch !== state.delivery.branch) {
     // Gateがfail-closeしている復旧可能な不一致は、即criticalではない。同じDeliveryで
@@ -765,7 +838,7 @@ function run(rawInput, options = {}) {
     if (isLifecycleRecovery) return rawInput;
     if (
       toolName === 'Bash' &&
-      workspace !== path.resolve(cwd) &&
+      isolated &&
       targetsWorkspace(command, workspace, cwd, { shared: shared(), env })
     ) {
       return rawInput;
@@ -789,13 +862,12 @@ function run(rawInput, options = {}) {
   }
 
   const isEdit = WRITE_TOOLS.has(toolName);
-  const isolated = workspace !== path.resolve(cwd);
   if (isolated) {
     const sharedTree = shared();
     if (isEdit) {
-      // 払い出したworktreeの外へ書くと、隔離したはずの共有ツリーを再び変更してしまう。
-      // 共有ツリー配下だけを拒否し、リポジトリ外のファイルは従来どおり素通しする。
-      // 相対pathはtoolの実行directoryから解決し、境界は共有ツリーの根で判定する。
+      // 払い出したworktreeの外へ書くと、隔離したはずの共有ツリーや兄弟worktreeを再び
+      // 変更してしまう。守る根の配下だけを拒否し、リポジトリ外のファイルは従来どおり
+      // 素通しする。相対pathはtoolの実行directoryから解決する。
       const targets = writeTargets(input.tool_input).map(target => path.resolve(cwd, target));
       if (targets.length === 0) {
         return deny(
@@ -805,9 +877,10 @@ function run(rawInput, options = {}) {
       }
       const outside = targets.find(target => escapesWorktree(workspace, sharedTree, target));
       if (outside) {
-        // symlinkで抜ける経路は、共有ツリーからの相対pathに置き換えられない。その場合は
+        // symlinkで抜ける経路は、守る根からの相対pathに置き換えられない。その場合は
         // 具体的な代替pathを示さず、worktreeの中で書き直させる。
-        const relative = path.relative(sharedTree, outside);
+        const container = sharedTree.find(root => isInside(root, outside));
+        const relative = container ? path.relative(container, outside) : '';
         const inShared = relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
         return deny(
           `[ECC Delivery Gate] Issue #${state.delivery.issue_number} is checked out in the delivery worktree ${workspace}. ` +
@@ -827,7 +900,9 @@ function run(rawInput, options = {}) {
           "and ECC's own worktree-aware commands (`scripts/codex/run-role.js`, …) only when the script is this plugin's own file, " +
           'with no output redirection into that tree. ' +
           'Forms whose working tree cannot be read from the command itself are rejected: wrappers such as `sh -c` or `xargs`, ' +
-          'command substitution and `${...}` expansion, `--git-dir`/`--work-tree`/`GIT_*` overrides, and a `cd` that is not chained with `&&`.'
+          'command substitution and `${...}` expansion, `--git-dir`/`--work-tree`/`GIT_*` overrides, a `cd` that is not chained with `&&`, ' +
+          'and quoting the gate cannot parse (an unclosed quote or a trailing backslash). ' +
+          'The same boundary applies when this session already runs inside the worktree: the shared working tree and every sibling worktree stay protected.'
       );
     }
   }

@@ -865,6 +865,91 @@ test('isolation holds when the session runs from a subdirectory of the shared wo
   }
 });
 
+test('the boundary holds when the session itself already runs inside the delivery worktree', () => {
+  const fixture = createGitFixture('delivery-inside-worktree-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  // worktreeにも同じ設定が渡るよう、payload前にcommitしておく。
+  assert.strictEqual(spawnSync('git', ['add', '.ecc/config.json'], { cwd: fixture }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'require delivery workflow'], { cwd: fixture }).status, 0);
+  const baseBranch = spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  const branch = 'codex/issue-79-inside-worktree';
+  const worktreePath = path.join(temp, 'delivery-inside-worktree-tree');
+  const siblingPath = path.join(temp, 'delivery-inside-worktree-sibling');
+  assert.strictEqual(
+    spawnSync('git', ['worktree', 'add', '--quiet', '-b', branch, worktreePath], { cwd: fixture }).status,
+    0
+  );
+  assert.strictEqual(
+    spawnSync('git', ['worktree', 'add', '--quiet', '-b', 'codex/issue-80-sibling', siblingPath], { cwd: fixture }).status,
+    0
+  );
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-inside-worktree-state') };
+  // 手順書どおり、以後の作業は払い出されたworktreeの中で進む。cwdはworktreeである。
+  const input = { session_id: 'delivery-inside-worktree', cwd: worktreePath };
+  writeState(input, {
+    delivery: {
+      status: 'ready',
+      request_hash: 'inside-worktree-fixture',
+      title: 'the gate must not switch itself off inside the worktree',
+      base_branch: baseBranch,
+      issue_number: 79,
+      issue_url: 'https://example.invalid/issues/79',
+      branch,
+      worktree_path: worktreePath,
+      draft_pr_url: null
+    }
+  }, fixtureEnv);
+
+  const decide = payload => JSON.parse(deliveryGate.run(JSON.stringify(payload), { cwd: worktreePath, env: fixtureEnv }));
+  // cwdとworktreeが一致すると境界検査ごと消える実装では、共有ツリーも兄弟worktreeも
+  // 絶対pathでそのまま書き換えられてしまう。
+  for (const toolCall of [
+    { tool_name: 'Edit', tool_input: { file_path: path.join(fixture, 'src', 'product.ts') } },
+    { tool_name: 'Write', tool_input: { file_path: path.join(siblingPath, 'src', 'product.ts'), content: 'x' } },
+    {
+      tool_name: 'MultiEdit',
+      tool_input: {
+        file_path: path.join(worktreePath, 'src', 'product.ts'),
+        edits: [{ file_path: path.join(fixture, 'src', 'product.ts'), old_string: 'a', new_string: 'b' }]
+      }
+    },
+    { tool_name: 'NotebookEdit', tool_input: { notebook_path: path.join(fixture, 'src', 'analysis.ipynb') } }
+  ]) {
+    const denied = decide({ ...input, ...toolCall });
+    assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny', JSON.stringify(toolCall.tool_input));
+    assert.match(denied.hookSpecificOutput.permissionDecisionReason, /delivery worktree/);
+  }
+
+  for (const command of [
+    `git -C "${fixture}" reset --hard`,
+    `git -C "${siblingPath}" commit -am "fix"`,
+    `echo bypass > "${path.join(fixture, 'src', 'product.ts')}"`,
+    `cd "${fixture}" && touch src/product.ts`,
+    `echo "safe\\""; git -C "${fixture}" reset --hard`
+  ]) {
+    const denied = decide({ ...input, tool_name: 'Bash', tool_input: { command } });
+    assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny', command);
+    assert.match(denied.hookSpecificOutput.permissionDecisionReason, /isolated in the worktree/);
+  }
+
+  // worktreeの中の作業は、cwdがworktreeでもそのまま通り続ける。
+  for (const toolInput of [
+    { file_path: path.join(worktreePath, 'src', 'product.ts') },
+    { file_path: path.join('src', 'product.ts') }
+  ]) {
+    const allowed = JSON.stringify({ ...input, tool_name: 'Edit', tool_input: toolInput });
+    assert.strictEqual(deliveryGate.run(allowed, { cwd: worktreePath, env: fixtureEnv }), allowed, toolInput.file_path);
+  }
+  for (const command of ['git commit -am "fix"', 'npm test', 'git status --porcelain']) {
+    const allowed = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command } });
+    assert.strictEqual(deliveryGate.run(allowed, { cwd: worktreePath, env: fixtureEnv }), allowed, command);
+  }
+});
+
 test('an existing linked worktree is reused, and the shared working tree is never adopted', () => {
   const executed = [];
   const runCommand = (binary, args) => {
@@ -1164,6 +1249,59 @@ test('worktree issuance fails closed on unverified paths and shell-unsafe refs',
   );
   // 境界違反はgitへ渡る前に止まる。中途半端に登録されたworktreeを残さない。
   assert.ok(executed.every(command => !command.includes('worktree add')));
+
+  // 実体を解決しない検査は、リポジトリの外に見えるsymlinkが中を指す払い出し先を通す。
+  const nestedRoot = path.join(main, 'nested-root');
+  fs.mkdirSync(nestedRoot, { recursive: true });
+  const linkedRoot = path.join(temp, 'failclose-linked-root');
+  let linked = true;
+  try {
+    fs.symlinkSync(nestedRoot, linkedRoot, process.platform === 'win32' ? 'junction' : 'dir');
+  } catch {
+    // symlinkを作れない環境ではこの経路自体が存在しない。
+    linked = false;
+  }
+  if (linked) {
+    assert.throws(
+      () => deliveryWorktreePath(main, 'codex/issue-68-linked', { config: { deliveryWorktreeRoot: linkedRoot } }),
+      /inside the shared working tree/
+    );
+    assert.throws(
+      () => ensureDeliveryWorktree({ base_branch: 'main' }, 'codex/issue-68-linked', {
+        cwd: main,
+        config: { deliveryWorktreeRoot: linkedRoot },
+        runCommand
+      }),
+      /inside the shared working tree/
+    );
+  }
+
+  // 登録済みのworktreeも同じ境界で検証する。共有ツリーの配下にあるworktreeを再利用すると、
+  // 隔離したはずの作業が共有ツリーの `git status` に現れる。
+  const nestedWorktree = path.join(main, 'nested-worktree');
+  fs.mkdirSync(nestedWorktree, { recursive: true });
+  const nestedRunCommand = (binary, args) => {
+    executed.push([binary, ...args].join(' '));
+    if (args[0] === 'worktree' && args[1] === 'list') {
+      return [
+        `worktree ${main}`,
+        'branch refs/heads/main',
+        '',
+        `worktree ${nestedWorktree}`,
+        'branch refs/heads/codex/issue-68-nested',
+        ''
+      ].join('\n');
+    }
+    return '';
+  };
+  assert.throws(
+    () => ensureDeliveryWorktree({ base_branch: 'main' }, 'codex/issue-68-nested', {
+      cwd: main,
+      runCommand: nestedRunCommand
+    }),
+    /resolves inside the shared working tree/
+  );
+  assert.ok(executed.every(command => !command.includes('worktree add')));
 });
 
 test('delivery preparation resolves the unique pending project session without relying on Bash environment propagation', () => {
@@ -1305,6 +1443,9 @@ test('an isolated delivery only allows commands that provably act inside the wor
     'diff -u src/product.ts src/renamed.ts',
     'rg --line-number --hidden pattern src',
     'wc -l src/product.ts',
+    // バックスラッシュで意味を消した文字は語の一部であって、演算子ではない。
+    `git -C "${workspace}" commit -m "note \\" quote"`,
+    'grep -rn pattern\\;name src',
     // ECC自身のcommandは記録済みDeliveryのworktreeを解決して動く。
     'node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --session delivery',
     `node "${path.join(pluginRoot, 'scripts', 'codex', 'acceptance-audit.js')}" --issue 79`
@@ -1401,7 +1542,16 @@ test('an isolated delivery only allows commands that provably act inside the wor
     // pathを付けた実行ファイルは、名前が同じでもPATHのcommandとは限らない。
     `"${path.join(workspace, 'sort')}" src/product.ts`,
     './grep pattern src',
-    `"${path.join(workspace, 'git')}" commit -am "fix"`
+    `"${path.join(workspace, 'git')}" commit -am "fix"`,
+    // バックスラッシュは二重引用符の中でも `"` の意味を消す。引用の開閉だけを追うと、
+    // 引用の外にある `;` を引用の中と読み違え、共有ツリーで走るcommandを見落とす。
+    'echo "safe\\""; git reset --hard; echo "x"',
+    'echo "safe\\"" && rm -rf src',
+    "echo 'literal\\' ; git reset --hard",
+    // 読み切れない引用は、どこからが次のcommandなのかを決められない。
+    'git status --porcelain "',
+    "git status --porcelain 'unclosed",
+    'git status --porcelain \\'
   ]) {
     assert.strictEqual(deliveryGate.targetsWorkspace(command, workspace, shared, { env: gateEnv }), false, command);
   }

@@ -266,27 +266,52 @@ function isInsideWorkingTree(root, target) {
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
 }
 
-// 設定値をそのまま信じると、リポジトリの中を指す払い出し先を受け入れてしまう。境界は
-// ここで拒否し、既定値へ黙って戻さない。実体pathでも判定するのは、リポジトリの外に
-// 見えるsymlinkが中を指している場合に字面だけでは通ってしまうためである。
-function assertWorktreeOutsideSharedTree(main, target, configured) {
-  const roots = new Set([main]);
-  try {
-    roots.add(fs.realpathSync(main));
-  } catch {
-    // 主作業ツリーを解決できない環境では字面の判定だけを行う。
+// まだ存在しない払い出し先も判定できるよう、実在する最長の親までrealpathで正規化し、
+// 残りを繋ぎ直す。target側を解決しないと、`/bin` のようにリポジトリの外に見えるsymlinkが
+// 中（`/usr/bin`）を指していても境界検査を通り抜ける。
+function realPath(target) {
+  const absolute = path.resolve(String(target || ''));
+  let current = absolute;
+  const suffix = [];
+  for (let depth = 0; depth < 64; depth += 1) {
+    try {
+      const real = fs.realpathSync(current);
+      return suffix.length > 0 ? path.join(real, ...suffix) : real;
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return absolute;
+      suffix.unshift(path.basename(current));
+      current = parent;
+    }
   }
+  return absolute;
+}
+
+// 共有ツリーの中かどうかは、字面と実体の両方で判定する。どちらか一方だけでは、symlinkを
+// 挟んだpathが境界を越えたことに気付けない。
+function isInsideSharedTree(main, target) {
+  const roots = new Set([path.resolve(main), realPath(main)]);
+  const targets = new Set([path.resolve(target), realPath(target)]);
   for (const root of roots) {
-    if (!isInsideWorkingTree(root, target)) continue;
-    throw new Error(
-      `Delivery worktree ${target} would be created inside the shared working tree ${root}. ` +
-        'A worktree inside the repository dirties the shared `git status` and breaks the clean-HEAD checks this workflow depends on. ' +
-        (configured
-          ? `Point deliveryWorktreeRoot (or ECC_DELIVERY_WORKTREE_ROOT) at a path outside that tree; a relative value such as "${configured}" is resolved against the shared working tree. `
-          : 'Point deliveryWorktreeRoot (or ECC_DELIVERY_WORKTREE_ROOT) at a path outside that tree. ') +
-        'Then run this command again.'
-    );
+    for (const candidate of targets) {
+      if (isInsideWorkingTree(root, candidate)) return true;
+    }
   }
+  return false;
+}
+
+// 設定値をそのまま信じると、リポジトリの中を指す払い出し先を受け入れてしまう。境界は
+// ここで拒否し、既定値へ黙って戻さない。
+function assertWorktreeOutsideSharedTree(main, target, configured) {
+  if (!isInsideSharedTree(main, target)) return;
+  throw new Error(
+    `Delivery worktree ${target} would be created inside the shared working tree ${main}. ` +
+      'A worktree inside the repository dirties the shared `git status` and breaks the clean-HEAD checks this workflow depends on. ' +
+      (configured
+        ? `Point deliveryWorktreeRoot (or ECC_DELIVERY_WORKTREE_ROOT) at a path outside that tree; a relative value such as "${configured}" is resolved against the shared working tree, and symbolic links are resolved before this check. `
+        : 'Point deliveryWorktreeRoot (or ECC_DELIVERY_WORKTREE_ROOT) at a path outside that tree; symbolic links are resolved before this check. ') +
+      'Then run this command again.'
+  );
 }
 
 function deliveryWorktreePath(mainWorktree, branch, options = {}) {
@@ -322,6 +347,16 @@ function ensureDeliveryWorktree(delivery, branch, options = {}) {
           'Delivery work always runs in a worktree of its own, and preparation never adopts the shared working tree. ' +
           `Commit or stash the work that belongs to ${target} first: the new worktree checks out the same branch, so committed work follows it while uncommitted changes stay in the shared tree. ` +
           `Then switch ${existingPath} to another branch yourself and run this command again.`
+      );
+    }
+    // 登録済みのworktreeでも配置は検証する。共有ツリーの配下（symlink経由を含む）に
+    // 登録されたworktreeをそのまま採用すると、隔離したはずの作業が共有ツリーの
+    // `git status` に現れ、cleanなHEADを要求する検証を自分で壊す。
+    if (isInsideSharedTree(main, existingPath)) {
+      throw new Error(
+        `Branch ${target} is registered to worktree ${existingPath}, which resolves inside the shared working tree ${main}. ` +
+          'A worktree inside the repository dirties the shared `git status` and breaks the clean-HEAD checks this workflow depends on. ' +
+          'Move it outside that tree yourself with `git worktree move`, then run this command again.'
       );
     }
     // 既存のlinked worktreeは削除も上書きもせず、そのまま再利用する。
