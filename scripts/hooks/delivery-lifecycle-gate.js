@@ -182,13 +182,16 @@ function run(rawInput, options = {}) {
       state.review_complete === true &&
       state.review_head === head &&
       state.review_worktree_clean === true &&
+      state.review_limit_reached !== true &&
       Number.isInteger(state.review_blocking_findings) &&
       state.review_blocking_findings > 0
     )
   ) {
     return deny(
       '[ECC Delivery Gate] The clean implementation commit is waiting for an independent Codex review. ' +
-      'Run `/ecc:code-review` for the current HEAD before further edits. If the review has no critical/high findings, push and create the Draft PR instead of starting another edit loop.'
+      (state.review_limit_reached === true
+        ? '独立レビューが3回で収束しなかったため、自動修正ループを停止しました。残っているrelease-blockerの方針を人が判断してください。'
+        : '現在のHEADで`/ecc:code-review`を実行してください。release-blockerがなければ、新たな編集ループを始めずpushしてDraft PRを作成してください。')
     );
   }
   return rawInput;

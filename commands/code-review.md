@@ -36,7 +36,7 @@ clean and the current branch is an Issue-linked delivery branch, review the
 complete committed branch diff against its base branch instead. Only stop with
 "Nothing to review" when both diffs are empty.
 
-### Phase 2 — REVIEW
+### Phase 2 — INDEPENDENT REVIEW
 
 Run the fork's fresh-context Codex reviewer first:
 
@@ -48,34 +48,24 @@ the current session state before the delivery can continue.
 node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --request "Review the complete current delivery. Use the diff to identify scope, then read every changed file in full and trace relevant callers, consumers, tests, configuration, and ordered operational procedures for correctness, security, regressions, and release blockers." --session "$CLAUDE_SESSION_ID"
 ```
 
-Use its findings as independent evidence in the ECC review. If Codex reports a
-fallback, continue with the native review. ECC retains control of review count,
-severity policy, and final judgment.
+The Codex result is the independent review evidence for a normal Delivery.
+Claude must not read the complete diff again, invoke a reviewer-named Claude
+sub-agent, or rerun the same broad checklist. Claude only:
 
-Read each changed file in full. Check for:
+1. checks the cited evidence for each `release-blocker`;
+2. fixes accepted `release-blocker` findings;
+3. records `follow-up` findings for later work without fixing them in this
+   delivery; and
+4. proceeds when no `release-blocker` remains.
 
-**Security Issues (CRITICAL):**
-- Hardcoded credentials, API keys, tokens
-- SQL injection vulnerabilities
-- XSS vulnerabilities
-- Missing input validation
-- Insecure dependencies
-- Path traversal risks
+If Codex reports a fallback or an incomplete review, Claude may perform a native
+review once because independent evidence is unavailable. Do not run Codex and a
+full native review for the same snapshot.
 
-**Code Quality (HIGH):**
-- Functions > 50 lines
-- Files > 800 lines
-- Nesting depth > 4 levels
-- Missing error handling
-- console.log statements
-- TODO/FIXME comments
-- Missing JSDoc for public APIs
-
-**Best Practices (MEDIUM):**
-- Mutation patterns (use immutable instead)
-- Emoji usage in code/comments
-- Missing tests for new code
-- Accessibility issues (a11y)
+After a blocker fix, rerun this command only as a focused re-review. ECC limits
+the cycle to the initial review plus two focused re-reviews. A focused re-review
+checks the previous blockers and regressions introduced by their fixes; it does
+not reopen the complete delivery review.
 
 ### Phase 3 — REPORT
 
@@ -86,10 +76,10 @@ Generate report with:
 - Issue description
 - Suggested fix
 
-Block commit only when a `release-blocker` remains. `owner-action` is an explicit
+Block delivery only when a `release-blocker` remains. `owner-action` is an explicit
 non-blocking operator follow-up, and `follow-up` is a non-blocking repository
-improvement. CRITICAL findings must always be `release-blocker`; HIGH findings
-must be `release-blocker` or `owner-action`.
+improvement. CRITICAL findings must always be `release-blocker`; HIGH severity
+alone does not make a finding a release blocker.
 Never approve code with security vulnerabilities.
 
 ---

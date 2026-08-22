@@ -4,6 +4,8 @@
 
 ### Changed
 
+- 標準Deliveryを一人の実装担当と一回のCodex release reviewへ簡素化し、同じ差分に対するClaude側の全面再レビューを廃止しました。現在のマージを止める指摘を取り返しのつかないセキュリティ・データ・受入条件・必須検査・公開契約の欠陥へ限定し、それ以外は一つの後続Issueへ分離します。
+- blocker修正後は対象指摘と修正由来の回帰だけを再検証し、初回を含む最大3 review roundで収束しない場合に限って人の判断へ移します。全タスク一律のTDD、全テスト層、80% coverageは要求せず、変更リスクに比例した最小の検証を選びます。
 - 製品セッションのインシデント処理を`report-only`へ固定し、中央Operator専用の`central-remediate`、attestation、書込Codex roleを撤去しました。Kit／ECCの修正は対象repositoryを直接開いた対話セッションで行います。
 - Claude親セッション、Claudeサブエージェント、Codexの責務を一意にしました。CodexをContext Builderと独立release/security reviewの正本とし、Claude reviewerは異なる観点が必要な場合だけ使う助言役へ限定します。
 - 中央インシデントIssueのタイトルと本文を日本語の固定形式へ統一し、Operator用statusラベルを新規報告へ付けないようにしました。

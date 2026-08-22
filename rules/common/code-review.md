@@ -6,19 +6,17 @@ Code review ensures quality, security, and maintainability before code is merged
 
 ## When to Review
 
-**MANDATORY review triggers:**
+**Release review trigger:**
 
-- After writing or modifying code
-- Before any commit to shared branches
+- Once after the final implementation commit
 - When security-sensitive code is changed (auth, payments, user data)
-- When architectural changes are made
 - Before merging pull requests
 
 **Pre-Review Requirements:**
 
 Before requesting review, ensure:
 
-- All automated checks (CI/CD) are passing
+- Required local checks are passing for the current HEAD
 - Merge conflicts are resolved
 - Branch is up to date with target branch
 
@@ -27,18 +25,14 @@ Before requesting review, ensure:
 Before marking code complete:
 
 - [ ] Code is readable and well-named
-- [ ] Functions are focused (<50 lines)
-- [ ] Files are cohesive (<800 lines)
-- [ ] No deep nesting (>4 levels)
-- [ ] Errors are handled explicitly
 - [ ] No hardcoded secrets or credentials
-- [ ] No console.log or debug statements
-- [ ] Tests exist for new functionality
-- [ ] Test coverage meets 80% minimum
+- [ ] Stated acceptance criteria and core flows are verified
+- [ ] Required checks pass because of the current change
+- [ ] Public contracts and destructive operations have a safe migration or rollback
 
 ## Security Review Triggers
 
-**STOP and use security-reviewer agent when:**
+Use the independent Codex `security-review` role when the change materially affects:
 
 - Authentication or authorization code
 - User input handling
@@ -53,7 +47,7 @@ Before marking code complete:
 | Level | Meaning | Action |
 |-------|---------|--------|
 | CRITICAL | Security vulnerability or data loss risk | **BLOCK** - Must fix before merge |
-| HIGH | Bug or significant quality issue | **WARN** - Should fix before merge |
+| HIGH | Serious issue whose disposition depends on concrete merge risk | **ASSESS** - May block or become follow-up |
 | MEDIUM | Maintainability concern | **INFO** - Consider fixing |
 | LOW | Style or minor suggestion | **NOTE** - Optional |
 
@@ -63,7 +57,8 @@ Before marking code complete:
 > delegation tool is available and higher-priority instructions permit it, and otherwise apply the
 > same review perspectives in the parent context.
 
-Use these agents for code review:
+The standard Delivery has one release-review authority: Codex. These Claude agents are optional
+for a distinct bounded advisory question and must not repeat the full review:
 
 | Agent | Purpose |
 |-------|---------|
@@ -77,12 +72,12 @@ Use these agents for code review:
 ## Review Workflow
 
 ```
-1. Run git diff to understand changes
-2. Check security checklist first
-3. Review code quality checklist
-4. Run relevant tests
-5. Verify coverage >= 80%
-6. Use appropriate agent for detailed review
+1. Run required local verification once on the final candidate
+2. Commit the candidate
+3. Run the independent Codex review once
+4. Fix only release blockers
+5. Re-review blocker fixes only, with at most two focused rounds
+6. Group non-blocking findings into a follow-up Issue
 ```
 
 ## Common Issues to Catch
@@ -114,15 +109,15 @@ Use these agents for code review:
 
 ## Approval Criteria
 
-- **Approve**: No CRITICAL or HIGH issues
-- **Warning**: Only HIGH issues (merge with caution)
-- **Block**: CRITICAL issues found
+- **Approve**: No `release-blocker` remains
+- **Follow-up**: Non-blocking repository improvements or external owner actions remain
+- **Block**: A concrete security, data-loss, acceptance, required-check, or compatibility blocker remains
 
 ## Integration with Other Rules
 
 This rule works with:
 
-- [testing.md](testing.md) - Test coverage requirements
+- [testing.md](testing.md) - Risk-based test requirements
 - [security.md](security.md) - Security checklist
 - [git-workflow.md](git-workflow.md) - Commit standards
 - [agents.md](agents.md) - Agent delegation

@@ -66,17 +66,20 @@ function run(rawInput, options = {}) {
     review_owner_actions: [],
     review_result: null,
     review_snapshot: null,
-    review_request_hash: null
+    review_request_hash: null,
+    review_limit_reached: state.delivery.review_cycle && state.delivery.review_cycle.limit_reached === true
   }, env);
 
   return {
     additionalContext: [
       '[ECC Delivery Progress]',
       `Current clean commit ${head} is recorded.`,
-      'Run the independent Codex review now. Do not begin another edit cycle before that review.',
+      state.delivery.review_cycle && state.delivery.review_cycle.round > 0
+        ? '前回のrelease-blocker修正だけをCodexで限定再レビューしてください。全面レビューをやり直さないでください。'
+        : '独立したCodexレビューを1回実行してください。レビュー前に別の編集サイクルを始めないでください。',
       config.deliveryCompletion === 'squash-merge'
-        ? `If the review has no critical/high findings, push this branch, create the linked Draft PR, and run ${config.mergeGate.command}. The Completion Gate will Ready and squash merge it.`
-        : 'If the review has no critical/high findings, push this branch and create the linked Draft PR.'
+        ? `release-blockerがなければbranchをpushし、紐づくDraft PRを作成して${config.mergeGate.command}を実行してください。Completion GateがReady化してsquash mergeします。`
+        : 'release-blockerがなければbranchをpushし、紐づくDraft PRを作成してください。'
     ].join('\n')
   };
 }

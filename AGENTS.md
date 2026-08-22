@@ -2,12 +2,12 @@
 
 This is a **production-ready AI coding plugin** providing 67 specialized agents, 281 skills, 99 commands, and automated hook workflows for software development.
 
-**Version:** 2.1.0-koute.28
+**Version:** 2.1.0-koute.29
 
 ## Core Principles
 
 1. **Agent-Aware** — Delegate only when the runtime and higher-priority instructions permit it
-2. **Test-Driven** — Write tests before implementation, 80%+ coverage required
+2. **Risk-Tested** — Prove changed behavior at the smallest useful test layer
 3. **Security-First** — Never compromise on security; validate all inputs
 4. **Immutability** — Always create new objects, never mutate existing ones
 5. **Plan Before Execute** — Plan complex features before writing code
@@ -19,8 +19,8 @@ This is a **production-ready AI coding plugin** providing 67 specialized agents,
 | planner | Implementation planning | Complex features, refactoring |
 | architect | System design and scalability | Architectural decisions |
 | tdd-guide | Test-driven development | New features, bug fixes |
-| code-reviewer | Code quality and maintainability | After writing/modifying code |
-| security-reviewer | Vulnerability detection | Before commits, sensitive code |
+| code-reviewer | Advisory code quality perspective | Only for a distinct bounded question; not in the standard Delivery review |
+| security-reviewer | Advisory vulnerability perspective | Only for a distinct bounded question; Codex remains the release-review authority |
 | spec-miner | Brownfield spec extraction | Onboarding brownfield projects to spec-driven development |
 | build-error-resolver | Fix build/type errors | When build fails |
 | e2e-runner | End-to-end Playwright testing | Critical user flows |
@@ -64,7 +64,7 @@ Never claim an agent ran without invoking it and collecting its result.
 When delegation is permitted, consider the matching specialist for genuinely bounded work:
 - Complex feature requests → **planner**
 - Independent implementation or specialist work → matching Claude sub-agent
-- Bug fix or new feature → **tdd-guide**
+- Bug reproduction or public-contract test design → consider **tdd-guide**
 - Architectural decision → **architect**
 - Security-sensitive code → **security-reviewer**
 - Brownfield project onboarding → **spec-miner**
@@ -82,19 +82,19 @@ parent can collect every result before ending its turn. Fire-and-forget delegati
 
 ## Security Guidelines
 
-**Before ANY commit:**
+**Before a security-sensitive commit:**
 - No hardcoded secrets (API keys, passwords, tokens)
 - All user inputs validated
 - SQL injection prevention (parameterized queries)
 - XSS prevention (sanitized HTML)
 - CSRF protection enabled
 - Authentication/authorization verified
-- Rate limiting on all endpoints
+- Rate limiting where abuse or resource-exhaustion risk requires it
 - Error messages don't leak sensitive data
 
 **Secret management:** NEVER hardcode secrets. Use environment variables or a secret manager. Validate required secrets at startup. Rotate any exposed secrets immediately.
 
-**If security issue found:** STOP → use security-reviewer agent → fix CRITICAL issues → rotate exposed secrets → review codebase for similar issues.
+**If a security issue is found:** STOP → run the independent Codex security review → fix release blockers → rotate exposed secrets when applicable. Add a Claude security specialist only for a distinct bounded question.
 
 ## Coding Style
 
@@ -114,25 +114,17 @@ parent can collect every result before ending its turn. Fire-and-forget delegati
 
 ## Testing Requirements
 
-**Minimum coverage: 80%**
-
-Test types (all required):
-1. **Unit tests** — Individual functions, utilities, components
-2. **Integration tests** — API endpoints, database operations
-3. **E2E tests** — Critical user flows
-
-**TDD workflow (mandatory):**
-1. Write test first (RED) — test should FAIL
-2. Write minimal implementation (GREEN) — test should PASS
-3. Refactor (IMPROVE) — verify coverage 80%+
+Use the smallest test layer that proves the changed acceptance criteria. Use RED/GREEN for bug
+reproduction and stable public contracts. Preserve product-specific coverage thresholds, but ECC
+does not impose a universal 80% target or require unit, integration, and E2E tests for every task.
 
 Troubleshoot failures: check test isolation → verify mocks → fix implementation (not tests, unless tests are wrong).
 
 ## Development Workflow
 
-1. **Plan** — Use planner agent, identify dependencies and risks, break into phases
-2. **TDD** — Use tdd-guide agent, write tests first, implement, refactor
-3. **Review** — Run the independent Codex review; add a Claude specialist only for a distinct advisory perspective
+1. **Plan proportionally** — Keep routine work in the implementation context; use a planner for genuinely complex or high-risk work
+2. **Implement and verify** — One owner carries implementation through the smallest sufficient tests
+3. **Review once** — Run the independent Codex review; fix release blockers and defer other improvements
 4. **Capture knowledge in the right place**
    - Personal debugging notes, preferences, and temporary context → auto memory
    - Team/project knowledge (architecture decisions, API changes, runbooks) → the project's existing docs structure
@@ -183,7 +175,7 @@ tests/           — Test suite
 
 ## Success Metrics
 
-- All tests pass with 80%+ coverage
+- Required changed-area and product gates pass
 - No security vulnerabilities
 - Code is readable and maintainable
 - Performance is acceptable

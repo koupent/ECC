@@ -137,7 +137,16 @@ function initializeDelivery(input, request, options = {}) {
     branch: null,
     draft_pr_url: null
   };
-  writeState(input, { delivery, project: projectFingerprint(cwd) }, env);
+  // レビュー結果はDelivery単位の証拠である。前のDeliveryの改善候補や
+  // 収束上限を次の要求へ持ち越すと、無関係なIssue作成や誤停止になる。
+  writeState(input, {
+    delivery,
+    project: projectFingerprint(cwd),
+    review_round: 0,
+    review_limit_reached: false,
+    review_followups: [],
+    review_followup_issue_url: null
+  }, env);
   return delivery;
 }
 
