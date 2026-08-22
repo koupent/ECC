@@ -48,8 +48,11 @@ const {
   isDeliveryRequest,
   normalizeIssueTitle,
   parseIssueNumber,
+  parseRepositoryUrl,
   pendingSessionForProject,
   prepareDelivery,
+  referenceMatchesRepository,
+  resolveDeliveryReferences,
   runCommand,
   selectDeliveryBranch,
   slug,
@@ -367,6 +370,11 @@ function createDraftPrFixture(name, sessionId, stateName) {
   );
   assert.strictEqual(spawnSync('git', ['add', '.ecc/config.json'], { cwd: fixture }).status, 0);
   assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'require delivery workflow'], { cwd: fixture }).status, 0);
+  // URL表記のIssue / PR参照は、このremoteのhost・owner・repoと突き合わせて判定される。
+  assert.strictEqual(
+    spawnSync('git', ['remote', 'add', 'origin', 'https://github.com/koupent/ECC.git'], { cwd: fixture }).status,
+    0
+  );
   const baseBranch = spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
   const branch = 'codex/issue-271-task';
   assert.strictEqual(spawnSync('git', ['switch', '-c', branch], { cwd: fixture }).status, 0);
@@ -540,6 +548,9 @@ test('a draft-pr delivery allows only read-only Bash and fails closed when the w
     'git branch --show-current',
     'gh pr view 274',
     'gh api repos/acme/repo/pulls/274',
+    'git cat-file -p HEAD:src/product.ts',
+    'git rev-parse --verify HEAD',
+    'git ls-files --cached',
     'rg -n needle src',
     'grep -rn needle src',
     'cat -n src/product.ts',
@@ -576,6 +587,15 @@ test('a draft-pr delivery allows only read-only Bash and fails closed when the w
     'git --exec-path=/tmp log',
     'git log --ext-diff',
     'git show --textconv HEAD',
+    // read-onlyなsubcommandでも、外部filterやpagerを起動するoptionは通さない。
+    'git cat-file --filters HEAD:src/product.ts',
+    'git cat-file --filters-path=src/product.ts HEAD:src/product.ts',
+    'git cat-file --textconv HEAD:src/product.ts',
+    'git cat-file --batch-command',
+    'git -p log',
+    'git --paginate log',
+    'git diff --ext-diff HEAD',
+    'git blame --textconv src/product.ts',
     'gh pr view 274 --web',
     'tail -f src/product.ts',
     'date -s 2020-01-01'
@@ -592,6 +612,17 @@ test('a draft-pr delivery allows only read-only Bash and fails closed when the w
   assert.strictEqual(deliveryGate.isReadOnlyBashCommand("rg --pre 'touch review-bypass-sentinel' needle src"), false);
   assert.strictEqual(deliveryGate.isReadOnlyBashCommand('rg -n --glob=*.ts needle src'), true);
   assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git blame --textconv src/product.ts'), false);
+  // Gitもsubcommandごとにoptionを許可する。`cat-file --filters` は設定済みfilter processを
+  // 実行できるため、read-onlyなsubcommandでも拒否する。
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git cat-file --filters HEAD:README.md'), false);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git cat-file --filters-path=README.md HEAD:README.md'), false);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git cat-file -p HEAD:README.md'), true);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git cat-file --batch-check'), true);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git --paginate log'), false);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git --no-pager log --oneline -5'), true);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git log --pretty=format:%H'), true);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git diff --stat HEAD~1'), true);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git status --porcelain=v2'), true);
 
   // Stop: 変更が無ければ完了状態のまま停止できる。
   const stop = JSON.stringify(input);
@@ -622,16 +653,17 @@ test('a GitHub URL naming another Issue or PR starts a new delivery while the re
   assert.strictEqual(resumed.branch, same.branch);
   assert.strictEqual(resumed.draft_pr_url, 'https://example.invalid/pull/274');
 
-  // canonical URLで別Issue / 別PRを指した要求は、旧Deliveryを退避して新規Deliveryを始める。
+  // 同じrepositoryのcanonical URLで別Issue / 別PRを指した要求は、旧Deliveryを退避して
+  // 新規Deliveryを始める。
   for (const [name, request, expected] of [
     [
       'delivery-draft-pr-url-issue',
-      'https://github.com/acme/repo/issues/300 を修正してください',
+      'https://github.com/koupent/ECC/issues/300 を修正してください',
       { requested_issue_number: 300, requested_pr_number: null }
     ],
     [
       'delivery-draft-pr-url-pull',
-      'https://github.com/acme/repo/pull/300 の指摘を修正してください',
+      'https://github.com/koupent/ECC/pull/300 の指摘を修正してください',
       { requested_issue_number: null, requested_pr_number: 300 }
     ]
   ]) {
@@ -661,6 +693,94 @@ test('a GitHub URL naming another Issue or PR starts a new delivery while the re
   assert.strictEqual(explicitPrNumber('pull-request 300 を確認してください'), 300);
   assert.strictEqual(explicitIssueNumber('https://github.com/acme/repo/pull/300 を修正してください'), null);
   assert.strictEqual(explicitPrNumber('https://github.com/acme/repo/issues/300 を修正してください'), null);
+});
+
+test('a same-numbered URL from another repository never resumes or prepares this clone delivery', () => {
+  // remote URLはhttps、ssh、scp表記のいずれでも同じrepositoryとして解決する。
+  for (const remote of [
+    'https://github.com/koupent/ECC.git',
+    'git@github.com:koupent/ECC.git',
+    'ssh://git@github.com:22/koupent/ECC',
+    'https://token@github.com/koupent/ecc/'
+  ]) {
+    assert.deepStrictEqual(parseRepositoryUrl(remote), { host: 'github.com', owner: 'koupent', repo: 'ecc' }, remote);
+  }
+  const repository = parseRepositoryUrl('https://github.com/koupent/ECC.git');
+  // 短い表記は現在のrepositoryの指定として扱い、URLはhost・owner・repoの完全一致を要求する。
+  assert.strictEqual(referenceMatchesRepository({ kind: 'pr', host: null, number: 274 }, repository), true);
+  assert.strictEqual(
+    referenceMatchesRepository({ kind: 'pr', host: 'github.com', owner: 'koupent', repo: 'ecc', number: 274 }, repository),
+    true
+  );
+  assert.strictEqual(
+    referenceMatchesRepository({ kind: 'pr', host: 'github.com', owner: 'other', repo: 'project', number: 274 }, repository),
+    false
+  );
+  // remoteを解決できないcloneでは、URL指定を現在のrepositoryとみなさない。
+  assert.strictEqual(
+    referenceMatchesRepository({ kind: 'pr', host: 'github.com', owner: 'koupent', repo: 'ecc', number: 274 }, null),
+    false
+  );
+
+  for (const [name, request, foreign] of [
+    ['delivery-foreign-pull', 'https://github.com/other/project/pull/274 の指摘を修正してください', /github\.com\/other\/project PR #274/],
+    ['delivery-foreign-issue', 'https://github.com/other/project/issues/271 を修正してください', /github\.com\/other\/project Issue #271/],
+    ['delivery-foreign-host', 'https://ghe.example.com/koupent/ECC/pull/274 を修正してください', /ghe\.example\.com\/koupent\/ecc PR #274/]
+  ]) {
+    const other = createDraftPrFixture(`${name}-repo`, name, `${name}-state`);
+    const started = initializeDelivery(other.input, request, { cwd: other.fixture, env: other.fixtureEnv });
+    // 番号が記録済みIssue #271 / PR #274と一致していても、進行中Deliveryは再開しない。
+    assert.strictEqual(started.status, 'pending', request);
+    assert.strictEqual(started.issue_number, null, request);
+    assert.strictEqual(started.draft_pr_url, null, request);
+    // このcloneの同番号Issue / PRとしては解決しない。
+    assert.strictEqual(started.requested_issue_number, null, request);
+    assert.strictEqual(started.requested_pr_number, null, request);
+    assert.match(started.foreign_reference, foreign, request);
+    const state = readState(other.input, other.fixtureEnv);
+    assert.strictEqual(state.previous_delivery.status, 'draft-pr', request);
+    assert.strictEqual(state.previous_delivery.issue_number, 271, request);
+    assert.strictEqual(state.previous_delivery.draft_pr_url, 'https://example.invalid/pull/274', request);
+
+    // prepareはGitHubを一度も呼ばず、Issueもbranchも作らずにfail-closeする。
+    const ghCalls = [];
+    assert.throws(
+      () => prepareDelivery(other.input, {
+        cwd: other.fixture,
+        env: other.fixtureEnv,
+        runCommand(binary, args, commandOptions) {
+          if (binary === 'gh') ghCalls.push(args.join(' '));
+          return runCommand(binary, args, commandOptions);
+        }
+      }),
+      /this clone is github\.com\/koupent\/ecc/,
+      request
+    );
+    assert.deepStrictEqual(ghCalls, [], request);
+    assert.strictEqual(
+      spawnSync('git', ['branch', '--list', 'codex/*', '--format=%(refname:short)'], { cwd: other.fixture, encoding: 'utf8' }).stdout.trim(),
+      other.branch,
+      request
+    );
+    assert.strictEqual(readState(other.input, other.fixtureEnv).delivery.status, 'pending', request);
+
+    // Context Builderも別リポジトリのIssueをこのcloneから取得しない。
+    const references = resolveDeliveryReferences(request, { cwd: other.fixture, env: other.fixtureEnv });
+    assert.strictEqual(references.issue, null, request);
+    assert.strictEqual(references.pr, null, request);
+    assert.strictEqual(
+      contextBuilder.requestWithExplicitIssueSnapshot(request, {
+        cwd: other.fixture,
+        env: other.fixtureEnv,
+        runCommand(binary, args) {
+          if (binary === 'gh') throw new Error(`unexpected gh call: ${args.join(' ')}`);
+          return runCommand(binary, args, { cwd: other.fixture, env: other.fixtureEnv });
+        }
+      }),
+      request,
+      request
+    );
+  }
 });
 
 test('preparing a delivery that names another PR binds it to that PR head instead of creating an Issue and branch', () => {
@@ -697,11 +817,12 @@ test('preparing a delivery that names another PR binds it to that PR head instea
 
   const started = initializeDelivery(
     input,
-    'https://github.com/acme/repo/pull/300 の指摘を修正してください',
+    'https://github.com/koupent/ECC/pull/300 の指摘を修正してください',
     { cwd: fixture, env: fixtureEnv }
   );
   assert.strictEqual(started.status, 'pending');
   assert.strictEqual(started.requested_pr_number, 300);
+  assert.strictEqual(started.foreign_reference, null);
 
   const prepared = prepareDelivery(input, { cwd: fixture, env: fixtureEnv, runCommand: stubbedGh(openPr) });
   // 指定PRはIssue検索より先に解決され、Delivery はそのPRのhead / base / 関連Issueに拘束される。

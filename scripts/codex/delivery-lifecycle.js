@@ -63,34 +63,114 @@ function slug(value) {
 // Issue / PR の指定は `Issue #300` のような短い表記だけでなく、GitHubのcanonical URL
 // （`https://<host>/<owner>/<repo>/issues|pull/<n>`）や `Pull Request #300` でも届く。
 // どれか一つでも取りこぼすと、別Deliveryへの要求を進行中Deliveryの続きとして扱ってしまう。
-const HOST = String.raw`(?:https?:\/\/)?(?:[\w-]+\.)+[a-z]{2,}(?::\d+)?`;
+// URL表記ではhost・owner・repoも保持する。番号だけを見ると、別リポジトリの同番号URL
+// （`other/project/pull/274`）を進行中DeliveryのPR #274と同一視し、このcloneの
+// 無関係なIssueやbranchへ配送してしまう。
+const REPOSITORY_URL = String.raw`(?:https?:\/\/)?((?:[\w-]+\.)+[a-z]{2,}(?::\d+)?)\/([^\s/]+)\/([^\s/]+)`;
 const DELIVERY_REFERENCES = {
-  issueNumber: [
-    new RegExp(String.raw`${HOST}\/[^\s/]+\/[^\s/]+\/issues\/(\d+)\b`, 'i'),
-    /\bissue\s*#?\s*(\d+)\b/i
+  issue: [
+    { pattern: new RegExp(String.raw`${REPOSITORY_URL}\/issues\/(\d+)\b`, 'i'), repository: true },
+    { pattern: /\bissue\s*#?\s*(\d+)\b/i, repository: false }
   ],
-  prNumber: [
-    new RegExp(String.raw`${HOST}\/[^\s/]+\/[^\s/]+\/pull\/(\d+)\b`, 'i'),
-    /\b(?:pull[\s-]*request|pr)\s*#?\s*(\d+)\b/i
+  pr: [
+    { pattern: new RegExp(String.raw`${REPOSITORY_URL}\/pull\/(\d+)\b`, 'i'), repository: true },
+    { pattern: /\b(?:pull[\s-]*request|pr)\s*#?\s*(\d+)\b/i, repository: false }
   ]
 };
+// GitHubのhost・owner・repoは大文字小文字を区別せず、remote URLは `.git` 付きでも届く。
+const REMOTE_URL = /^(?:[a-z][a-z0-9+.-]*:\/\/)?(?:[^@/\s]*@)?([^/:\s]+?)(?::\d+)?[/:]+([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/i;
+
+function normalizeRepositoryPart(value) {
+  return String(value || '').replace(/\.git$/i, '').toLowerCase();
+}
+
+function parseRepositoryUrl(value) {
+  const match = String(value || '').trim().match(REMOTE_URL);
+  if (!match) return null;
+  return {
+    host: normalizeRepositoryPart(match[1]),
+    owner: normalizeRepositoryPart(match[2]),
+    repo: normalizeRepositoryPart(match[3])
+  };
+}
 
 function parseDeliveryReferences(request) {
   const value = String(request || '');
-  const parsed = {};
-  for (const [key, patterns] of Object.entries(DELIVERY_REFERENCES)) {
-    const match = patterns.map(pattern => value.match(pattern)).find(Boolean);
-    parsed[key] = match ? Number(match[1]) : null;
+  const parsed = { issue: null, pr: null };
+  for (const [kind, patterns] of Object.entries(DELIVERY_REFERENCES)) {
+    for (const { pattern, repository } of patterns) {
+      const match = value.match(pattern);
+      if (!match) continue;
+      parsed[kind] = repository
+        ? {
+            kind,
+            host: normalizeRepositoryPart(match[1]),
+            owner: normalizeRepositoryPart(match[2]),
+            repo: normalizeRepositoryPart(match[3]),
+            number: Number(match[4])
+          }
+        : { kind, host: null, owner: null, repo: null, number: Number(match[1]) };
+      break;
+    }
   }
   return parsed;
 }
 
 function explicitIssueNumber(request) {
-  return parseDeliveryReferences(request).issueNumber;
+  const reference = parseDeliveryReferences(request).issue;
+  return reference ? reference.number : null;
 }
 
 function explicitPrNumber(request) {
-  return parseDeliveryReferences(request).prNumber;
+  const reference = parseDeliveryReferences(request).pr;
+  return reference ? reference.number : null;
+}
+
+// このcloneが実際に配送できるGitHub repositoryはremoteだけが決める。
+function currentRepository(options = {}) {
+  const execute = options.runCommand || runCommand;
+  try {
+    return parseRepositoryUrl(execute('git', ['remote', 'get-url', 'origin'], { cwd: options.cwd, env: options.env, timeout: 5000 }));
+  } catch {
+    return null;
+  }
+}
+
+function describeRepository(repository) {
+  return repository ? `${repository.host}/${repository.owner}/${repository.repo}` : 'an unresolved GitHub repository';
+}
+
+function describeReference(reference) {
+  const scope = reference.host ? describeRepository(reference) : 'this repository';
+  return `${scope} ${reference.kind === 'pr' ? 'PR' : 'Issue'} #${reference.number}`;
+}
+
+// 短い表記（`Issue #300`）は現在のrepositoryの指定として扱う。host・owner・repoまで
+// 書かれたURLだけは、remoteと完全一致したときにだけ現在のrepositoryの指定とみなす。
+// 別リポジトリ・不明なhost・remoteを解決できないcloneはfail-closeさせるため、
+// requested_issue_number / requested_pr_number には採用しない。
+function referenceMatchesRepository(reference, repository) {
+  if (!reference || !reference.host) return true;
+  if (!repository) return false;
+  return reference.host === repository.host &&
+    reference.owner === repository.owner &&
+    reference.repo === repository.repo;
+}
+
+function resolveDeliveryReferences(request, options = {}) {
+  const parsed = parseDeliveryReferences(request);
+  const needsRepository = ['issue', 'pr'].some(kind => parsed[kind] && parsed[kind].host);
+  const repository = options.repository !== undefined
+    ? options.repository
+    : needsRepository ? currentRepository(options) : null;
+  const resolved = { issue: null, pr: null, repository, foreign: [] };
+  for (const kind of ['issue', 'pr']) {
+    const reference = parsed[kind];
+    if (!reference) continue;
+    if (referenceMatchesRepository(reference, repository)) resolved[kind] = reference;
+    else resolved.foreign.push(reference);
+  }
+  return resolved;
 }
 
 function deliveryPrNumber(delivery) {
@@ -98,11 +178,13 @@ function deliveryPrNumber(delivery) {
   return match ? Number(match[1]) : (delivery && delivery.requested_pr_number) || null;
 }
 
-function referencesOtherDelivery(delivery, request) {
-  const { issueNumber, prNumber } = parseDeliveryReferences(request);
-  if (issueNumber && delivery.issue_number && issueNumber !== Number(delivery.issue_number)) return true;
+function referencesOtherDelivery(delivery, request, options = {}) {
+  const references = options.references || resolveDeliveryReferences(request, options);
+  // 別リポジトリを名指しした要求は、番号が一致していてもこのDeliveryの続きではない。
+  if (references.foreign.length) return true;
+  if (references.issue && delivery.issue_number && references.issue.number !== Number(delivery.issue_number)) return true;
   const recordedPr = deliveryPrNumber(delivery);
-  return Boolean(prNumber && recordedPr && prNumber !== recordedPr);
+  return Boolean(references.pr && recordedPr && references.pr.number !== recordedPr);
 }
 
 function resumeDeliveryAfterDraftPr(input, delivery, env) {
@@ -163,6 +245,7 @@ function initializeDelivery(input, request, options = {}) {
     return deferred;
   }
   if (!isDeliveryRequest(request)) return null;
+  const references = resolveDeliveryReferences(request, { cwd, env, runCommand: options.runCommand });
   const active = isActiveDelivery(current.delivery) ? current.delivery : null;
   let superseded = null;
   if (active && active.status === 'draft-pr') {
@@ -172,9 +255,9 @@ function initializeDelivery(input, request, options = {}) {
     // Draft PR到達後の追加要求は、同じIssue/PRを指す限り同じDeliveryの続きである。
     // 参照を保ったままreadyへ戻し、branch一致、clean commit、fresh review、
     // Completion Gateを再適用する。draft-prのまま継続すると全Gateが素通りになる。
-    if (!referencesOtherDelivery(active, request)) return resumeDeliveryAfterDraftPr(input, active, env);
-    // 別のIssue/PRを名指しする要求だけは新しいDeliveryを開始する。旧Deliveryの
-    // Issue・branch・Draft PR参照はstateに退避し、記録から消さない。
+    if (!referencesOtherDelivery(active, request, { references })) return resumeDeliveryAfterDraftPr(input, active, env);
+    // 別のIssue/PR、または別リポジトリを名指しする要求だけは新しいDeliveryを開始する。
+    // 旧DeliveryのIssue・branch・Draft PR参照はstateに退避し、記録から消さない。
     superseded = active;
   } else {
     // Claude Code の継続turnでは、ユーザーの追記文面が変わっても同じDeliveryである。
@@ -191,8 +274,11 @@ function initializeDelivery(input, request, options = {}) {
     status: options.deferred ? 'deferred' : 'pending',
     request_hash: requestHash,
     title: titleFromRequest(request, requestHash),
-    requested_issue_number: explicitIssueNumber(request),
-    requested_pr_number: explicitPrNumber(request),
+    requested_issue_number: references.issue ? references.issue.number : null,
+    requested_pr_number: references.pr ? references.pr.number : null,
+    // 別リポジトリを指すURLは、このcloneのIssue・branchへ配送してはいけない。番号を
+    // 採用せずに記録だけ残し、prepareでfail-closeする。
+    foreign_reference: references.foreign.length ? describeReference(references.foreign[0]) : null,
     base_branch: config.deliveryBaseBranch,
     issue_number: null,
     issue_url: null,
@@ -356,6 +442,14 @@ function prepareDelivery(input = {}, options = {}) {
   const commandOptions = { cwd, env, runCommand: execute };
 
   try {
+    // 別リポジトリのIssue/PRは、このcloneのgh・branchでは解決できない。番号だけが一致する
+    // 無関係なIssueへ配送しないよう、Issue検索もbranch作成も行わずここで止める。
+    if (delivery.foreign_reference) {
+      throw new Error(
+        `The request names ${delivery.foreign_reference}, but this clone is ${describeRepository(currentRepository(commandOptions))}; ` +
+          'run the delivery in that repository\'s clone, or name the Issue or PR of this repository.'
+      );
+    }
     const dirty = execute('git', ['status', '--porcelain'], commandOptions);
     if (dirty) throw new Error('Delivery preparation requires a clean working tree; preserve or commit existing changes first.');
 
@@ -456,11 +550,17 @@ if (require.main === module) {
 }
 
 module.exports = {
+  currentRepository,
+  describeReference,
+  describeRepository,
   explicitIssueNumber,
   explicitPrNumber,
   deliveryBranch,
   deliveryPrNumber,
+  parseRepositoryUrl,
+  referenceMatchesRepository,
   referencesOtherDelivery,
+  resolveDeliveryReferences,
   resumeDeliveryAfterDraftPr,
   findDuplicateIssue,
   findExistingDeliveryPr,

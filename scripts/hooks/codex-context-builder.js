@@ -2,7 +2,7 @@
 'use strict';
 
 const { loadConfig } = require('../codex/config');
-const { explicitIssueNumber, initializeDelivery, isActiveDelivery, runCommand } = require('../codex/delivery-lifecycle');
+const { initializeDelivery, isActiveDelivery, resolveDeliveryReferences, runCommand } = require('../codex/delivery-lifecycle');
 const { runRole } = require('../codex/run-role');
 const { hash, readState, resolveSessionId } = require('../codex/runtime-state');
 
@@ -20,8 +20,15 @@ function isPlanMode(input) {
 }
 
 function requestWithExplicitIssueSnapshot(prompt, options = {}) {
-  const issueNumber = explicitIssueNumber(prompt);
-  if (!issueNumber) return prompt;
+  // 別リポジトリのIssue URLをこのcloneの `gh issue view` で解決すると、同番号の無関係な
+  // Issueをauthoritative snapshotとして渡してしまう。現在のrepositoryの指定だけを取得する。
+  const reference = resolveDeliveryReferences(prompt, {
+    cwd: options.cwd,
+    env: options.env,
+    runCommand: options.runCommand
+  }).issue;
+  if (!reference) return prompt;
+  const issueNumber = reference.number;
   const execute = options.runCommand || runCommand;
   try {
     const raw = execute(

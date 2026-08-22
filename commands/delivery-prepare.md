@@ -21,11 +21,19 @@ explicit change request resumes it on the recorded Issue and branch, drops the
 recorded completion and review evidence, and requires a fresh review before the
 task can stop. Until it resumes, only read-only inspection and the reset command
 are allowed, so file edits, shell mutations, branch switches, and commits stay
-blocked. Read-only inspection is allowlisted per argument, so options that run
-another program (`rg --pre`, `file -C`, `git -c` / `--ext-diff`, `gh --web`) are
-denied together with every unknown option. Only a request naming a different
-Issue or PR — by number, as `Pull Request #300`, or as a canonical GitHub
-`/issues/300` or `/pull/300` URL — starts a new delivery that needs this command.
+blocked. Read-only inspection is allowlisted per argument and, for `git`, per
+subcommand, so options that run another program (`rg --pre`, `file -C`,
+`git -c` / `--ext-diff` / `cat-file --filters`, `gh --web`) are denied together
+with every unknown option. Only a request naming a different Issue or PR — by
+number, as `Pull Request #300`, or as a canonical GitHub `/issues/300` or
+`/pull/300` URL — starts a new delivery that needs this command.
+
+A URL is matched against this clone's `origin` remote by host, owner, and
+repository, not by number alone. A reference to another repository — including
+the same number on another host or owner — never resumes the recorded delivery
+and is never resolved as a local Issue or PR: preparation fails closed instead of
+creating an Issue and branch for it. Run such a request in that repository's own
+clone, or name the Issue or PR of this repository.
 
 When the request names a PR, the preparer resolves that PR before any Issue
 search: the delivery is bound to the PR's head branch, base branch, and linked

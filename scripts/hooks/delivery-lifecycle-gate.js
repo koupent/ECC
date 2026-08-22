@@ -49,10 +49,30 @@ function hasExecutableShellControl(command) {
 // draft-prのDeliveryで通してよいのは、状態を変えない参照だけである。read-onlyと断定できない
 // binaryやsubcommandは拒否する（fail-close）。ここを広くすると、Edit/Writeを止めても
 // shell経由のファイル変更・branch切替・commitでGateを迂回できてしまう。
-const READ_ONLY_GIT_SUBCOMMANDS = new Set([
-  'blame', 'cat-file', 'describe', 'diff', 'log', 'ls-files', 'ls-tree',
-  'name-rev', 'rev-list', 'rev-parse', 'shortlog', 'show', 'status', 'whatchanged'
+// subcommandがread-onlyでも、optionひとつで外部processを起動できる。`cat-file --filters`
+// と `--filters-path` は設定済みのclean/smudge filterを、`--textconv` はtextconv programを
+// そのまま実行する。そのためread-onlyと確認したoptionだけをsubcommandごとに列挙し、
+// 未知のoptionは拒否する。
+const GIT_HISTORY_OPTION = String.raw`-\d+|-[nU]\d*|-[psz]|--(?:abbrev-commit|all|author=\S*|date=\S+|decorate(?:=\S+)?|first-parent|follow|format=\S*|graph|grep=\S*|max-count=\d+|merges|name-only|name-status|no-color|no-merges|no-ext-diff|no-patch|no-renames|no-textconv|numstat|oneline|patch|pretty(?:=\S*)?|reverse|shortstat|since=\S+|stat(?:=\S+)?|summary|unified=\d+|until=\S+)`;
+const READ_ONLY_GIT_OPTIONS = new Map([
+  ['blame', /^(?:-[ltefnswb]|-L\S*|--(?:abbrev=\d+|date=\S+|incremental|line-porcelain|porcelain|root|show-stats))$/],
+  // `--filters` / `--filters-path` / `--textconv` は外部programを起動するため載せない。
+  ['cat-file', /^(?:-[tsep]|--(?:allow-unknown-type|batch(?:=\S*)?|batch-all-objects|batch-check(?:=\S*)?|buffer|follow-symlinks))$/],
+  ['describe', /^(?:--(?:abbrev=\d+|all|always|contains|dirty(?:=\S*)?|exclude=\S+|long|match=\S+|tags))$/],
+  ['diff', new RegExp(String.raw`^(?:${GIT_HISTORY_OPTION}|-[MRw]|--(?:cached|check|diff-filter=\S+|dst-prefix=\S+|find-renames(?:=\S+)?|ignore-all-space|no-index|src-prefix=\S+|staged))$`)],
+  ['log', new RegExp(String.raw`^(?:${GIT_HISTORY_OPTION})$`)],
+  ['ls-files', /^(?:-[socmdiz]+|--(?:cached|deleted|directory|error-unmatch|exclude-standard|full-name|modified|others|stage))$/],
+  ['ls-tree', /^(?:-[rdtlz]+|--(?:abbrev=\d+|format=\S*|full-name|full-tree|name-only|name-status))$/],
+  ['name-rev', /^(?:--(?:all|always|name-only|refs=\S+|tags))$/],
+  ['rev-list', new RegExp(String.raw`^(?:${GIT_HISTORY_OPTION}|--(?:count|left-right|objects))$`)],
+  ['rev-parse', /^(?:-q|--(?:abbrev-ref(?:=\S+)?|absolute-git-dir|all|git-dir|is-inside-work-tree|quiet|short(?:=\d+)?|show-cdup|show-toplevel|symbolic-full-name|verify))$/],
+  ['shortlog', /^(?:-[sne]+|--(?:email|no-merges|numbered|summary))$/],
+  ['show', new RegExp(String.raw`^(?:${GIT_HISTORY_OPTION}|-s|--(?:diff-filter=\S+|no-notes))$`)],
+  ['status', /^(?:-[sbz]+|-u(?:all|no|normal)?|--(?:branch|ignored(?:=\S+)?|long|no-color|porcelain(?:=\S+)?|short|untracked-files(?:=\S+)?))$/],
+  ['whatchanged', new RegExp(String.raw`^(?:${GIT_HISTORY_OPTION})$`)]
 ]);
+// `git branch` は列挙flagだけなら参照だが、位置引数が付くと作成・削除・改名になる。
+const GIT_BRANCH_OPTION = /^(?:-a|-r|-v|-vv|--all|--list|--show-current|--verbose|--(?:no-)?color|--format=.*|--sort=.*)$/i;
 const READ_ONLY_GH_SUBCOMMANDS = new Map([
   ['pr', new Set(['view', 'list', 'status', 'diff', 'checks'])],
   ['issue', new Set(['view', 'list', 'status'])],
@@ -106,12 +126,15 @@ function commandTokens(command) {
 
 function isReadOnlyGitCommand(args) {
   if (args.some(argument => GIT_EXEC_FLAG.test(argument))) return false;
+  // subcommandより前に置けるgit本体のoptionは、pagerを起動しない `--no-pager` だけ許す。
   const rest = args[0] === '--no-pager' ? args.slice(1) : args;
   const subcommand = String(rest[0] || '').toLowerCase();
-  if (READ_ONLY_GIT_SUBCOMMANDS.has(subcommand)) return true;
-  // `git branch` は列挙flagだけなら参照だが、位置引数が付くと作成・削除・改名になる。
-  if (subcommand !== 'branch') return false;
-  return rest.slice(1).every(argument => /^(?:-a|-r|-v|-vv|--all|--list|--show-current|--verbose|--(?:no-)?color|--format=.*|--sort=.*)$/i.test(argument));
+  const options = rest.slice(1);
+  if (subcommand === 'branch') return options.every(argument => GIT_BRANCH_OPTION.test(argument));
+  const allowed = READ_ONLY_GIT_OPTIONS.get(subcommand);
+  if (!allowed) return false;
+  // option以外の位置引数はrevisionやpathとして渡るだけで実行されない。
+  return options.every(argument => !/^-./.test(argument) || argument === '--' || allowed.test(argument));
 }
 
 function isReadOnlyGhCommand(args) {
