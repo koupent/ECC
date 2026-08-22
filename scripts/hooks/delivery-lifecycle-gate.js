@@ -25,7 +25,12 @@ function branchAt(cwd, env) {
   return gitValue(cwd, env, ['branch', '--show-current']);
 }
 
-function hasExecutableShellControl(command) {
+// `allowQuotedExpansion` は、`node "$CLAUDE_PLUGIN_ROOT/scripts/codex/reset.js" "<session>"` の
+// ように全体の形をregexで固定できる呼び出し専用である。double quoteの中の `$NAME` は語分割も
+// command substitutionも起こさないため、argument列は展開後も変わらない。allowlistで
+// option単位に判定する経路（isReadOnlyBashCommand）では、展開後に別のargumentへ化けるため使わない。
+function hasExecutableShellControl(command, options = {}) {
+  const allowQuotedExpansion = options.allowQuotedExpansion === true;
   let quote = null;
   for (let index = 0; index < command.length; index += 1) {
     const character = command[index];
@@ -40,17 +45,23 @@ function hasExecutableShellControl(command) {
     }
     if (quote) {
       if (character === quote) quote = null;
-      else if (
-        quote === '"' &&
-        (character === '`' || (character === '$' && ['(', '{'].includes(command[index + 1])))
-      ) return true;
+      else if (quote === '"' && character === '`') return true;
+      // double quoteの中でも `$(` と `${` は実行・置換に化ける。plainな `$NAME` だけは、
+      // 呼び出し側が明示的に許可したときに通す。
+      else if (quote === '"' && character === '$') {
+        if (!allowQuotedExpansion) return true;
+        if (!/[A-Za-z_]/.test(command[index + 1] || '')) return true;
+      }
       continue;
     }
     if (character === '"' || character === "'") {
       quote = character;
       continue;
     }
-    if ('\r\n;&|<>`(){}^'.includes(character) || (character === '$' && command[index + 1] === '(')) return true;
+    // quoteの外の `$` は常に拒否する。`$(` と `${` だけを見ると、`rg $IFS--pre=rm` や
+    // `gh api ... $IFS-X PUT` のように展開結果が語分割されて新しいoptionになり、token検査では
+    // 位置引数に見えるまま外部process起動やGitHub書き込みへ到達する。
+    if ('\r\n;&|<>`(){}^$'.includes(character)) return true;
   }
   return quote !== null;
 }
@@ -148,12 +159,52 @@ const NON_MUTATING_TOOLS = new Set([
 // fresh reviewの要求であり、そこで止めると `/ecc:code-review` へ進めずデッドロックになる。
 const REVIEW_ENTRY_TOOL = 'SlashCommand';
 
+// shellはquoteとbackslashをコマンドへ渡す前に取り除く。両端の引用符だけを落とすと、
+// `''--pre=rm` や `\-\-pre=rm` が位置引数に見えたまま `--pre=rm` として渡り、option検査を
+// 素通りする。ここでshellと同じ順にquoteを解いてからoptionを判定する。展開文字や制御文字は
+// hasExecutableShellControl()が先に拒否するため、ここではquote除去だけを再現すればよい。
 function commandTokens(command) {
-  return String(command || '')
-    .trim()
-    .split(/\s+/)
-    .map(token => token.replace(/^["']|["']$/g, ''))
-    .filter(Boolean);
+  const value = String(command || '');
+  const tokens = [];
+  let current = '';
+  let started = false;
+  let quote = null;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (quote === "'") {
+      if (character === "'") quote = null;
+      else current += character;
+      continue;
+    }
+    // double quoteの中のbackslashをshellは一部しか外さないが、外す側に寄せるとoptionとして
+    // 検査されるだけなので安全側に倒れる。
+    if (character === '\\' && index + 1 < value.length) {
+      current += value[index + 1];
+      started = true;
+      index += 1;
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '"') quote = null;
+      else current += character;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      started = true;
+      continue;
+    }
+    if (/\s/.test(character)) {
+      if (started) tokens.push(current);
+      current = '';
+      started = false;
+      continue;
+    }
+    current += character;
+    started = true;
+  }
+  if (started) tokens.push(current);
+  return tokens;
 }
 
 function isReadOnlyGitCommand(args) {
@@ -203,7 +254,9 @@ function isReadOnlyBashCommand(command) {
 
 function isExactLifecycleCommand(command, action) {
   const value = String(command || '').trim();
-  if (!value || hasExecutableShellControl(value)) return false;
+  // 記録済みのprepare / resetは `"$CLAUDE_PLUGIN_ROOT/scripts/codex/..."` の形で案内される。
+  // 全体をregexで固定するため、double quoteの中の変数展開だけは許す。
+  if (!value || hasExecutableShellControl(value, { allowQuotedExpansion: true })) return false;
   const node = String.raw`(?:node(?:\.exe)?|"[^"]*node(?:\.exe)?"|'[^']*node(?:\.exe)?')`;
   const scriptName = action === 'prepare' ? 'delivery-lifecycle\\.js' : 'reset\\.js';
   const script = String.raw`(?:"[^"]*scripts[\\/]codex[\\/]${scriptName}"|'[^']*scripts[\\/]codex[\\/]${scriptName}'|[^\s]+scripts[\\/]codex[\\/]${scriptName})`;

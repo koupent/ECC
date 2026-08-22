@@ -580,7 +580,10 @@ test('a draft-pr delivery allows only read-only Bash and fails closed when the w
     'ls -la src',
     'wc -l src/product.ts',
     'stat -c %s src/product.ts',
-    'node "/plugin/scripts/codex/reset.js" "delivery-draft-pr-bash"'
+    'node "/plugin/scripts/codex/reset.js" "delivery-draft-pr-bash"',
+    // 案内されるresetコマンドはplugin rootを変数で受ける。double quoteの中の `$NAME` は
+    // 語分割もcommand substitutionも起こさないため、形をregexで固定したまま通す。
+    'node "$CLAUDE_PLUGIN_ROOT/scripts/codex/reset.js" "delivery-draft-pr-bash"'
   ]) {
     assert.strictEqual(deliveryGate.run(bash(allowed), { cwd: fixture, env: fixtureEnv }), bash(allowed), allowed);
   }
@@ -622,6 +625,18 @@ test('a draft-pr delivery allows only read-only Bash and fails closed when the w
     'gh pr view 274 --web',
     'tail -f src/product.ts',
     'date -s 2020-01-01',
+    // shell展開はtoken検査の後に起きる。`$IFS` は空白へ展開されるため、位置引数に見える
+    // tokenから外部process起動optionやGitHub書き込みoptionを組み立てられる。
+    'rg $IFS--pre=rm needle src',
+    'gh api repos/acme/repo/issues $IFS-X$IFS PUT',
+    'git ${GIT_OPTION} log',
+    // 引用符とbackslashもshellがコマンドへ渡す前に外す。両端の引用符だけを落とす判定では、
+    // 実際にはoptionとして渡るtokenを位置引数と見誤る。
+    "rg ''--pre=rm needle src",
+    'rg \\-\\-pre=rm needle src',
+    // resetコマンドでも、quoteの外の展開は語分割で別のargumentへ化けるため通さない。
+    'node $CLAUDE_PLUGIN_ROOT/scripts/codex/reset.js delivery-draft-pr-bash',
+    'node "$(printf /plugin)/scripts/codex/reset.js" "delivery-draft-pr-bash"',
     // escapeされた引用符でquote判定を崩し、後続に別コマンドを連結する形も通さない。
     'echo \\"; touch review-bypass-sentinel; echo \\"',
     // 行末のbackslashは次行を継ぎ足せるため、単独では読み取り専用と断定できない。
@@ -646,6 +661,31 @@ test('a draft-pr delivery allows only read-only Bash and fails closed when the w
   // single quoteの中のbackslashはリテラルなので、閉じない引用符として扱う。
   assert.strictEqual(deliveryGate.isReadOnlyBashCommand("git log --grep='needle'"), true);
   assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git log --grep="needle"'), true);
+  // shell展開はtoken検査の後に起きるため、展開を含むコマンドはread-onlyと断定できない。
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('rg $IFS--pre=rm needle src'), false);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('gh api repos/acme/repo/pulls/274 $IFS-X$IFS PUT'), false);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git log --grep="$(touch sentinel)"'), false);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git log --grep="${IFS}"'), false);
+  // single quoteの中は展開されないため、参照のままである。
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand("git log --grep='$IFS'"), true);
+  // quoteとbackslashはshellが外す。両端の引用符だけを落とすと、optionを位置引数と見誤る。
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand("rg ''--pre=rm needle src"), false);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('rg \\-\\-pre=rm needle src'), false);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('rg "--pre"=rm needle src'), false);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('git log \\-\\-output=/tmp/log'), false);
+  // quoteを外した結果がPATH解決されるbare nameなら、これまで通り参照として通す。
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand('gi\\t status'), true);
+  assert.strictEqual(deliveryGate.isReadOnlyBashCommand("'git' status"), true);
+  // 案内されるprepare / resetは形をregexで固定するため、double quoteの中の変数展開だけ許す。
+  assert.strictEqual(
+    deliveryGate.isExactLifecycleCommand('node "$CLAUDE_PLUGIN_ROOT/scripts/codex/delivery-lifecycle.js" prepare', 'prepare'),
+    true
+  );
+  assert.strictEqual(
+    deliveryGate.isExactLifecycleCommand('node $CLAUDE_PLUGIN_ROOT/scripts/codex/delivery-lifecycle.js prepare', 'prepare'),
+    false
+  );
+  assert.strictEqual(deliveryGate.isExactLifecycleCommand('node "${IFS}/scripts/codex/reset.js" "sess"', 'reset'), false);
   // path付きの実行ファイルはbasenameで判定しない。
   assert.strictEqual(deliveryGate.isReadOnlyBashCommand('./git status'), false);
   assert.strictEqual(deliveryGate.isReadOnlyBashCommand('/tmp/gh pr view 274'), false);

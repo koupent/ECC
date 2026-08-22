@@ -40,6 +40,13 @@ because its base name says nothing about what actually runs. Escaped quotes and
 trailing line continuations are treated as command separators, so a chained
 command can never be read as a single quoted argument.
 
+Because the shell rewrites a command after this check, every unquoted `$`
+expansion is denied: `rg $IFS--pre=rm` and `gh api ... $IFS-X PUT` would
+otherwise pass the argument check as positional arguments and then reach the
+shell as denied options. Quotes and backslashes are removed the way the shell
+removes them before the arguments are checked, so `''--pre=rm` and `\-\-pre=rm`
+are inspected as the option they become.
+
 Only a request naming a different Issue or PR — by number, as
 `Pull Request #300`, or as a canonical GitHub `/issues/300` or `/pull/300`
 URL — starts a new delivery that needs this command. A request that names two
