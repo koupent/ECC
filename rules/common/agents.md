@@ -24,6 +24,10 @@ This file is the canonical delegation policy. `AGENTS.md`, the platform copies
 (`.cursor/rules/common-agents.md`, `.opencode/instructions/INSTRUCTIONS.md`), and the
 translations under `docs/` restate it and must stay semantically identical to it.
 
+**Scope.** This policy governs every "use the X agent" step in every other rule file of this
+pack — including its platform copies and translations — regardless of how absolutely that step
+is phrased. Read each such step as "delegate when this policy permits delegation".
+
 **Mechanism.** This rule describes when delegation is useful; it does not automatically spawn an
 agent, and no runtime spawns one on its own. An agent runs only when the parent model invokes an
 available Agent or Task tool and collects the result.

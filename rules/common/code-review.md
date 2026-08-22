@@ -59,6 +59,10 @@ Before marking code complete:
 
 ## Agent Usage
 
+> Every "use the X agent" step in this file follows [agents.md](agents.md): delegate when a
+> delegation tool is available and higher-priority instructions permit it, and otherwise apply the
+> same review perspectives in the parent context.
+
 Use these agents for code review:
 
 | Agent | Purpose |

@@ -10,6 +10,10 @@ The Feature Implementation Workflow describes the development pipeline: planning
 
 ## Feature Implementation Workflow
 
+> Every "use the X agent" step below follows the agent orchestration rule: delegate when a
+> delegation tool is available and higher-priority instructions permit it, and otherwise carry out
+> the same step in the parent context.
+
 1. **Plan First**
    - Use **planner** agent to create implementation plan
    - Identify dependencies and risks

@@ -49,7 +49,8 @@ Este es un **plugin de IA para codificación listo para producción** que propor
 
 ## Orquestación de Agentes
 
-`rules/common/agents.md` es la política canónica de delegación; esta sección la reformula.
+`rules/common/agents.md` es la política canónica de delegación; esta sección la reformula y rige
+cada paso "usa el agente X" del resto de este documento, por absoluto que sea su enunciado.
 
 Este catálogo describe los roles disponibles; no lanza un agente automáticamente, y ningún runtime
 lo lanza por su cuenta. Delega solo cuando el runtime expone la herramienta necesaria y las

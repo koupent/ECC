@@ -24,6 +24,10 @@ Located in `~/.claude/agents/`:
 
 `rules/common/agents.md` is the canonical delegation policy; this file restates it for Cursor.
 
+**Scope.** This policy governs every "use the X agent" step in every other Cursor rule of this
+pack, regardless of how absolutely that step is phrased. Read each such step as "delegate when
+this policy permits delegation".
+
 **Mechanism.** This rule describes when delegation is useful; it does not automatically spawn an
 agent, and no runtime spawns one on its own. An agent runs only when the parent model invokes an
 available Agent or Task tool and collects the result.

@@ -22,6 +22,10 @@ Ubicados en `~/.claude/agents/`:
 
 `rules/common/agents.md` es la política canónica de delegación; este documento es su traducción.
 
+**Alcance.** Esta política rige cada paso "usa el agente X" de las demás reglas de este pack, por
+absoluto que sea su enunciado. Lee cada uno de esos pasos como "delega cuando esta política lo
+permita".
+
 **Mecanismo.** Esta regla describe cuándo la delegación es útil; no lanza un agente
 automáticamente, y ningún runtime lo lanza por su cuenta. Un agente se ejecuta solo cuando el
 modelo padre invoca una herramienta Agent o Task disponible y recoge su resultado.

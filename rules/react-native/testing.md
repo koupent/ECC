@@ -49,4 +49,5 @@ test('calls onSelect with the user id when pressed', () => {
 
 ## What to test first
 
-Use the `tdd-guide` agent proactively for new features: write a failing test that captures the behavior, then implement.
+For new features, write a failing test that captures the behavior, then implement. Delegate that
+loop to the `tdd-guide` agent whenever [common/agents.md](../common/agents.md) permits delegation.

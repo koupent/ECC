@@ -1331,9 +1331,12 @@ test('run-role persists a contradictory release blocker as blocked', () => {
   assert.strictEqual(state.review_blocking_findings, 1);
 });
 
+const repoRoot = path.join(__dirname, '..', '..');
+const readRepoFile = (...segments) => fs.readFileSync(path.join(repoRoot, ...segments), 'utf8');
+
 test('distributed agent rules defer to runtime capabilities and do not claim automatic spawning', () => {
-  const agentsRule = fs.readFileSync(path.join(__dirname, '..', '..', 'rules', 'common', 'agents.md'), 'utf8');
-  const rootAgents = fs.readFileSync(path.join(__dirname, '..', '..', 'AGENTS.md'), 'utf8');
+  const agentsRule = readRepoFile('rules', 'common', 'agents.md');
+  const rootAgents = readRepoFile('AGENTS.md');
   assert.doesNotMatch(agentsRule, /No user prompt needed/);
   assert.doesNotMatch(agentsRule, /ALWAYS use parallel Task execution/);
   assert.match(agentsRule, /higher-priority/);
@@ -1341,6 +1344,83 @@ test('distributed agent rules defer to runtime capabilities and do not claim aut
   assert.doesNotMatch(rootAgents, /Use agents proactively without user prompt/);
   assert.match(rootAgents, /higher-priority/);
   assert.match(rootAgents, /does not automatically spawn/i);
+});
+
+test('the canonical delegation policy is named as canonical and is subordinate to the harness', () => {
+  // 中央Issue #58: 正本が一意でなく、ハーネスとの優先順位も書かれていなかったため、
+  // Rulesとハーネス指示が正面衝突した。正本・機構・期待・優先順位・適用範囲を回帰対象にする。
+  const agentsRule = readRepoFile('rules', 'common', 'agents.md');
+  assert.match(agentsRule, /canonical delegation policy/);
+  assert.match(agentsRule, /governs every "use the X agent" step/);
+  assert.match(agentsRule, /do not call the Agent tool unless the user requested it/);
+
+  for (const [file, restatement] of [
+    [readRepoFile('CLAUDE.md'), /canonical delegation policy/],
+    [readRepoFile('AGENTS.md'), /canonical delegation policy/],
+    [readRepoFile('.cursor', 'rules', 'common-agents.md'), /canonical delegation policy/],
+    [readRepoFile('.opencode', 'instructions', 'INSTRUCTIONS.md'), /canonical delegation policy/]
+  ]) {
+    assert.match(file, /rules\/common\/agents\.md/);
+    assert.match(file, restatement);
+    assert.match(file, /governs\s+\n?every "use the X agent" step/);
+    assert.match(file, /higher-priority/);
+  }
+
+  const rulesReadme = readRepoFile('rules', 'README.md');
+  assert.match(rulesReadme, /Rule Priority/);
+  assert.match(rulesReadme, /follow the harness/);
+});
+
+test('rules that name an agent stay conditional on the canonical delegation policy', () => {
+  for (const file of [
+    ['rules', 'common', 'security.md'],
+    ['rules', 'common', 'performance.md'],
+    ['rules', 'common', 'testing.md'],
+    ['rules', 'common', 'development-workflow.md'],
+    ['rules', 'common', 'code-review.md'],
+    ['.cursor', 'rules', 'common-security.md'],
+    ['.cursor', 'rules', 'common-performance.md'],
+    ['.cursor', 'rules', 'common-testing.md'],
+    ['.cursor', 'rules', 'common-development-workflow.md']
+  ]) {
+    const source = readRepoFile(...file);
+    const label = file.join('/');
+    assert.match(source, /permits? delegation|agent orchestration rule|agents\.md/, label);
+    assert.doesNotMatch(source, /Use PROACTIVELY/, label);
+  }
+
+  const reactNativeTesting = readRepoFile('rules', 'react-native', 'testing.md');
+  assert.doesNotMatch(reactNativeTesting, /agent proactively/);
+  assert.match(reactNativeTesting, /permits delegation/);
+
+  for (const rules of [readRepoFile('RULES.md'), readRepoFile('docs', 'ja-JP', 'RULES.md')]) {
+    assert.match(rules, /rules\/common\/agents\.md/);
+  }
+});
+
+test('every translated delegation policy carries the same mechanism and precedence', () => {
+  const translations = [
+    ['docs', 'es', 'rules', 'common', 'agents.md'],
+    ['docs', 'ja-JP', 'rules', 'common', 'agents.md'],
+    ['docs', 'ko-KR', 'rules', 'agents.md'],
+    ['docs', 'pt-BR', 'rules', 'agents.md'],
+    ['docs', 'tr', 'rules', 'common', 'agents.md'],
+    ['docs', 'zh-CN', 'rules', 'common', 'agents.md'],
+    ['docs', 'zh-TW', 'rules', 'agents.md'],
+    ['docs', 'es', 'AGENTS.md'],
+    ['docs', 'ja-JP', 'AGENTS.md'],
+    ['docs', 'tr', 'AGENTS.md'],
+    ['docs', 'zh-CN', 'AGENTS.md']
+  ];
+  for (const file of translations) {
+    const source = readRepoFile(...file);
+    const label = file.join('/');
+    assert.match(source, /rules\/common\/agents\.md/, label);
+    assert.doesNotMatch(source, /No user prompt needed/, label);
+    assert.doesNotMatch(source, /Immediate Agent Usage/, label);
+    // 「ハーネス」に相当する語で優先順位が説明されていること。
+    assert.match(source, /harness|하네스|ハーネス/i, label);
+  }
 });
 
 test('insufficient Context Builder output triggers Claude fallback', () => {

@@ -50,7 +50,8 @@ This is a **production-ready AI coding plugin** providing 67 specialized agents,
 
 ## Agent Orchestration
 
-`rules/common/agents.md` is the canonical delegation policy; this section restates it.
+`rules/common/agents.md` is the canonical delegation policy; this section restates it and governs
+every "use the X agent" step elsewhere in this document, however absolutely that step is phrased.
 
 This catalog describes available roles; it does not automatically spawn an agent, and no runtime
 spawns one on its own. Delegate only when the runtime exposes the required tool and higher-priority

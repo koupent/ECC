@@ -46,7 +46,9 @@ Bu, yazılım geliştirme için 28 özel agent, 116 skill, 59 command ve otomati
 
 ## Agent Orkestrasyonu
 
-Kanonik devretme politikası `rules/common/agents.md` dosyasıdır; bu bölüm onu yeniden ifade eder.
+Kanonik devretme politikası `rules/common/agents.md` dosyasıdır; bu bölüm onu yeniden ifade eder
+ve bu belgenin başka yerlerindeki her "X agent'ını kullan" adımını, ifadesi ne kadar kesin olursa
+olsun yönetir.
 
 Bu katalog mevcut rolleri anlatır; bir agent'ı otomatik olarak başlatmaz ve hiçbir runtime
 kendiliğinden başlatmaz. Yalnızca runtime gerekli aracı sunduğunda ve sistem, runtime veya

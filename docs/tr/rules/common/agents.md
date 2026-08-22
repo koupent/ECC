@@ -21,6 +21,10 @@
 
 Kanonik devretme politikası `rules/common/agents.md` dosyasıdır; bu belge onun çevirisidir.
 
+**Kapsam.** Bu politika, bu paketteki diğer tüm kural belgelerinde geçen her "X agent'ını kullan"
+adımını, ifadesi ne kadar kesin olursa olsun yönetir. Bu adımların her birini "bu politika izin
+verdiğinde devret" biçiminde okuyun.
+
 **Mekanizma.** Bu kural devretmenin ne zaman yararlı olduğunu anlatır; bir agent'ı otomatik olarak
 başlatmaz ve hiçbir runtime kendiliğinden bir agent başlatmaz. Bir agent yalnızca ana model mevcut
 Agent veya Task aracını çağırıp sonucunu topladığında çalışır.

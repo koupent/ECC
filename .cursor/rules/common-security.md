@@ -25,6 +25,10 @@ Before ANY commit:
 
 ## Security Response Protocol
 
+> The delegation step below follows the agent orchestration rule: delegate when a delegation tool
+> is available and higher-priority instructions permit it, and otherwise run the same review in
+> the parent context.
+
 If security issue found:
 1. STOP immediately
 2. Use **security-reviewer** agent

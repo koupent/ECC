@@ -18,7 +18,8 @@ This is a **Claude Code plugin** - a collection of production-ready agents, skil
 ## Agent Usage Policy
 
 `rules/common/agents.md` is the canonical delegation policy. `AGENTS.md`, the platform copies
-under `.cursor/` and `.opencode/`, and the translations under `docs/` restate it.
+under `.cursor/` and `.opencode/`, and the translations under `docs/` restate it. It governs
+every "use the X agent" step in every rule file, however absolutely that step is phrased.
 
 - Nothing here automatically spawns an agent. An agent runs only when the model invokes an
   available Agent or Task tool and collects its result.
