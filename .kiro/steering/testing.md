@@ -25,6 +25,10 @@ MANDATORY workflow:
 
 ## Troubleshooting Test Failures
 
+> The delegation step below follows the agent orchestration steering file (`agents.md`): delegate
+> when a delegation tool is available and higher-priority instructions permit it, and otherwise
+> work through the same steps in the parent context.
+
 1. Use **tdd-guide** agent
 2. Check test isolation
 3. Verify mocks are correct
@@ -32,4 +36,5 @@ MANDATORY workflow:
 
 ## Agent Support
 
-- **tdd-guide** - Use PROACTIVELY for new features, enforces write-tests-first
+- **tdd-guide** - Consider it for new features whenever `agents.md` permits delegation; it enforces
+  write-tests-first

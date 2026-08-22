@@ -1,12 +1,14 @@
 ---
-description: "Agent orchestration: available agents, parallel execution, multi-perspective analysis"
-alwaysApply: true
+inclusion: auto
+name: agents
+description: Agent delegation policy for Kiro: mechanism, expectation, precedence, and the fallback when delegation is unavailable.
 ---
+
 # Agent Orchestration
 
 ## Available Agents
 
-Located in `~/.claude/agents/`:
+Located in `.kiro/agents/` (Markdown for the IDE, JSON for the CLI):
 
 | Agent | Purpose | When to Use |
 |-------|---------|-------------|
@@ -22,11 +24,11 @@ Located in `~/.claude/agents/`:
 
 ## Agent Usage Policy
 
-`rules/common/agents.md` is the canonical delegation policy; this file restates it for Cursor.
+`rules/common/agents.md` is the canonical delegation policy; this steering file restates it for Kiro.
 
-**Scope.** This policy governs every "use the X agent" step in every other Cursor rule of this
-pack, regardless of how absolutely that step is phrased. Read each such step as "delegate when
-this policy permits delegation".
+**Scope.** This policy governs every "use the X agent" step in every other steering file, hook, and
+skill of this pack, regardless of how absolutely that step is phrased. Read each such step as
+"delegate when this policy permits delegation".
 
 **Mechanism.** This rule describes when delegation is useful; it does not automatically spawn an
 agent, and no runtime spawns one on its own. An agent runs only when the parent model invokes an
@@ -41,42 +43,38 @@ always take precedence over this rule. When the harness restricts delegation —
 tells you which perspectives to cover, not that you may override the restriction.
 
 When delegation tools are available and higher-priority instructions permit their use:
+
 1. Complex feature requests - Consider the **planner** agent
 2. Code just written/modified - Consider the **code-reviewer** agent
 3. Bug fix or new feature - Consider the **tdd-guide** agent
 4. Architectural decision - Consider the **architect** agent
 
 When delegation is unavailable or prohibited, keep the work in the parent context and apply the
-same planning, testing, and review checklists directly. Never claim that an agent ran when no
-tool invocation and result collection occurred.
+same planning, testing, and review checklists directly. Never claim that an agent ran when no tool
+invocation and result collection occurred.
 
-## Parallel Task Execution
+## Delegation Completion Contract
 
-Use parallel Task execution for genuinely independent operations only when the runtime permits
-delegation and the parent can collect every result before ending its turn. Fire-and-forget
-delegation is forbidden:
+Applies to every agent at every depth (parent, child, grandchild):
 
-```markdown
-# GOOD: Parallel execution
-Launch 3 agents in parallel:
-1. Agent 1: Security analysis of auth module
-2. Agent 2: Performance review of cache system
-3. Agent 3: Type checking of utilities
-
-# BAD: Sequential when unnecessary
-First agent 1, then agent 2, then agent 3
-```
+1. **Your final message IS the deliverable.** Never end your turn with "waiting for background
+   agents" — a spawned task is not a completed task.
+2. **If you delegate, you own collection.** Wait for results, integrate them, then return.
+   Fire-and-forget delegation is forbidden.
+3. **Decompose only when the work cannot fit in one context.** Do not re-delegate a task already
+   sized for a single agent.
 
 ## Multi-Perspective Analysis
 
-For complex problems, consider split role sub-agents when delegation is permitted and the
+For complex problems, consider split-role sub-agents when delegation is permitted and the
 perspectives are genuinely independent:
+
 - Factual reviewer
 - Senior engineer
 - Security expert
 - Consistency reviewer
 - Redundancy checker
 
-When delegation is unavailable, run the same perspectives as separate passes in the parent
-context. The perspective is what catches defects a diff-scoped review misses, such as a wrong
-step order in a procedure whose diff touches a single line; the agent is only the vehicle.
+When delegation is unavailable, run the same perspectives as separate passes in the parent context.
+The perspective is what catches defects a diff-scoped review misses, such as a wrong step order in
+a procedure whose diff touches a single line; the agent is only the vehicle.

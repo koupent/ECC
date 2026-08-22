@@ -6,6 +6,10 @@ The Feature Implementation Workflow describes the development pipeline: research
 
 ## Feature Implementation Workflow
 
+> Every "use the X agent" step below follows [agents.md](./agents.md): delegate when a delegation
+> tool is available and higher-priority instructions permit it, and otherwise carry out the same
+> step in the parent context.
+
 0. **Research & Reuse** _(mandatory before any new implementation)_
    - **GitHub code search first:** Run `gh search repos` and `gh search code` to find existing implementations, templates, and patterns before writing anything new.
    - **Library docs second:** Use Context7 or primary vendor docs to confirm API behavior, package usage, and version-specific details before implementing.

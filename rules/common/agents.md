@@ -20,9 +20,26 @@ Located in `~/.claude/agents/`:
 
 ## Agent Usage Policy
 
-This rule describes when delegation is useful; it does not automatically spawn an agent.
-The parent model must invoke the available Agent or Task tool. Higher-priority system,
-runtime, organization, and user instructions always take precedence over this rule.
+This file is the canonical delegation policy. `AGENTS.md`, the platform copies
+(`.cursor/rules/common-agents.md`, `.opencode/instructions/INSTRUCTIONS.md`,
+`.kiro/steering/agents.md`), and the translations under `docs/` restate it and must stay
+semantically identical to it.
+
+**Scope.** This policy governs every "use the X agent" step in every other rule file of this
+pack — including its platform copies and translations — regardless of how absolutely that step
+is phrased. Read each such step as "delegate when this policy permits delegation".
+
+**Mechanism.** This rule describes when delegation is useful; it does not automatically spawn an
+agent, and no runtime spawns one on its own. An agent runs only when the parent model invokes an
+available Agent or Task tool and collects the result.
+
+**Expectation.** When such a tool is available and higher-priority instructions permit it, judge
+for yourself whether to delegate. A separate request from the user is not required.
+
+**Precedence.** Higher-priority system, runtime or harness, organization, and user instructions
+always take precedence over this rule. When the harness restricts delegation — for example
+"do not call the Agent tool unless the user requested it" — follow the harness. This rule then
+tells you which perspectives to cover, not that you may override the restriction.
 
 When delegation tools are available and higher-priority instructions permit their use:
 1. Complex feature requests - Consider the **planner** agent
@@ -70,3 +87,7 @@ perspectives are genuinely independent:
 - Security expert
 - Consistency reviewer
 - Redundancy checker
+
+When delegation is unavailable, run the same perspectives as separate passes in the parent
+context. The perspective is what catches defects a diff-scoped review misses, such as a wrong
+step order in a procedure whose diff touches a single line; the agent is only the vehicle.

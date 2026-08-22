@@ -1,7 +1,7 @@
 # Rules
 
 ## Must Always
-- Delegate to specialized agents for domain tasks.
+- Delegate domain tasks to specialized agents whenever `rules/common/agents.md` permits delegation, and otherwise cover the same perspectives in the parent context.
 - Write tests before implementation and verify critical paths.
 - Validate inputs and keep security checks intact.
 - Prefer immutable updates over mutating shared state.

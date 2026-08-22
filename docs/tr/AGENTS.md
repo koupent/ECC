@@ -6,7 +6,7 @@ Bu, yazılım geliştirme için 28 özel agent, 116 skill, 59 command ve otomati
 
 ## Temel İlkeler
 
-1. **Agent-Öncelikli** — Alan görevleri için özel agentlara delege edin
+1. **Agent-Farkında** — Yalnızca runtime ve daha yüksek öncelikli talimatlar izin verdiğinde devredin
 2. **Test-Odaklı** — Uygulamadan önce testler yazın, %80+ kapsama gereklidir
 3. **Güvenlik-Öncelikli** — Güvenlikten asla taviz vermeyin; tüm girdileri doğrulayın
 4. **Değişmezlik** — Her zaman yeni nesneler oluşturun, mevcut olanları asla değiştirmeyin
@@ -46,7 +46,18 @@ Bu, yazılım geliştirme için 28 özel agent, 116 skill, 59 command ve otomati
 
 ## Agent Orkestrasyonu
 
-Agentları kullanıcı istemi olmadan proaktif olarak kullanın:
+Kanonik devretme politikası `rules/common/agents.md` dosyasıdır; bu bölüm onu yeniden ifade eder
+ve bu belgenin başka yerlerindeki her "X agent'ını kullan" adımını, ifadesi ne kadar kesin olursa
+olsun yönetir.
+
+Bu katalog mevcut rolleri anlatır; bir agent'ı otomatik olarak başlatmaz ve hiçbir runtime
+kendiliğinden başlatmaz. Yalnızca runtime gerekli aracı sunduğunda ve sistem, runtime veya
+harness, organizasyon, proje ya da kullanıcı talimatları izin verdiğinde devredin; bu sınırlar
+içinde, istenmesini beklemeden devredip devretmeyeceğine kendin karar ver. Harness devretmeyi
+kısıtlıyorsa harness'a uyun ve aynı planlama, test ve inceleme kontrol listesini ana bağlamda
+uygulayın. Aracı çağırmadan ve sonucu toplamadan bir agent'ın çalıştığını asla iddia etmeyin.
+
+Devretmeye izin verildiğinde, sınırları gerçekten belirli işler için ilgili uzmanı değerlendirin:
 - Karmaşık özellik istekleri → **planner**
 - Yeni yazılan/değiştirilen kod → **code-reviewer**
 - Hata düzeltme veya yeni özellik → **tdd-guide**
@@ -56,7 +67,9 @@ Agentları kullanıcı istemi olmadan proaktif olarak kullanın:
 - Otonom döngüler / döngü izleme → **loop-operator**
 - Harness yapılandırma güvenilirliği ve maliyeti → **harness-optimizer**
 
-Bağımsız işlemler için paralel yürütme kullanın — birden fazla agenti aynı anda başlatın.
+Paralel yürütmeyi bağımsız işlemler için yalnızca runtime devretmeye izin verdiğinde ve ana model
+turunu bitirmeden önce tüm sonuçları toplayabildiğinde kullanın. Sonucu toplanmayan devretme
+yasaktır.
 
 ## Güvenlik Kuralları
 
