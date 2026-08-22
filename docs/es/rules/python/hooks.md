@@ -11,7 +11,7 @@ paths:
 
 Configurar en `~/.claude/settings.json`:
 
-- **black/ruff**: Auto-formatear archivos `.py` después de editar
+- **Formateador configurado**: Auto-formatear archivos `.py` después de editar con la herramienta elegida por el proyecto
 - **mypy/pyright**: Ejecutar verificación de tipos después de editar archivos `.py`
 
 ## Advertencias

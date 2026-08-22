@@ -34,9 +34,9 @@ class Point(NamedTuple):
 
 ## 格式化
 
-* 使用 **black** 进行代码格式化
-* 使用 **isort** 进行导入排序
-* 使用 **ruff** 进行代码检查
+* 使用项目配置中选定的格式化、导入排序和检查工具
+* Ruff-only 项目使用 `ruff format` 和 `ruff check`，不得要求 black 或 isort
+* 不得添加或运行项目未采用的第二套工具
 
 ## 参考
 
