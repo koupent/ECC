@@ -2,6 +2,7 @@
 'use strict';
 
 const { spawnSync } = require('child_process');
+const fs = require('fs');
 const path = require('path');
 const { loadConfig } = require('../codex/config');
 const { deliveryWorkspace, readState, recordIncident, resolveSessionId, writeState } = require('../codex/runtime-state');
@@ -28,6 +29,36 @@ const GIT_READ_ONLY_FORMS = new Map([
   ['tag', new Set(['', '-l', '--list', '-n'])],
   ['worktree', new Set(['list', '--porcelain'])]
 ]);
+// 読み取りsubcommandでも、引数次第でファイルを作り、外部programを起動する
+// （`git diff --output=<path>`、`--ext-diff`、`--textconv`、`git grep -O`）。共有ツリーで
+// 通すのは、副作用がないと確認できたoptionだけにするfail-close。値だけの引数（revision、
+// pathspec、message）はそれ自体では何も書かない。
+const GIT_READ_SAFE_OPTIONS = new Set([
+  '--', '--abbrev', '--abbrev-commit', '--after', '--all', '--all-match', '--author',
+  '--author-date-order', '--before', '--boundary', '--branch', '--branches', '--cached', '--cc',
+  '--color', '--committer', '--contains', '--count', '--date', '--date-order', '--decorate',
+  '--deleted', '--diff-algorithm', '--diff-filter', '--dirstat', '--dst-prefix', '--error-unmatch',
+  '--exclude', '--exclude-standard', '--exit-code', '--extended-regexp', '--find-copies',
+  '--find-copies-harder', '--find-renames', '--first-parent', '--fixed-strings', '--follow',
+  '--format', '--full-history', '--full-index', '--full-name', '--git-common-dir', '--git-dir',
+  '--graph', '--grep', '--heads', '--histogram', '--ignore-all-space', '--ignore-blank-lines',
+  '--ignore-case', '--ignore-cr-at-eol', '--ignore-space-at-eol', '--ignore-space-change',
+  '--ignore-submodules', '--ignored', '--indent-heuristic', '--is-inside-git-dir',
+  '--is-inside-work-tree', '--left-right', '--line-number', '--list', '--long', '--max-count',
+  '--max-parents', '--merge-base', '--merges', '--min-parents', '--minimal', '--modified',
+  '--name-only', '--name-status', '--numstat', '--oneline', '--others', '--parents', '--patch',
+  '--patience', '--perl-regexp', '--points-at', '--porcelain', '--pretty', '--quiet', '--raw',
+  '--recurse-submodules', '--refs', '--relative', '--remotes', '--reverse', '--short',
+  '--shortstat', '--show-cdup', '--show-current', '--show-prefix', '--show-toplevel', '--since',
+  '--skip', '--sort', '--src-prefix', '--stage', '--staged', '--stat', '--stdin', '--summary',
+  '--symbolic', '--symbolic-full-name', '--tags', '--topo-order', '--unified', '--until',
+  '--verbose', '--verify', '--word-diff'
+]);
+// `--no-…` はいずれも機能を止める向きで、ファイルを作らない。
+const GIT_READ_SAFE_NEGATION = /^--no-[a-z][a-z0-9-]*$/;
+// 短いoptionは、ファイルを作らず外部programも起動しないものだけを認める。pagerやeditorを
+// 起動する `git grep -O` のような形は列挙しない。
+const GIT_READ_SAFE_SHORT = /^-(?:\d+|[abcdefhilmnpqrstuvwxz]|[CEFGLMPSUW])\S*$/;
 // gitの作業ツリーやgit dirを実行directoryから引き剥がすglobal option。どのツリーを
 // 書き換えるかコマンド文字列からは追えない。
 const GIT_UNTRACEABLE_OPTIONS = new Set(['--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env']);
@@ -53,8 +84,6 @@ const WORKTREE_AWARE_TOOL = /(?:^|[\\/])scripts[\\/]codex[\\/](?:acceptance-audi
 // 展開してからでないと中身が決まらない記法。
 const UNTRACEABLE_EXPANSION = /\$\(|\$\{|`|<\(|>\(/;
 const SEGMENT_SEPARATORS = ';&|\n\r';
-// 引用されていない先頭のリダイレクト演算子。`2>`、`&>`、`>>`、`<` を含む。
-const REDIRECTION = /^(?:\d+|&)?(>>|>|<)(.*)$/;
 // 共有ツリーへ書き込みうるtool。MultiEditのように編集ごとにpathを持つ形もあるため、
 // トップレベルのfile_pathだけを見ない。
 const WRITE_TOOLS = new Set(['Edit', 'MultiEdit', 'NotebookEdit', 'Write']);
@@ -141,6 +170,46 @@ function isInside(root, target) {
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
 }
 
+// 存在する最長の親までrealpathで正規化し、残りを繋ぎ直す。まだ無いファイルへの書き込みも、
+// 途中のsymlinkを解決した実体で判定できる。
+function realPath(target) {
+  const absolute = path.resolve(String(target || ''));
+  let current = absolute;
+  const suffix = [];
+  for (let depth = 0; depth < 64; depth += 1) {
+    try {
+      const real = fs.realpathSync(current);
+      return suffix.length > 0 ? path.join(real, ...suffix) : real;
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return absolute;
+      suffix.unshift(path.basename(current));
+      current = parent;
+    }
+  }
+  return absolute;
+}
+
+// worktreeの中のsymlinkが共有ツリーを指していると、字面のpathだけではworktreeの中に
+// 見える。書き込み先は字面と実体の両方で判定し、どちらかが共有ツリーへ抜けるなら拒否する。
+function escapesWorktree(workspace, shared, target) {
+  const sharedRoots = [path.resolve(shared), realPath(shared)];
+  const workspaceRoots = [path.resolve(workspace), realPath(workspace)];
+  return [path.resolve(target), realPath(target)].some(
+    candidate =>
+      sharedRoots.some(root => isInside(root, candidate)) &&
+      !workspaceRoots.some(root => isInside(root, candidate))
+  );
+}
+
+// commandが走るdirectoryをworktreeの中だと言い切れるか。symlinkで外へ抜ける経路は
+// worktreeの中とは見なさない。
+function confinedToWorktree(workspace, target) {
+  if (!target) return false;
+  const roots = [path.resolve(workspace), realPath(workspace)];
+  return [path.resolve(target), realPath(target)].every(candidate => roots.some(root => isInside(root, candidate)));
+}
+
 // commandをshellの区切り文字で分ける。引用符の中の区切り文字はコマンド境界ではない。
 // 各segmentには後続の区切り演算子を添える。`&&` と `||` は `&` `|` と意味が違い、
 // 直前のcommandが成功したかどうかで次のcommandの実行directoryが変わる。
@@ -178,15 +247,19 @@ function splitSegments(command) {
   return splitCommand(command).map(segment => segment.text);
 }
 
-// tokenの先頭が引用されていたかまで持ち帰る。`git commit -m ">note"` の `>` は
-// リダイレクトではなく引数であり、両者を取り違えると判定が狂う。
+// tokenを、文字ごとに引用されていたかどうかと一緒に持ち帰る。`git commit -m ">note"` の
+// `>` はリダイレクトではなく引数であり、両者を取り違えると判定が狂う。
 function tokenizeParts(segment) {
   const parts = [];
   let current = null;
   let quote = null;
+  const start = () => {
+    if (current === null) current = { value: '', quoted: [] };
+  };
   const append = (character, quoted) => {
-    if (current === null) current = { value: character, quotedStart: quoted };
-    else current.value += character;
+    start();
+    current.value += character;
+    current.quoted.push(quoted);
   };
   for (const character of String(segment || '')) {
     if (quote) {
@@ -196,7 +269,7 @@ function tokenizeParts(segment) {
     }
     if (character === '"' || character === "'") {
       quote = character;
-      if (current === null) current = { value: '', quotedStart: true };
+      start();
       continue;
     }
     if (/\s/.test(character)) {
@@ -214,29 +287,72 @@ function tokenize(segment) {
   return tokenizeParts(segment).map(part => part.value);
 }
 
+// 一つのtokenを、commandの語とリダイレクトに分ける。shellは `marker>src/x` の `>` も
+// リダイレクトとして解釈するので、演算子はtokenの先頭だけでなく途中でも探す。
+// `2>` と `&>` の前置きはfd指定であって語ではない。
+function splitRedirectionParts(part) {
+  const value = String(part && part.value || '');
+  const quoted = (part && part.quoted) || [];
+  const items = [];
+  let buffer = '';
+  let pending = null;
+  const flush = () => {
+    if (pending) items.push({ operator: pending, target: buffer });
+    else if (buffer) items.push({ word: buffer });
+    pending = null;
+    buffer = '';
+  };
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (!quoted[index] && (character === '>' || character === '<')) {
+      let operator = character;
+      if (!quoted[index + 1] && value[index + 1] === character) {
+        operator += character;
+        index += 1;
+      }
+      if (!pending && (/^\d+$/.test(buffer) || buffer === '&')) buffer = '';
+      flush();
+      pending = operator;
+      continue;
+    }
+    buffer += character;
+  }
+  flush();
+  return items;
+}
+
 // リダイレクトはcommandの種類に関わらずファイルを作る。`git status > src/x` のように
 // 読み取りcommandでも共有ツリーへ書けるので、書き込み先だけを取り出して別に検査する。
 function scanRedirections(parts) {
   const tokens = [];
   const writes = [];
-  for (let index = 0; index < parts.length; index += 1) {
-    const part = parts[index];
-    const match = part.quotedStart ? null : REDIRECTION.exec(part.value);
-    if (!match) {
-      tokens.push(part.value);
-      continue;
+  // 書き込み演算子のtargetが次の語にある状態。読み取れないまま終わったら空文字を
+  // 書き込み先として残し、呼び出し側でfail-closeさせる。
+  let awaiting = false;
+  for (const part of parts) {
+    for (const item of splitRedirectionParts(part)) {
+      if (item.operator) {
+        if (awaiting) writes.push('');
+        const write = item.operator === '>' || item.operator === '>>';
+        awaiting = false;
+        // 入力リダイレクトは読み取りで、`>&2` のようなfd複製はファイルを作らない。
+        if (!write) continue;
+        if (item.target) {
+          if (!item.target.startsWith('&')) writes.push(item.target);
+          continue;
+        }
+        awaiting = true;
+        continue;
+      }
+      if (awaiting) {
+        awaiting = false;
+        if (!item.word.startsWith('&')) writes.push(item.word);
+        continue;
+      }
+      tokens.push(item.word);
     }
-    const [, operator, attached] = match;
-    let target = attached;
-    if (!target) {
-      const next = parts[index + 1];
-      target = next ? next.value : '';
-      index += 1;
-    }
-    // 入力リダイレクトは読み取りで、`>&2` のようなfd複製はファイルを作らない。
-    if (operator === '<' || target.startsWith('&')) continue;
-    writes.push(target);
   }
+  if (awaiting) writes.push('');
   return { tokens, writes };
 }
 
@@ -262,9 +378,19 @@ function isWorktreeAwareTool(name, tokens) {
   return name === 'node' && WORKTREE_AWARE_TOOL.test(String(tokens[1] || ''));
 }
 
+// revisionやpathspecのようなoperandは、それ自体ではファイルを作らない。optionは
+// 副作用がないと確認できた形だけを認める。
+function isReadOnlyGitArgument(argument) {
+  const value = String(argument || '');
+  if (!value.startsWith('-')) return true;
+  const name = value.split('=')[0];
+  if (GIT_READ_SAFE_OPTIONS.has(name) || GIT_READ_SAFE_NEGATION.test(name)) return true;
+  return GIT_READ_SAFE_SHORT.test(value);
+}
+
 function isReadOnlyGit(subcommand, args) {
   if (!subcommand) return false;
-  if (GIT_READ_SUBCOMMANDS.has(subcommand)) return true;
+  if (GIT_READ_SUBCOMMANDS.has(subcommand)) return args.every(isReadOnlyGitArgument);
   const forms = GIT_READ_ONLY_FORMS.get(subcommand);
   if (!forms) return false;
   return args.length === 0 ? forms.has('') : args.every(arg => forms.has(arg));
@@ -274,6 +400,7 @@ function isReadOnlyGit(subcommand, args) {
 // 混じった書き込みはlocationをnullにして、呼び出し側でfail-closeさせる。
 function gitInvocation(args, cwd) {
   let location = cwd;
+  let configOverride = false;
   let index = 0;
   while (index < args.length && args[index].startsWith('-')) {
     const arg = args[index];
@@ -289,13 +416,17 @@ function gitInvocation(args, cwd) {
       continue;
     }
     // `-c core.worktree=...` はgitの書き込み先を実行directoryから引き剥がせる。
+    // `-c diff.external=...` のような指定は、読み取りsubcommandでも任意のprogramを
+    // 走らせるので、読み取り扱いをやめてworktreeの中だけで通す。
     if (arg === '-c' || arg === '--config-env') {
       if (/^core\./i.test(String(args[index + 1] || ''))) location = null;
+      configOverride = true;
       index += 2;
       continue;
     }
     if (arg.startsWith('-c') && arg.length > 2) {
       if (/^core\./i.test(arg.slice(2))) location = null;
+      configOverride = true;
       index += 1;
       continue;
     }
@@ -308,7 +439,7 @@ function gitInvocation(args, cwd) {
   }
   const subcommand = args[index];
   const rest = args.slice(index + 1);
-  if (isReadOnlyGit(subcommand, rest)) return { write: false, location };
+  if (!configOverride && isReadOnlyGit(subcommand, rest)) return { write: false, location };
   // subcommandより前の引数に展開が残っていると、どのツリーを書き換えるか決まらない。
   // subcommand以降はcommit messageなどが入るため、実行directoryの判定には使わない。
   if (args.slice(0, index + 1).some(arg => /[$`]/.test(arg))) return { write: true, location: null };
@@ -333,7 +464,7 @@ function targetsWorkspace(command, workspace, cwd = process.cwd()) {
       const resolved = resolveDirectory(current, target);
       // 書き込み先を読み取れない形と、worktreeの外にある共有ツリーのファイルを拒否する。
       if (!resolved) return false;
-      if (isInside(shared, resolved) && !isInside(workspace, resolved)) return false;
+      if (escapesWorktree(workspace, shared, resolved)) return false;
     }
     while (tokens.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) {
       // GIT_DIR や GIT_WORK_TREE はgit自身の書き込み先を差し替える。
@@ -356,10 +487,10 @@ function targetsWorkspace(command, workspace, cwd = process.cwd()) {
       continue;
     }
     if (COMMAND_WRAPPERS.has(name)) return false;
-    const inWorktree = Boolean(current) && isInside(workspace, current);
+    const inWorktree = confinedToWorktree(workspace, current);
     if (name === 'git') {
       const { write, location } = gitInvocation(tokens.slice(1), current);
-      if (write && !(location && isInside(workspace, location))) return false;
+      if (write && !confinedToWorktree(workspace, location)) return false;
       continue;
     }
     // git以外のcommandも共有ツリーのファイルを書き換える。worktreeの中で走ることが
@@ -369,15 +500,49 @@ function targetsWorkspace(command, workspace, cwd = process.cwd()) {
   return true;
 }
 
+// 切り詰められた入力からでも、Deliveryを引くためのsession idだけは拾える。hookの入力は
+// tool_inputより前にsession_idを置くため、先頭側に残っている。
+function sessionIdFromRaw(rawInput) {
+  const match = /"session_?[iI]d"\s*:\s*"([^"\\]{1,200})"/.exec(String(rawInput || ''));
+  return match ? match[1] : '';
+}
+
+// 共通runnerは1 MiBを超えるtool入力を切り詰め、pass-throughはfail-openする。切り詰められた
+// 入力からはtool名も書き込み先も読み取れず、そのcommandが共有ツリーを変更しないと
+// 言い切れない。隔離中のDeliveryを抱えたprojectでは、ここをfail-closeさせる。
+function truncatedDecision(rawInput, options, env) {
+  const cwd = options.cwd || env.CLAUDE_PROJECT_DIR || process.cwd();
+  let config;
+  try {
+    config = loadConfig(cwd, env);
+  } catch {
+    config = null;
+  }
+  if (!config || config.deliveryWorkflow !== 'required') return rawInput;
+  const reason =
+    `[ECC Delivery Gate] The hook payload exceeded ${options.maxStdin || 1024 * 1024} bytes and was truncated, ` +
+    'so this gate cannot read the tool call or its write targets while a delivery worktree is in effect. ' +
+    'Refusing to fall back to pass-through. Retry with a smaller payload, ' +
+    'for example by writing the content inside the delivery worktree in smaller pieces.';
+  const sessionId = sessionIdFromRaw(rawInput) || env.CLAUDE_SESSION_ID || env.ECC_SESSION_ID || '';
+  // どのDeliveryの入力かを特定できないまま素通しすると、隔離の判定そのものが消える。
+  if (!sessionId) return deny(reason);
+  const state = readState({ session_id: sessionId }, env);
+  if (!state.delivery) return rawInput;
+  if (state.delivery.status === 'draft-pr' || state.delivery.status === 'merged') return rawInput;
+  return deny(reason);
+}
+
 function run(rawInput, options = {}) {
+  const env = options.env || process.env;
+  if (options.truncated) return truncatedDecision(rawInput, options, env);
   let input;
   try {
     input = typeof rawInput === 'string' ? JSON.parse(rawInput) : rawInput;
   } catch {
     return rawInput;
   }
-  const env = options.env || process.env;
-  const cwd = options.cwd || input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  const cwd = options.cwd || input.cwd || env.CLAUDE_PROJECT_DIR || process.cwd();
   const config = loadConfig(cwd, env);
   if (config.deliveryWorkflow !== 'required') return rawInput;
 
@@ -487,11 +652,18 @@ function run(rawInput, options = {}) {
             'Reissue the edit with an explicit absolute path inside that worktree.'
         );
       }
-      const outside = targets.find(target => isInside(shared, target) && !isInside(workspace, target));
+      const outside = targets.find(target => escapesWorktree(workspace, shared, target));
       if (outside) {
+        // symlinkで抜ける経路は、共有ツリーからの相対pathに置き換えられない。その場合は
+        // 具体的な代替pathを示さず、worktreeの中で書き直させる。
+        const relative = path.relative(shared, outside);
+        const inShared = relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
         return deny(
           `[ECC Delivery Gate] Issue #${state.delivery.issue_number} is checked out in the delivery worktree ${workspace}. ` +
-            `Edit ${path.join(workspace, path.relative(shared, outside))} instead; the shared working tree keeps its own branch and uncommitted changes.`
+            (inShared
+              ? `Edit ${path.join(workspace, relative)} instead`
+              : `${outside} resolves outside that worktree, so write inside ${workspace} instead`) +
+            '; the shared working tree keeps its own branch and uncommitted changes.'
         );
       }
     }
@@ -530,10 +702,22 @@ function run(rawInput, options = {}) {
 }
 
 if (require.main === module) {
+  // 子processとして起動された場合、切り詰めは親のrunnerが済ませている。自分でも上限を
+  // 持ち、どちらで切れてもrun()へtruncatedを伝える。
+  const maxStdin = Number(process.env.ECC_HOOK_INPUT_MAX_BYTES) || 1024 * 1024;
+  let truncated = /^(1|true|yes)$/i.test(String(process.env.ECC_HOOK_INPUT_TRUNCATED || ''));
   let raw = '';
   process.stdin.setEncoding('utf8');
-  process.stdin.on('data', chunk => { raw += chunk; });
-  process.stdin.on('end', () => process.stdout.write(run(raw)));
+  process.stdin.on('data', chunk => {
+    if (raw.length < maxStdin) {
+      const remaining = maxStdin - raw.length;
+      raw += chunk.substring(0, remaining);
+      if (chunk.length > remaining) truncated = true;
+    } else {
+      truncated = true;
+    }
+  });
+  process.stdin.on('end', () => process.stdout.write(run(raw, { truncated, maxStdin })));
 }
 
 module.exports = {

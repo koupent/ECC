@@ -657,6 +657,103 @@ test('preparation issues an Issue worktree instead of switching the shared worki
   }
 });
 
+test('isolation holds against attached redirections, writing Git arguments, and symlink escapes', () => {
+  const fixture = createGitFixture('delivery-escape-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  const baseBranch = spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  const branch = 'codex/issue-79-escape-paths';
+  const worktreePath = path.join(temp, 'delivery-escape-worktree');
+  assert.strictEqual(
+    spawnSync('git', ['worktree', 'add', '--quiet', '-b', branch, worktreePath], { cwd: fixture }).status,
+    0
+  );
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-escape-state') };
+  const input = { session_id: 'delivery-escape', cwd: fixture };
+  writeState(input, {
+    delivery: {
+      status: 'ready',
+      request_hash: 'escape-fixture',
+      title: 'the gate must not be talked out of the worktree',
+      base_branch: baseBranch,
+      issue_number: 79,
+      issue_url: 'https://example.invalid/issues/79',
+      branch,
+      worktree_path: worktreePath,
+      worktree_shared: false,
+      draft_pr_url: null
+    }
+  }, fixtureEnv);
+
+  const denyBash = command => {
+    const payload = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command } });
+    const decision = JSON.parse(deliveryGate.run(payload, { cwd: fixture, env: fixtureEnv }));
+    assert.strictEqual(decision.hookSpecificOutput.permissionDecision, 'deny', command);
+  };
+  const allowBash = command => {
+    const payload = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command } });
+    assert.strictEqual(deliveryGate.run(payload, { cwd: fixture, env: fixtureEnv }), payload, command);
+  };
+
+  // リダイレクト演算子はtokenの先頭に限らない。shellは `word>file` も出力先として解釈する。
+  for (const command of [
+    'echo payload marker>src/product.ts',
+    'echo payload marker>>src/product.ts',
+    'echo payload 2>src/product.ts',
+    'echo payload>"src/product.ts"',
+    'git status --porcelain>src/status.txt'
+  ]) denyBash(command);
+
+  // 読み取り扱いのsubcommandでも、引数次第でファイルを書き、外部programを起動する。
+  for (const command of [
+    'git diff --output=src/product.ts',
+    'git diff --output src/product.ts',
+    'git log --output=src/product.ts',
+    'git grep -O./evil pattern',
+    'git diff --ext-diff',
+    'git -c diff.external=./evil diff'
+  ]) denyBash(command);
+
+  // 引用された `>` は引数であり、共有ツリーの読み取りとworktreeの中の書き込みは通り続ける。
+  allowBash('git status --porcelain');
+  allowBash('git log --oneline -5');
+  allowBash('git diff --stat HEAD -- src/product.ts');
+  allowBash(`git -C "${worktreePath}" commit -m "note > file"`);
+  allowBash(`cd "${worktreePath}" && git diff --output=report.diff`);
+
+  // worktreeの中のsymlinkが共有ツリーを指す場合、字面のpathだけではworktreeの中に見える。
+  const linkPath = path.join(worktreePath, 'linked-shared');
+  let symlinked = true;
+  try {
+    fs.symlinkSync(fixture, linkPath, process.platform === 'win32' ? 'junction' : 'dir');
+  } catch {
+    // symlinkを作れない環境ではこの経路自体が存在しない。
+    symlinked = false;
+  }
+  if (symlinked) {
+    denyBash(`cd "${worktreePath}" && echo bypass > linked-shared/src/product.ts`);
+    denyBash(`cd "${linkPath}" && git commit -am "fix"`);
+    const linkedEdit = JSON.stringify({
+      ...input,
+      tool_name: 'Edit',
+      tool_input: { file_path: path.join(linkPath, 'src', 'product.ts') }
+    });
+    const deniedLink = JSON.parse(deliveryGate.run(linkedEdit, { cwd: fixture, env: fixtureEnv }));
+    assert.strictEqual(deniedLink.hookSpecificOutput.permissionDecision, 'deny');
+    assert.match(deniedLink.hookSpecificOutput.permissionDecisionReason, /delivery worktree/);
+  }
+  // worktreeの実体そのものへの編集は通り続ける。
+  const worktreeEdit = JSON.stringify({
+    ...input,
+    tool_name: 'Edit',
+    tool_input: { file_path: path.join(worktreePath, 'src', 'product.ts') }
+  });
+  assert.strictEqual(deliveryGate.run(worktreeEdit, { cwd: fixture, env: fixtureEnv }), worktreeEdit);
+});
+
 test('an existing linked worktree is reused, and the shared working tree is never adopted', () => {
   const executed = [];
   const runCommand = (binary, args) => {

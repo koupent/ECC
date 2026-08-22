@@ -10,8 +10,11 @@
 'use strict';
 
 const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { writeState } = require('../../scripts/codex/runtime-state');
 
 const repoRoot = path.join(__dirname, '..', '..');
 const runner = path.join(repoRoot, 'scripts', 'hooks', 'run-with-flags.js');
@@ -145,6 +148,69 @@ if (
     assert.strictEqual(result.status, 0);
     assert.strictEqual(result.stdout, payload);
     JSON.parse(result.stdout);
+  })
+)
+  passed++;
+else failed++;
+
+if (
+  test('the delivery isolation gate denies a truncated payload instead of failing open', () => {
+    // 隔離中のDeliveryでは、切り詰められた入力からtoolも書き込み先も読み取れない。
+    // runnerのpass-throughに任せると、Bash/Edit検査が判定なしで通過してしまう。
+    const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-truncated-delivery-'));
+    fs.mkdirSync(path.join(fixture, '.ecc'), { recursive: true });
+    fs.writeFileSync(
+      path.join(fixture, '.ecc', 'config.json'),
+      JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+      'utf8'
+    );
+    const hookEnv = {
+      CLAUDE_PLUGIN_ROOT: repoRoot,
+      CLAUDE_PROJECT_DIR: fixture,
+      ECC_DELIVERY_WORKFLOW: 'required',
+      ECC_DISABLED_HOOKS: '',
+      ECC_HOOK_PROFILE: 'standard',
+      ECC_KOUTE_STATE_DIR: path.join(fixture, 'state')
+    };
+    writeState({ session_id: 'truncated-delivery' }, {
+      delivery: {
+        status: 'ready',
+        issue_number: 79,
+        branch: 'codex/issue-79-truncated',
+        worktree_path: path.join(fixture, 'worktree')
+      }
+    }, { ...process.env, ...hookEnv });
+
+    const oversizedFor = sessionId => JSON.stringify({
+      session_id: sessionId,
+      cwd: fixture,
+      tool_name: 'Write',
+      tool_input: { file_path: path.join(fixture, 'src', 'product.ts'), content: 'x'.repeat(MAX_STDIN + 4096) }
+    });
+    const runGate = payload => spawnSync(
+      'node',
+      [runner, 'pre:edit-write:delivery-lifecycle', 'scripts/hooks/delivery-lifecycle-gate.js', 'standard,strict'],
+      {
+        input: payload,
+        encoding: 'utf8',
+        cwd: fixture,
+        env: { ...process.env, ...hookEnv },
+        timeout: 30000,
+        maxBuffer: 16 * 1024 * 1024,
+        stdio: ['pipe', 'pipe', 'pipe']
+      }
+    );
+
+    const blocked = runGate(oversizedFor('truncated-delivery'));
+    assert.strictEqual(blocked.status, 0, `expected exit 0, got ${blocked.status}: ${blocked.stderr}`);
+    const decision = JSON.parse(blocked.stdout);
+    assert.strictEqual(decision.hookSpecificOutput.permissionDecision, 'deny');
+    assert.match(decision.hookSpecificOutput.permissionDecisionReason, /truncated/);
+
+    // 進行中のDeliveryが無いsessionは、従来どおりpass-throughがfail-openする。
+    const idle = runGate(oversizedFor('truncated-delivery-idle'));
+    assert.strictEqual(idle.status, 0);
+    assert.strictEqual(idle.stdout, '', 'no active delivery keeps the fail-open pass-through');
   })
 )
   passed++;

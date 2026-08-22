@@ -60,14 +60,26 @@ when they would have run in the worktree:
 - Anything that can create or change a file while the gate cannot prove it runs in
   the worktree: `npm test`, `touch`, `rm`, `mv`, `sed -i`, `node script.js`, …
 - Output redirection into the shared tree, whatever the command is
-  (`git status > src/out.txt`, `echo x >> src/product.ts`), and a redirection target
-  the gate cannot resolve.
+  (`git status > src/out.txt`, `echo x >> src/product.ts`), including an operator
+  attached to the preceding word (`echo payload marker>src/product.ts`) or carrying a
+  file descriptor (`2>src/product.ts`), and a redirection target the gate cannot
+  resolve.
 - A `git` subcommand that is not on the read-only list counts as a write, so a
-  subcommand the gate does not know is never allowed against the shared tree.
+  subcommand the gate does not know is never allowed against the shared tree. A
+  read-only subcommand also counts as a write as soon as an argument can create a file
+  or start another program (`git diff --output=…`, `--ext-diff`, `git grep -O…`), so
+  only arguments that are known to be side-effect-free pass in the shared tree.
+- A path that stays inside the worktree only on paper: the gate resolves symbolic
+  links, so `cd "<worktree_path>" && echo x > link-to-shared/src/product.ts` and an
+  `Edit` of the same path are rejected.
 - Indirect invocations (`sh -c`, `eval`, `env`, `xargs`, `find -exec`, `sudo`, …),
   command substitution and `${...}` expansion.
-- `--git-dir`, `--work-tree`, `--namespace`, `-c core.*`, and any `GIT_*` variable in
+- `--git-dir`, `--work-tree`, `--namespace`, any `-c <key>=<value>` override (it can
+  point Git at another tree or at an external program), and any `GIT_*` variable in
   the command's environment prefix.
+- A tool call whose hook payload exceeds the 1 MiB limit and is truncated: the gate
+  cannot read the call, so it is denied instead of passed through. Reissue it in
+  smaller pieces.
 - A `cd` that is not chained to the command with `&&`, or that happens inside a
   subshell; `cd <worktree>; git ...` and `cd <worktree> || git ...` both run `git`
   in the shared tree when the `cd` fails.
