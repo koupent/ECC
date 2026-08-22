@@ -15,7 +15,7 @@
         "id": "pre:read-search:codex-context-gate"
       },
       {
-        "matcher": "Bash|Edit|Write|MultiEdit",
+        "matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit",
         "hooks": [
           {
             "type": "command",

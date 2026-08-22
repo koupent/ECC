@@ -31,15 +31,57 @@ const GIT_READ_ONLY_FORMS = new Map([
 // gitの作業ツリーやgit dirを実行directoryから引き剥がすglobal option。どのツリーを
 // 書き換えるかコマンド文字列からは追えない。
 const GIT_UNTRACEABLE_OPTIONS = new Set(['--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env']);
-// gitを間接的に起動できるcommand。実際に走るgitのdirectoryもsubcommandも追跡できない。
-const GIT_WRAPPERS = new Set([
+// 別のcommandを間接的に起動できるcommand。実際に走るcommandも、その実行directoryも
+// コマンド文字列からは追跡できない。
+const COMMAND_WRAPPERS = new Set([
   'bash', 'busybox', 'command', 'dash', 'doas', 'env', 'eval', 'exec', 'find', 'fish', 'ionice', 'ksh',
   'nice', 'nohup', 'parallel', 'script', 'setsid', 'sh', 'stdbuf', 'sudo', 'time', 'timeout',
   'watch', 'xargs', 'zsh'
 ]);
+// 共有ツリーのcwdでも通せるcommand。gitに限らずファイルを書き換えるcommandは共有ツリーを
+// 汚すため、副作用を持たない読み取りだけを列挙するfail-closeにする。引数次第で書き込む
+// `sed -i` や `awk`、任意のcodeを実行する `node` `python` は含めない。
+const READ_ONLY_COMMANDS = new Set([
+  'basename', 'cat', 'cksum', 'cmp', 'comm', 'cut', 'date', 'df', 'diff', 'dirname', 'du', 'echo',
+  'file', 'grep', 'head', 'hostname', 'id', 'jq', 'ls', 'md5sum', 'nl', 'printf', 'ps', 'pwd',
+  'readlink', 'realpath', 'rg', 'sha1sum', 'sha256sum', 'sort', 'stat', 'tail', 'tree', 'true',
+  'uname', 'uniq', 'wc', 'which', 'whoami'
+]);
+// ECC自身のcommandは記録済みのDeliveryからworktreeを解決して、そこだけを読み書きする。
+// 共有ツリーのcwdから起動されても共有ツリーを変更しないので、隔離中でも通す。
+const WORKTREE_AWARE_TOOL = /(?:^|[\\/])scripts[\\/]codex[\\/](?:acceptance-audit|delivery-lifecycle|doctor|record-event|reset|run-role)\.js$/i;
 // 展開してからでないと中身が決まらない記法。
 const UNTRACEABLE_EXPANSION = /\$\(|\$\{|`|<\(|>\(/;
 const SEGMENT_SEPARATORS = ';&|\n\r';
+// 引用されていない先頭のリダイレクト演算子。`2>`、`&>`、`>>`、`<` を含む。
+const REDIRECTION = /^(?:\d+|&)?(>>|>|<)(.*)$/;
+// 共有ツリーへ書き込みうるtool。MultiEditのように編集ごとにpathを持つ形もあるため、
+// トップレベルのfile_pathだけを見ない。
+const WRITE_TOOLS = new Set(['Edit', 'MultiEdit', 'NotebookEdit', 'Write']);
+
+// 書き込み系toolがファイルを指す形は一つではない。Editのfile_path、NotebookEditの
+// notebook_path、MultiEditの編集ごとのfile_pathをすべて集める。集められなかった書き込みは
+// 対象を読み取れないので、呼び出し側でfail-closeさせる。
+function writeTargets(toolInput) {
+  const source = toolInput && typeof toolInput === 'object' ? toolInput : {};
+  const targets = [];
+  const collect = value => {
+    if (typeof value === 'string' && value.trim()) targets.push(value);
+  };
+  collect(source.file_path);
+  collect(source.notebook_path);
+  collect(source.path);
+  if (Array.isArray(source.edits)) {
+    for (const edit of source.edits) {
+      if (edit && typeof edit === 'object') {
+        collect(edit.file_path);
+        collect(edit.notebook_path);
+        collect(edit.path);
+      }
+    }
+  }
+  return [...new Set(targets)];
+}
 
 function deny(reason) {
   return JSON.stringify({
@@ -136,30 +178,66 @@ function splitSegments(command) {
   return splitCommand(command).map(segment => segment.text);
 }
 
-function tokenize(segment) {
-  const tokens = [];
+// tokenの先頭が引用されていたかまで持ち帰る。`git commit -m ">note"` の `>` は
+// リダイレクトではなく引数であり、両者を取り違えると判定が狂う。
+function tokenizeParts(segment) {
+  const parts = [];
   let current = null;
   let quote = null;
+  const append = (character, quoted) => {
+    if (current === null) current = { value: character, quotedStart: quoted };
+    else current.value += character;
+  };
   for (const character of String(segment || '')) {
     if (quote) {
       if (character === quote) quote = null;
-      else current += character;
+      else append(character, true);
       continue;
     }
     if (character === '"' || character === "'") {
       quote = character;
-      if (current === null) current = '';
+      if (current === null) current = { value: '', quotedStart: true };
       continue;
     }
     if (/\s/.test(character)) {
-      if (current !== null) tokens.push(current);
+      if (current !== null) parts.push(current);
       current = null;
       continue;
     }
-    current = current === null ? character : current + character;
+    append(character, false);
   }
-  if (current !== null) tokens.push(current);
-  return tokens;
+  if (current !== null) parts.push(current);
+  return parts;
+}
+
+function tokenize(segment) {
+  return tokenizeParts(segment).map(part => part.value);
+}
+
+// リダイレクトはcommandの種類に関わらずファイルを作る。`git status > src/x` のように
+// 読み取りcommandでも共有ツリーへ書けるので、書き込み先だけを取り出して別に検査する。
+function scanRedirections(parts) {
+  const tokens = [];
+  const writes = [];
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    const match = part.quotedStart ? null : REDIRECTION.exec(part.value);
+    if (!match) {
+      tokens.push(part.value);
+      continue;
+    }
+    const [, operator, attached] = match;
+    let target = attached;
+    if (!target) {
+      const next = parts[index + 1];
+      target = next ? next.value : '';
+      index += 1;
+    }
+    // 入力リダイレクトは読み取りで、`>&2` のようなfd複製はファイルを作らない。
+    if (operator === '<' || target.startsWith('&')) continue;
+    writes.push(target);
+  }
+  return { tokens, writes };
 }
 
 // 展開が必要なtokenは実際のdirectoryを決められない。追跡不能をnullで表し、
@@ -171,14 +249,17 @@ function resolveDirectory(base, target) {
   return base ? path.resolve(base, value) : null;
 }
 
-function mentionsGit(text) {
-  return /\bgit\b/i.test(String(text || ''));
-}
-
 // `/usr/bin/git` や `"git.exe"` も同じgitである。判定はcommand名だけで行う。
 function commandName(token) {
   const value = String(token || '').replace(/^[({]+/, '');
   return String(value.split(/[\\/]/).pop() || '').replace(/\.exe$/i, '').toLowerCase();
+}
+
+// `node <plugin>/scripts/codex/run-role.js ...` のような、ECC自身のworktree対応command。
+// `node -e "..."` や `node --require x -e "..."` は任意のcodeを実行するので、node自身の
+// optionを挟まず、最初の引数がそのままscript pathである形だけを認める。
+function isWorktreeAwareTool(name, tokens) {
+  return name === 'node' && WORKTREE_AWARE_TOOL.test(String(tokens[1] || ''));
 }
 
 function isReadOnlyGit(subcommand, args) {
@@ -234,24 +315,33 @@ function gitInvocation(args, cwd) {
   return { write: true, location };
 }
 
-// worktreeを払い出しても、親CLIのcwdは共有ツリーのままである。書き込み系のGit操作は、
-// 実行directoryがworktreeへ移っているか（`cd <worktree> && git ...`）、git自身が
-// `-C <worktree>` でそこを指しているときだけ許可する。commandの中にworktree pathの
-// 文字列が現れるだけでは、そのgitが共有ツリーを書き換えないことの証明にならない。
-// 追跡できない起動の仕方（wrapper、command置換、`||` を挟んだcd）は、共有ツリーを
-// 書き換えないと言い切れないので拒否する。
+// worktreeを払い出しても、親CLIのcwdは共有ツリーのままである。隔離中は、実行directoryが
+// worktreeへ移っている（`cd <worktree> && ...`）か、gitが `-C <worktree>` でそこを
+// 指しているcommandだけを書き込みとして許可する。commandの中にworktree pathの文字列が
+// 現れるだけでは、そのcommandが共有ツリーを書き換えないことの証明にならない。
+// 共有ツリーのcwdで残せるのは、ファイルを作らない読み取りcommandとgitの読み取り
+// subcommandだけである。追跡できない起動の仕方（wrapper、command置換、展開、`||` を
+// 挟んだcd）は、共有ツリーを書き換えないと言い切れないので拒否する。
 function targetsWorkspace(command, workspace, cwd = process.cwd()) {
-  let current = path.resolve(cwd || process.cwd());
+  const shared = path.resolve(cwd || process.cwd());
+  let current = shared;
   for (const { text, separator } of splitCommand(command)) {
-    const tokens = tokenize(text);
-    while (tokens.length > 0 && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0]) || /^\d*[<>]/.test(tokens[0]))) {
+    // 展開してからでないと、何がどのdirectoryで走るか決まらない。
+    if (UNTRACEABLE_EXPANSION.test(text)) return false;
+    const { tokens, writes } = scanRedirections(tokenizeParts(text));
+    for (const target of writes) {
+      const resolved = resolveDirectory(current, target);
+      // 書き込み先を読み取れない形と、worktreeの外にある共有ツリーのファイルを拒否する。
+      if (!resolved) return false;
+      if (isInside(shared, resolved) && !isInside(workspace, resolved)) return false;
+    }
+    while (tokens.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) {
       // GIT_DIR や GIT_WORK_TREE はgit自身の書き込み先を差し替える。
-      if (/^GIT_/i.test(tokens[0]) && mentionsGit(text)) return false;
+      if (/^GIT_/i.test(tokens[0])) return false;
       tokens.shift();
     }
     const name = commandName(tokens[0]);
     if (!name) continue;
-    if (UNTRACEABLE_EXPANSION.test(text) && mentionsGit(text)) return false;
     if (name === 'cd' || name === 'pushd') {
       // subshellの中のcdは呼び出し元のdirectoryを動かさない。
       const target = /[(){}]/.test(text) ? null : resolveDirectory(current, tokens[1]);
@@ -265,10 +355,16 @@ function targetsWorkspace(command, workspace, cwd = process.cwd()) {
       current = null;
       continue;
     }
-    if (GIT_WRAPPERS.has(name) && mentionsGit(text)) return false;
-    if (name !== 'git') continue;
-    const { write, location } = gitInvocation(tokens.slice(1), current);
-    if (write && !(location && isInside(workspace, location))) return false;
+    if (COMMAND_WRAPPERS.has(name)) return false;
+    const inWorktree = Boolean(current) && isInside(workspace, current);
+    if (name === 'git') {
+      const { write, location } = gitInvocation(tokens.slice(1), current);
+      if (write && !(location && isInside(workspace, location))) return false;
+      continue;
+    }
+    // git以外のcommandも共有ツリーのファイルを書き換える。worktreeの中で走ることが
+    // 読み取れないなら、副作用を持たない読み取りcommandとECC自身のcommandだけを通す。
+    if (!inWorktree && !READ_ONLY_COMMANDS.has(name) && !isWorktreeAwareTool(name, tokens)) return false;
   }
   return true;
 }
@@ -377,24 +473,36 @@ function run(rawInput, options = {}) {
   }
 
   const toolName = String(input.tool_name || '');
-  const isEdit = ['Edit', 'Write', 'MultiEdit'].includes(toolName);
+  const isEdit = WRITE_TOOLS.has(toolName);
   const isolated = workspace !== path.resolve(cwd);
   if (isolated) {
-    // 払い出したworktreeの外へ書くと、隔離したはずの共有ツリーを再び変更してしまう。
-    // 共有ツリー配下だけを拒否し、リポジトリ外のファイルは従来どおり素通しする。
-    const filePath = String(input.tool_input && input.tool_input.file_path || '');
-    if (isEdit && filePath && isInside(path.resolve(cwd), path.resolve(filePath)) && !isInside(workspace, path.resolve(filePath))) {
-      return deny(
-        `[ECC Delivery Gate] Issue #${state.delivery.issue_number} is checked out in the delivery worktree ${workspace}. ` +
-          `Edit ${path.join(workspace, path.relative(path.resolve(cwd), path.resolve(filePath)))} instead; the shared working tree keeps its own branch and uncommitted changes.`
-      );
+    const shared = path.resolve(cwd);
+    if (isEdit) {
+      // 払い出したworktreeの外へ書くと、隔離したはずの共有ツリーを再び変更してしまう。
+      // 共有ツリー配下だけを拒否し、リポジトリ外のファイルは従来どおり素通しする。
+      const targets = writeTargets(input.tool_input).map(target => path.resolve(shared, target));
+      if (targets.length === 0) {
+        return deny(
+          `[ECC Delivery Gate] ${toolName} did not name a file to write, so this gate cannot tell whether it stays inside the delivery worktree ${workspace}. ` +
+            'Reissue the edit with an explicit absolute path inside that worktree.'
+        );
+      }
+      const outside = targets.find(target => isInside(shared, target) && !isInside(workspace, target));
+      if (outside) {
+        return deny(
+          `[ECC Delivery Gate] Issue #${state.delivery.issue_number} is checked out in the delivery worktree ${workspace}. ` +
+            `Edit ${path.join(workspace, path.relative(shared, outside))} instead; the shared working tree keeps its own branch and uncommitted changes.`
+        );
+      }
     }
     if (toolName === 'Bash' && !targetsWorkspace(input.tool_input && input.tool_input.command, workspace, cwd)) {
       return deny(
-        `[ECC Delivery Gate] This delivery is isolated in the worktree ${workspace}, but the command is not provably a Git operation on that worktree. ` +
-          `Write it as \`cd "${workspace}" && git ...\` or \`git -C "${workspace}" ...\`. ` +
-          'Forms whose target working tree cannot be read from the command itself are rejected: wrappers such as `sh -c` or `xargs`, ' +
-          'command substitution, `--git-dir`/`--work-tree`/`GIT_DIR` overrides, and a `cd` that is not chained with `&&`.'
+        `[ECC Delivery Gate] This delivery is isolated in the worktree ${workspace}, but the command is not provably confined to that worktree. ` +
+          `Write it as \`cd "${workspace}" && ...\` or \`git -C "${workspace}" ...\`. ` +
+          'In the shared working tree only side-effect-free inspection is allowed (read-only `git` subcommands, `ls`, `cat`, `grep`, …) ' +
+          "and ECC's own worktree-aware commands (`scripts/codex/run-role.js`, …), with no output redirection into that tree. " +
+          'Forms whose working tree cannot be read from the command itself are rejected: wrappers such as `sh -c` or `xargs`, ' +
+          'command substitution and `${...}` expansion, `--git-dir`/`--work-tree`/`GIT_*` overrides, and a `cd` that is not chained with `&&`.'
       );
     }
   }
@@ -428,4 +536,14 @@ if (require.main === module) {
   process.stdin.on('end', () => process.stdout.write(run(raw)));
 }
 
-module.exports = { branchAt, gitValue, isExactLifecycleCommand, isInside, run, splitSegments, targetsWorkspace, tokenize };
+module.exports = {
+  branchAt,
+  gitValue,
+  isExactLifecycleCommand,
+  isInside,
+  run,
+  splitSegments,
+  targetsWorkspace,
+  tokenize,
+  writeTargets
+};

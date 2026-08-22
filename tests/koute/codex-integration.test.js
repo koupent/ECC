@@ -517,8 +517,8 @@ test('preparation issues an Issue worktree instead of switching the shared worki
   assert.strictEqual(ready.status, 'ready');
   assert.strictEqual(ready.branch, branch);
   assert.strictEqual(ready.worktree_created, true);
-  assert.strictEqual(ready.worktree_shared, false);
   assert.strictEqual(ready.branch_switch, null);
+  assert.notStrictEqual(fs.realpathSync(ready.worktree_path), fs.realpathSync(fixture));
   assert.strictEqual(ready.worktree_path, deliveryWorktreePath(fs.realpathSync(fixture), branch));
   assert.ok(fs.existsSync(path.join(ready.worktree_path, 'src', 'product.ts')));
   // 共有ツリーのbranchも未コミットの変更もそのまま残る。
@@ -559,6 +559,44 @@ test('preparation issues an Issue worktree instead of switching the shared worki
     new RegExp(path.join(ready.worktree_path, 'src', 'product.ts').replace(/[\\^$*+?.()|[\]{}]/g, '\\$&'))
   );
 
+  // 編集対象はトップレベルのfile_pathだけではない。MultiEditの編集ごとのpathも
+  // NotebookEditのnotebook_pathも共有ツリーを書き換える。
+  const worktreeMultiEdit = JSON.stringify({
+    ...input,
+    tool_name: 'MultiEdit',
+    tool_input: {
+      file_path: path.join(ready.worktree_path, 'src', 'product.ts'),
+      edits: [{ file_path: path.join(ready.worktree_path, 'src', 'product.ts'), old_string: 'a', new_string: 'b' }]
+    }
+  });
+  assert.strictEqual(deliveryGate.run(worktreeMultiEdit, { cwd: fixture, env: fixtureEnv }), worktreeMultiEdit);
+  for (const toolInput of [
+    {
+      file_path: path.join(ready.worktree_path, 'src', 'product.ts'),
+      edits: [{ file_path: path.join(fixture, 'src', 'product.ts'), old_string: 'a', new_string: 'b' }]
+    },
+    { edits: [{ file_path: path.join(fixture, 'src', 'product.ts'), old_string: 'a', new_string: 'b' }] }
+  ]) {
+    const smuggled = JSON.stringify({ ...input, tool_name: 'MultiEdit', tool_input: toolInput });
+    const deniedMultiEdit = JSON.parse(deliveryGate.run(smuggled, { cwd: fixture, env: fixtureEnv }));
+    assert.strictEqual(deniedMultiEdit.hookSpecificOutput.permissionDecision, 'deny');
+    assert.match(deniedMultiEdit.hookSpecificOutput.permissionDecisionReason, /delivery worktree/);
+  }
+  const sharedNotebook = JSON.stringify({
+    ...input,
+    tool_name: 'NotebookEdit',
+    tool_input: { notebook_path: path.join(fixture, 'src', 'analysis.ipynb') }
+  });
+  assert.strictEqual(
+    JSON.parse(deliveryGate.run(sharedNotebook, { cwd: fixture, env: fixtureEnv })).hookSpecificOutput.permissionDecision,
+    'deny'
+  );
+  // 書き込み先を読み取れないtool呼び出しは、worktreeの中だと決めつけずに止める。
+  const pathlessWrite = JSON.stringify({ ...input, tool_name: 'Write', tool_input: { content: 'x' } });
+  const deniedPathless = JSON.parse(deliveryGate.run(pathlessWrite, { cwd: fixture, env: fixtureEnv }));
+  assert.strictEqual(deniedPathless.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(deniedPathless.hookSpecificOutput.permissionDecisionReason, /did not name a file to write/);
+
   const sharedCommit = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: 'git commit -am "fix"' } });
   const deniedCommit = JSON.parse(deliveryGate.run(sharedCommit, { cwd: fixture, env: fixtureEnv }));
   assert.strictEqual(deniedCommit.hookSpecificOutput.permissionDecision, 'deny');
@@ -586,22 +624,40 @@ test('preparation issues an Issue worktree instead of switching the shared worki
     'deny'
   );
   // 列挙漏れのsubcommandや、cdの成否に依存する形での共有ツリー書き込みも止める。
+  // Git以外のcommand、リダイレクト、任意のcodeを実行する形も同じく共有ツリーを書き換える。
   for (const command of [
     'git mv src/product.ts src/renamed.ts',
     `cd "${ready.worktree_path}/missing" || git reset --hard`,
     'sh -c "git reset --hard"',
-    `git --work-tree "${fixture}" checkout -- .`
+    `git --work-tree "${fixture}" checkout -- .`,
+    'touch src/product.ts',
+    'rm -rf src',
+    'npm test',
+    'npm run build -- --out src',
+    'node -e "require(\'fs\').writeFileSync(\'src/product.ts\', \'\')"',
+    'echo bypass > src/product.ts',
+    'git status --porcelain > src/status.txt',
+    `cd "${ready.worktree_path}" && echo bypass > "${path.join(fixture, 'src', 'product.ts')}"`
   ]) {
     const bypass = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command } });
     const denied = JSON.parse(deliveryGate.run(bypass, { cwd: fixture, env: fixtureEnv }));
     assert.strictEqual(denied.hookSpecificOutput.permissionDecision, 'deny', command);
     assert.match(denied.hookSpecificOutput.permissionDecisionReason, /isolated in the worktree/);
   }
-  const readOnly = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command: 'git status --porcelain' } });
-  assert.strictEqual(deliveryGate.run(readOnly, { cwd: fixture, env: fixtureEnv }), readOnly);
+  // 副作用のない読み取り、worktreeの中で走る検証、ECC自身のworktree対応commandは通る。
+  for (const command of [
+    'git status --porcelain',
+    'cat src/product.ts',
+    `cd "${ready.worktree_path}" && npm test`,
+    `cd "${ready.worktree_path}" && npm test > report.log`,
+    'node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --request "Review" --session test'
+  ]) {
+    const allowed = JSON.stringify({ ...input, tool_name: 'Bash', tool_input: { command } });
+    assert.strictEqual(deliveryGate.run(allowed, { cwd: fixture, env: fixtureEnv }), allowed, command);
+  }
 });
 
-test('an existing worktree for the delivery branch is reused and never deleted', () => {
+test('an existing linked worktree is reused, and the shared working tree is never adopted', () => {
   const executed = [];
   const runCommand = (binary, args) => {
     executed.push([binary, ...args].join(' '));
@@ -625,17 +681,72 @@ test('an existing worktree for the delivery branch is reused and never deleted',
     runCommand
   });
   assert.strictEqual(worktree.created, false);
-  assert.strictEqual(worktree.shared, false);
   assert.strictEqual(worktree.path, path.join(temp, 'reuse-main-worktrees', 'codex-issue-68-existing'));
   assert.ok(executed.every(command => !/worktree (add|remove|prune)/.test(command)));
 
-  // 共有ツリーが既にそのbranchをcheckoutしているときは、そのツリーが作業場所になる。
-  const shared = ensureDeliveryWorktree({ base_branch: 'main' }, 'main', {
-    cwd: path.join(temp, 'reuse-main'),
-    runCommand
-  });
-  assert.strictEqual(shared.shared, true);
-  assert.strictEqual(shared.path, path.join(temp, 'reuse-main'));
+  // 共有ツリーが対象branchをcheckoutしている場合は、そのツリーを作業場所として
+  // 受け入れない。branchを手放してもらうまでfail-closeする。
+  assert.throws(
+    () => ensureDeliveryWorktree({ base_branch: 'main' }, 'main', {
+      cwd: path.join(temp, 'reuse-main'),
+      runCommand
+    }),
+    /checked out in the shared working tree/
+  );
+  assert.ok(executed.every(command => !/worktree (add|remove|prune)/.test(command)));
+});
+
+test('preparation fails closed while the shared working tree holds the delivery branch', () => {
+  const fixture = createGitFixture('delivery-shared-branch-repo');
+  fs.writeFileSync(
+    path.join(fixture, '.ecc', 'config.json'),
+    JSON.stringify({ profile: 'standard', deliveryWorkflow: 'required', codex: { enabled: true } }),
+    'utf8'
+  );
+  assert.strictEqual(spawnSync('git', ['add', '.ecc/config.json'], { cwd: fixture }).status, 0);
+  assert.strictEqual(spawnSync('git', ['commit', '--quiet', '-m', 'require delivery workflow'], { cwd: fixture }).status, 0);
+  const baseBranch = spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim();
+  const branch = 'codex/issue-79-shared-checkout';
+  // 共有ツリーが対象branchをcheckoutしている状態。ここを作業場所にすると隔離が消える。
+  assert.strictEqual(spawnSync('git', ['switch', '--quiet', '-c', branch], { cwd: fixture }).status, 0);
+  const fixtureEnv = { ...env, ECC_KOUTE_STATE_DIR: path.join(temp, 'delivery-shared-branch-state') };
+  const input = { session_id: 'delivery-shared-branch', cwd: fixture };
+  writeState(input, {
+    delivery: {
+      status: 'pending',
+      request_hash: 'shared-branch-fixture',
+      title: 'the shared tree must release the branch',
+      base_branch: baseBranch,
+      issue_number: 79,
+      issue_url: 'https://example.invalid/issues/79',
+      branch,
+      draft_pr_url: null
+    }
+  }, fixtureEnv);
+
+  assert.throws(
+    () => prepareDelivery(input, { cwd: fixture, env: fixtureEnv }),
+    /checked out in the shared working tree/
+  );
+  // 共有ツリーのbranchは動かさず、Deliveryもreadyにしない。
+  assert.strictEqual(spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim(), branch);
+  const blocked = readState(input, fixtureEnv).delivery;
+  assert.notStrictEqual(blocked.status, 'ready');
+  assert.strictEqual(blocked.worktree_path, undefined);
+  assert.ok(readEvents(fixtureEnv).some(event => event.type === 'delivery_prepare_failure'));
+
+  // 共有ツリーがbranchを手放せば、同じ再実行が専用worktreeを払い出す。
+  assert.strictEqual(spawnSync('git', ['switch', '--quiet', baseBranch], { cwd: fixture }).status, 0);
+  const ready = prepareDelivery(input, { cwd: fixture, env: fixtureEnv });
+  assert.strictEqual(ready.status, 'ready');
+  assert.strictEqual(ready.branch, branch);
+  assert.strictEqual(ready.worktree_created, true);
+  assert.notStrictEqual(fs.realpathSync(ready.worktree_path), fs.realpathSync(fixture));
+  assert.strictEqual(
+    spawnSync('git', ['branch', '--show-current'], { cwd: ready.worktree_path, encoding: 'utf8' }).stdout.trim(),
+    branch
+  );
+  assert.strictEqual(spawnSync('git', ['branch', '--show-current'], { cwd: fixture, encoding: 'utf8' }).stdout.trim(), baseBranch);
 });
 
 test('worktree issuance fails closed on unverified paths and shell-unsafe refs', () => {
@@ -791,7 +902,7 @@ test('completion accepts review evidence bound to the delivery worktree, not the
   assert.strictEqual(readState(input, fixtureEnv).delivery.status, 'draft-pr');
 });
 
-test('an isolated delivery only allows Git writes that actually run in the worktree', () => {
+test('an isolated delivery only allows commands that provably act inside the worktree', () => {
   const shared = path.join(temp, 'targets-shared');
   const workspace = path.join(temp, 'targets-shared-worktrees', 'codex-issue-79');
   for (const command of [
@@ -810,10 +921,19 @@ test('an isolated delivery only allows Git writes that actually run in the workt
     // 書き込みでも、worktreeを指していれば通る。
     `git -C "${workspace}" mv src/product.ts src/renamed.ts`,
     `git -C "${workspace}" branch -D codex/old`,
+    // worktreeの中で走るcommandは、gitでなくてもファイルを作ってよい。
     `cd "${workspace}" && npm test`,
-    'npm test',
-    // gitを起動しないcommandは、文字列にgitが出てきても素通しする。
-    'grep -r "git" docs'
+    `cd "${workspace}" && npm test > report.log`,
+    `cd "${workspace}" && node scripts/build.js`,
+    // 共有ツリーでも、ファイルを作らない読み取りcommandは通す。
+    'grep -r "git" docs',
+    'cat src/product.ts',
+    'ls -la src',
+    `git diff > "${path.join(workspace, 'delivery.diff')}"`,
+    'git log --oneline -5 | head -3',
+    // ECC自身のcommandは記録済みDeliveryのworktreeを解決して動く。
+    'node "$CLAUDE_PLUGIN_ROOT/scripts/codex/run-role.js" review --session delivery',
+    'node /plugin/scripts/codex/acceptance-audit.js --issue 79'
   ]) {
     assert.strictEqual(deliveryGate.targetsWorkspace(command, workspace, shared), true, command);
   }
@@ -859,7 +979,30 @@ test('an isolated delivery only allows Git writes that actually run in the workt
     `cd "${workspace}" && git --work-tree "${shared}" checkout -- .`,
     `cd "${workspace}" && git -c core.worktree="${shared}" reset --hard`,
     // 絶対pathでgitを呼んでも同じgitである。
-    '/usr/bin/git reset --hard'
+    '/usr/bin/git reset --hard',
+    // Gitを使わなくても共有ツリーは書き換えられる。worktreeの中で走ると読み取れない
+    // 限り、ファイルを作りうるcommandは通さない。
+    'npm test',
+    'npm run build',
+    'touch src/product.ts',
+    'rm -rf src',
+    'mv src/product.ts src/renamed.ts',
+    'sed -i "s/a/b/" src/product.ts',
+    'python -c "open(\'src/product.ts\', \'w\')"',
+    'node -e "require(\'fs\').writeFileSync(\'src/product.ts\', \'\')"',
+    'node scripts/build.js',
+    // リダイレクトはcommandの種類に関わらず共有ツリーへ書き込む。
+    'echo bypass > src/product.ts',
+    'echo bypass >src/product.ts',
+    'echo bypass >> src/product.ts',
+    'git status --porcelain > src/status.txt',
+    'git diff 2> src/error.log',
+    `cd "${workspace}" && cat report.log > "${shared}/report.log"`,
+    'cat src/product.ts > $LOG',
+    // worktreeの中に見えても、cdが効いていなければ共有ツリーで走る。
+    `cd "${workspace}"; npm test`,
+    // ECCのcommandに見せかけた任意のcode実行は通さない。
+    'node --require /plugin/scripts/codex/run-role.js -e "process.exit(0)"'
   ]) {
     assert.strictEqual(deliveryGate.targetsWorkspace(command, workspace, shared), false, command);
   }

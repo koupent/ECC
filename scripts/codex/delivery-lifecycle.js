@@ -271,15 +271,25 @@ function ensureDeliveryWorktree(delivery, branch, options = {}) {
   const existing = worktrees.find(entry => entry.branch === target);
   if (existing) {
     const existingPath = path.resolve(existing.path);
-    // 既存のworktreeは削除も上書きもしない。共有ツリーが既にこのbranchをcheckout
-    // している場合も、そのツリーをそのままDeliveryの作業場所として受け入れる。
+    // 主作業ツリーがそのbranchをcheckoutしていても、そこをDeliveryの作業場所にはしない。
+    // 受け入れると隔離が消え、Issueが報告した「全ての作業が単一ツリーに集中する」状態に
+    // 戻る。branchは同時に一つのツリーへしかcheckoutできないので、専用worktreeを作る前に
+    // 共有ツリー側でbranchを手放してもらう。
+    if (existingPath === main) {
+      throw new Error(
+        `Branch ${target} is checked out in the shared working tree ${existingPath}. ` +
+          'Delivery work always runs in a worktree of its own, and preparation never adopts the shared working tree. ' +
+          `Switch ${existingPath} to another branch yourself (its uncommitted changes stay there), then run this command again.`
+      );
+    }
+    // 既存のlinked worktreeは削除も上書きもせず、そのまま再利用する。
     if (!fs.existsSync(existingPath)) {
       throw new Error(
         `Branch ${target} is registered to worktree ${existingPath}, but that directory is missing. ` +
           'Restore it or run `git worktree prune` yourself, then run this command again.'
       );
     }
-    return { path: existingPath, branch: target, created: false, shared: existingPath === main, base_branch: null };
+    return { path: existingPath, branch: target, created: false, base_branch: null };
   }
 
   const worktreePath = deliveryWorktreePath(main, target, options);
@@ -302,7 +312,7 @@ function ensureDeliveryWorktree(delivery, branch, options = {}) {
       : ['worktree', 'add', '-b', target, worktreePath, base],
     { ...options, timeout: WORKTREE_ADD_TIMEOUT_MS }
   );
-  return { path: worktreePath, branch: target, created: true, shared: false, base_branch: base };
+  return { path: worktreePath, branch: target, created: true, base_branch: base };
 }
 
 function prepareDelivery(input = {}, options = {}) {
@@ -379,7 +389,6 @@ function prepareDelivery(input = {}, options = {}) {
       status: 'ready',
       worktree_path: worktree.path,
       worktree_created: worktree.created,
-      worktree_shared: worktree.shared,
       branch_switch: null
     };
     writeState(input, { delivery: next }, env);
@@ -401,16 +410,15 @@ function main() {
   if (command !== 'prepare') throw new Error('usage: delivery-lifecycle.js prepare --session <id>');
   if (!sessionId) throw new Error('No unique pending delivery session for this project; retry the exact session-bound command from the Delivery Gate.');
   const delivery = prepareDelivery({ session_id: sessionId, cwd: process.cwd() });
-  // stdoutのJSONは機械可読の契約なので、作業場所の受け渡しという人間向けの指示はstderrへ出す。
-  if (!delivery.worktree_shared) {
-    process.stderr.write(
-      `[ECC Delivery] Issue #${delivery.issue_number} is checked out at ${delivery.worktree_path} ` +
-        `(${delivery.worktree_created ? 'created' : 'reused'} worktree on ${delivery.branch}). ` +
-        'The shared working tree keeps its own branch and uncommitted changes. ' +
-        'Run every edit, test, commit, review, and push for this delivery inside that path ' +
-        `(for example \`cd "${delivery.worktree_path}"\` or \`git -C "${delivery.worktree_path}" ...\`).\n`
-    );
-  }
+  // 払い出しは常に共有ツリーとは別のworktreeで終わる。stdoutのJSONは機械可読の契約なので、
+  // 作業場所の受け渡しという人間向けの指示はstderrへ出す。
+  process.stderr.write(
+    `[ECC Delivery] Issue #${delivery.issue_number} is checked out at ${delivery.worktree_path} ` +
+      `(${delivery.worktree_created ? 'created' : 'reused'} worktree on ${delivery.branch}). ` +
+      'The shared working tree keeps its own branch and uncommitted changes. ' +
+      'Run every edit, test, commit, review, and push for this delivery inside that path ' +
+      `(for example \`cd "${delivery.worktree_path}"\` or \`git -C "${delivery.worktree_path}" ...\`).\n`
+  );
   process.stdout.write(`${JSON.stringify(delivery, null, 2)}\n`);
 }
 
