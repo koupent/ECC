@@ -207,13 +207,33 @@ When creating PRs:
 | go-build-resolver | Go build errors | Go build failures |
 | database-reviewer | Database optimization | SQL, schema design |
 
-### Immediate Agent Usage
+### Agent Usage Policy
 
-No user prompt needed:
-1. Complex feature requests - Use **planner** agent
-2. Code just written/modified - Use **code-reviewer** agent
-3. Bug fix or new feature - Use **tdd-guide** agent
-4. Architectural decision - Use **architect** agent
+`rules/common/agents.md` is the canonical delegation policy; this section restates it for
+OpenCode and governs every "use the X agent" step elsewhere in this document.
+
+**Mechanism.** This document describes when delegation is useful; it does not automatically spawn
+an agent, and no runtime spawns one on its own. An agent runs only when the parent model invokes
+an available Agent or Task tool and collects the result.
+
+**Expectation.** When such a tool is available and higher-priority instructions permit it, judge
+for yourself whether to delegate. A separate request from the user is not required.
+
+**Precedence.** Higher-priority system, runtime or harness, organization, and user instructions
+always take precedence over this document. When the harness restricts delegation — for example
+"do not call the Agent tool unless the user requested it" — follow the harness. These
+instructions then tell you which perspectives to cover, not that you may override the restriction.
+
+When delegation tools are available and higher-priority instructions permit their use:
+1. Complex feature requests - Consider the **planner** agent
+2. Code just written/modified - Consider the **code-reviewer** agent
+3. Bug fix or new feature - Consider the **tdd-guide** agent
+4. Architectural decision - Consider the **architect** agent
+
+When delegation is unavailable or prohibited, keep the work in the parent context and apply the
+same planning, testing, and review checklists directly. Delegate only for genuinely independent
+work, collect every result before ending the turn, and never claim that an agent ran when no tool
+invocation and result collection occurred.
 
 ---
 

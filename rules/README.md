@@ -127,7 +127,9 @@ For non-language domains like `web/`, follow the same layered pattern when there
 
 ## Rule Priority
 
-When language-specific rules and common rules conflict, **language-specific rules take precedence** (specific overrides general). This follows the standard layered configuration pattern (similar to CSS specificity or `.gitignore` precedence).
+Higher-priority system, runtime or harness, organization, and user instructions always take precedence over every rule in this directory. When a harness instruction conflicts with a rule — for example, a harness that forbids calling the Agent tool while `common/agents.md` describes delegation — follow the harness and apply the rule's intent within the parent context.
+
+Within that limit, when language-specific rules and common rules conflict, **language-specific rules take precedence** (specific overrides general). This follows the standard layered configuration pattern (similar to CSS specificity or `.gitignore` precedence).
 
 - `rules/common/` defines universal defaults applicable to all projects.
 - `rules/golang/`, `rules/python/`, `rules/swift/`, `rules/php/`, `rules/typescript/`, `rules/react-native/`, etc. override those defaults where language idioms differ.

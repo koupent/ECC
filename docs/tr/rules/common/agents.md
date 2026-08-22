@@ -17,17 +17,37 @@
 | doc-updater | Dokümantasyon | Dokümanları güncelleme |
 | rust-reviewer | Rust kod incelemesi | Rust projeleri |
 
-## Anlık Agent Kullanımı
+## Agent Kullanım Politikası
 
-Kullanıcı istemi gerekmez:
-1. Karmaşık özellik istekleri - **planner** agent kullan
-2. Kod yeni yazıldı/değiştirildi - **code-reviewer** agent kullan
-3. Hata düzeltmesi veya yeni özellik - **tdd-guide** agent kullan
-4. Mimari karar - **architect** agent kullan
+Kanonik devretme politikası `rules/common/agents.md` dosyasıdır; bu belge onun çevirisidir.
+
+**Mekanizma.** Bu kural devretmenin ne zaman yararlı olduğunu anlatır; bir agent'ı otomatik olarak
+başlatmaz ve hiçbir runtime kendiliğinden bir agent başlatmaz. Bir agent yalnızca ana model mevcut
+Agent veya Task aracını çağırıp sonucunu topladığında çalışır.
+
+**Beklenti.** Bu araç mevcutsa ve daha yüksek öncelikli talimatlar izin veriyorsa, devretip
+devretmeyeceğine kendin karar ver. Kullanıcıdan ayrı bir istek gerekmez.
+
+**Öncelik.** Sistem, runtime veya harness, organizasyon ve kullanıcı talimatları her zaman bu
+kuralın önündedir. Harness devretmeyi kısıtlıyorsa — örneğin "kullanıcı istemedikçe Agent aracını
+çağırma" — harness'a uy. Bu kural o durumda hangi bakış açılarının karşılanacağını söyler, kısıtı
+geçersiz kılma izni vermez.
+
+Devretme araçları mevcutsa ve daha yüksek öncelikli talimatlar kullanımlarına izin veriyorsa:
+1. Karmaşık özellik istekleri - **planner** agent'ı değerlendir
+2. Kod yeni yazıldı/değiştirildi - **code-reviewer** agent'ı değerlendir
+3. Hata düzeltmesi veya yeni özellik - **tdd-guide** agent'ı değerlendir
+4. Mimari karar - **architect** agent'ı değerlendir
+
+Devretme mevcut değilse veya yasaksa, işi ana bağlamda tut ve aynı planlama, test ve inceleme
+kontrol listelerini doğrudan uygula. Araç çağrısı yapılmadan ve sonuç toplanmadan bir agent'ın
+çalıştığını asla iddia etme.
 
 ## Paralel Görev Yürütme
 
-Bağımsız işlemler için DAIMA paralel Task yürütme kullan:
+Paralel Task yürütmeyi yalnızca gerçekten bağımsız işlemler için, runtime devretmeye izin
+verdiğinde ve ana model turunu bitirmeden önce tüm sonuçları toplayabildiğinde kullan. Sonucu
+toplanmayan devretme yasaktır:
 
 ```markdown
 # İYİ: Paralel yürütme
@@ -42,9 +62,14 @@ Bağımsız işlemler için DAIMA paralel Task yürütme kullan:
 
 ## Çok Perspektifli Analiz
 
-Karmaşık problemler için split role sub-agent'lar kullan:
+Karmaşık problemler için, devretmeye izin verildiğinde ve bakış açıları gerçekten bağımsız
+olduğunda split role sub-agent'ları değerlendir:
 - Factual reviewer
 - Senior engineer
 - Security expert
 - Consistency reviewer
 - Redundancy checker
+
+Devretme mevcut değilse, aynı bakış açılarını ana bağlamda ayrı geçişler olarak yürüt. Yalnızca
+diff'e bakan bir incelemenin kaçırdığı kusurları — örneğin diff'i tek satıra dokunan bir yordamın
+adım sırasının yanlış olması — yakalayan şey bakış açısıdır; agent yalnızca araçtır.

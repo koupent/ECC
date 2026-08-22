@@ -50,10 +50,15 @@ This is a **production-ready AI coding plugin** providing 67 specialized agents,
 
 ## Agent Orchestration
 
-This catalog describes available roles; it does not automatically spawn an agent. Delegate only
-when the runtime exposes the required tool and higher-priority system, organization, project, or
-user instructions permit it. Otherwise, apply the same planning, testing, and review checklist in
-the parent context. Never claim an agent ran without invoking it and collecting its result.
+`rules/common/agents.md` is the canonical delegation policy; this section restates it.
+
+This catalog describes available roles; it does not automatically spawn an agent, and no runtime
+spawns one on its own. Delegate only when the runtime exposes the required tool and higher-priority
+system, runtime or harness, organization, project, or user instructions permit it — within those
+limits, judge for yourself whether to delegate rather than waiting to be asked. When the harness
+restricts delegation, follow the harness and apply the same planning, testing, and review
+checklist in the parent context. Never claim an agent ran without invoking it and collecting its
+result.
 
 When delegation is permitted, consider the matching specialist for genuinely bounded work:
 - Complex feature requests → **planner**

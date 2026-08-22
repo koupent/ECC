@@ -6,7 +6,7 @@ Este es un **plugin de IA para codificación listo para producción** que propor
 
 ## Principios Fundamentales
 
-1. **Primero los Agentes** — Delega a agentes especializados para tareas de dominio
+1. **Consciente de los Agentes** — Delega solo cuando el runtime y las instrucciones de mayor prioridad lo permitan
 2. **Guiado por Pruebas** — Escribe pruebas antes de la implementación, se requiere 80%+ de cobertura
 3. **Seguridad Primero** — Nunca comprometer la seguridad; valida todas las entradas
 4. **Inmutabilidad** — Siempre crea nuevos objetos, nunca mutes los existentes
@@ -49,7 +49,18 @@ Este es un **plugin de IA para codificación listo para producción** que propor
 
 ## Orquestación de Agentes
 
-Usa agentes proactivamente sin prompt del usuario:
+`rules/common/agents.md` es la política canónica de delegación; esta sección la reformula.
+
+Este catálogo describe los roles disponibles; no lanza un agente automáticamente, y ningún runtime
+lo lanza por su cuenta. Delega solo cuando el runtime expone la herramienta necesaria y las
+instrucciones de mayor prioridad del sistema, del runtime o harness, de la organización, del
+proyecto o del usuario lo permiten; dentro de esos límites, decide por tu cuenta si delegar en vez
+de esperar a que te lo pidan. Cuando el harness restringe la delegación, sigue al harness y aplica
+la misma lista de verificación de planificación, pruebas y revisión en el contexto padre. Nunca
+afirmes que un agente se ejecutó sin haberlo invocado y recogido su resultado.
+
+Cuando se permite la delegación, considera al especialista correspondiente para trabajo realmente
+acotado:
 - Solicitudes de features complejas → **planner**
 - Código recién escrito/modificado → **code-reviewer**
 - Corrección de bug o nueva feature → **tdd-guide**
@@ -58,7 +69,9 @@ Usa agentes proactivamente sin prompt del usuario:
 - Bucles autónomos / monitoreo de bucles → **loop-operator**
 - Confiabilidad y costo de la configuración del harness → **harness-optimizer**
 
-Usa ejecución paralela para operaciones independientes — lanza múltiples agentes simultáneamente.
+Usa ejecución paralela para operaciones independientes solo cuando el runtime permita la
+delegación y el padre pueda recoger todos los resultados antes de terminar su turno. La delegación
+sin seguimiento está prohibida.
 
 ## Directrices de Seguridad
 
